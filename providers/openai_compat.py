@@ -24,6 +24,26 @@ from providers.common import (
 from providers.rate_limit import GlobalRateLimiter
 
 
+class _AuthHeaderOpenAI(AsyncOpenAI):
+    """AsyncOpenAI subclass that uses a configurable auth header name.
+
+    The base AsyncOpenAI hardcodes "Authorization: Bearer". This subclass
+    replaces it with any header name (e.g. "api-key") needed by the provider.
+    """
+
+    def __init__(self, *, auth_header: str = "Authorization", **kwargs: Any) -> None:
+        self._auth_header = auth_header
+        super().__init__(**kwargs)
+
+    async def _prepare_request(self, request: httpx.Request) -> None:
+        await super()._prepare_request(request)
+        if self._auth_header != "Authorization":
+            # Replace "Authorization" with the provider-specific header name
+            if "authorization" in request.headers:
+                del request.headers["authorization"]
+            request.headers[self._auth_header] = self.api_key
+
+
 class OpenAICompatibleProvider(BaseProvider):
     """Base class for providers using OpenAI-compatible chat completions API."""
 
@@ -34,6 +54,7 @@ class OpenAICompatibleProvider(BaseProvider):
         provider_name: str,
         base_url: str,
         api_key: str,
+        auth_header: str = "Authorization",
     ):
         super().__init__(config)
         self._provider_name = provider_name
@@ -56,7 +77,8 @@ class OpenAICompatibleProvider(BaseProvider):
                     write=config.http_write_timeout,
                 ),
             )
-        self._client = AsyncOpenAI(
+        self._client = _AuthHeaderOpenAI(
+            auth_header=auth_header,
             api_key=self._api_key,
             base_url=self._base_url,
             max_retries=0,
