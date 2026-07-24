@@ -127,6 +127,15 @@ Before looking at code, understand the intent:
 - What is the expected behavior change?
 ```
 
+### Skill Artifact Gate
+
+When the change includes a `SKILL.md` or a Skill's bundled resources, first use
+`uv run` from the repository root to execute `validate-agent-skills.py` in the
+top-level `scripts` directory. Treat any reported error as a required finding
+and do not continue the Skill artifact review until validation passes. Cite the
+validator result; do not duplicate its mechanical checks in this review
+workflow.
+
 ### Step 2: Review the Tests First
 
 Tests reveal intent and coverage:
