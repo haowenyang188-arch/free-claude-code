@@ -4,6 +4,14 @@ Use these templates only after replacing every placeholder with facts from the
 user's current task and verified environment. Omit inapplicable fields instead
 of borrowing values from examples or earlier tasks.
 
+## Contents
+
+- [Storage Contract](#storage-contract)
+- [Parent-To-Child Task Brief](#parent-to-child-task-brief)
+- [Child-To-Parent Result Report](#child-to-parent-result-report)
+- [Persistent Progress Ledger](#persistent-progress-ledger)
+- [Transfer Protocol](#transfer-protocol)
+
 ## Storage Contract
 
 Choose one `<coordination-root>` for the current task:
