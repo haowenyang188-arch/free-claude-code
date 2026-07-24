@@ -1,0 +1,33 @@
+[
+  {
+    "id": "planning-should-trigger",
+    "category": "should_trigger",
+    "prompt": "只制定实施计划，不修改文件：把两个现有配置解析器收敛到一个共享接口，同时保留旧导入路径的兼容层。请拆成可验收任务。",
+    "expected_activation": true,
+    "expected_behavior": [
+      "每个任务说明输入、输出、依赖、资源所有权、并行标志、共享接口、验收条件和失败影响",
+      "规划依赖顺序但不创建子智能体或开始实施"
+    ]
+  },
+  {
+    "id": "planning-should-not-trigger",
+    "category": "should_not_trigger",
+    "prompt": "解释 Python Path.resolve() 与 Path.absolute() 的区别，不要制定实施计划。",
+    "expected_activation": false,
+    "expected_behavior": [
+      "直接回答概念问题",
+      "不生成任务分解或多智能体安排"
+    ]
+  },
+  {
+    "id": "planning-boundary-shared-interface",
+    "category": "boundary",
+    "prompt": "只做规划判断：两个互不依赖的配置文件要分别修改，但它们必须产出同一个共享 schema。判断哪些工作可并行，并给出必要的任务记录；不要执行。",
+    "expected_activation": true,
+    "expected_behavior": [
+      "先定义共享接口或把它列为前置依赖，再判断后续任务是否可并行",
+      "共享资源只有一个明确所有者",
+      "不创建或调度子智能体"
+    ]
+  }
+]
