@@ -1,0 +1,34 @@
+[
+  {
+    "id": "context-should-trigger-handoff",
+    "category": "should_trigger",
+    "prompt": "当前任务会跨两个会话，并要把一个只读审计子任务交给子智能体。请建立可文件化传递的任务简报、结果报告和持续进度账本规范，避免压缩后丢失验收条件。",
+    "expected_activation": true,
+    "expected_behavior": [
+      "读取一层 handoff-artifacts reference 后按当前任务生成交接内容",
+      "简报、结果报告和进度账本共享同一任务身份并记录来源、状态和证据",
+      "父子写入路径和资源所有权互不冲突"
+    ]
+  },
+  {
+    "id": "context-should-not-trigger",
+    "category": "should_not_trigger",
+    "prompt": "用两句话解释什么是 Python context manager；不要配置项目上下文，也不要创建交接文件。",
+    "expected_activation": false,
+    "expected_behavior": [
+      "直接回答概念问题",
+      "不读取交接 reference，不创建任务简报、结果报告或进度账本"
+    ]
+  },
+  {
+    "id": "context-boundary-cross-task-pollution",
+    "category": "boundary",
+    "prompt": "恢复当前任务时发现一个旧进度报告，里面的任务 ID、平台路径和交付物都属于上一项任务，但其中有一条测试命令可能仍适用。请判断如何处理，不要执行命令。",
+    "expected_activation": true,
+    "expected_behavior": [
+      "拒绝把旧报告整体并入当前上下文，保留任务身份边界",
+      "只在独立核验来源和当前适用性后采用测试命令",
+      "旧任务的平台路径和交付物不得成为当前执行目标"
+    ]
+  }
+]
