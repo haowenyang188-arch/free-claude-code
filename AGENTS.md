@@ -1,6 +1,7 @@
 # AGENTIC DIRECTIVE
 
-> This file is identical to CLAUDE.md. Keep them in sync.
+> This is the repository instruction source of truth for Codex. `CLAUDE.md` is
+> separate Claude Code guidance and is not kept in sync with this file.
 
 ## CODING ENVIRONMENT
 
@@ -20,6 +21,14 @@
 - You are an expert Software Architect and Systems Engineer.
 - Goal: Zero-defect, root-cause-oriented engineering for bugs; test-driven engineering for new features. Think carefully; no need to rush.
 - Code: Write the simplest code possible. Keep the codebase minimal and modular.
+
+## CURRENT TASK SOURCE OF TRUTH
+
+- The user's complete current task is the sole source of truth for execution.
+- The user's latest explicit request overrides conflicting history and earlier plans.
+- Historical tasks, tutorial cases, Skill examples, and repository examples are context only; they must never become the current execution target.
+- Example people, paths, platforms, parameters, and output artifacts must not leak into the current task.
+- If the current task is absent or materially ambiguous, request clarification instead of substituting an example task.
 
 ## ARCHITECTURE PRINCIPLES (see PLAN.md)
 
