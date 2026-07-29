@@ -99,6 +99,7 @@ class MessagesRequest(BaseModel):
     extra_body: dict[str, Any] | None = None
     original_model: str | None = None
     resolved_provider_model: str | None = None
+    upstream_model: str | None = None
 
     @model_validator(mode="after")
     def map_model(self) -> MessagesRequest:
@@ -109,10 +110,13 @@ class MessagesRequest(BaseModel):
 
         resolved_full = settings.resolve_model(self.original_model)
         self.resolved_provider_model = resolved_full
-        self.model = Settings.parse_model_name(resolved_full)
+        # Keep full provider/model string in self.model for provider routing context
+        self.model = resolved_full
+        # Extract pure model name for upstream API calls
+        self.upstream_model = Settings.parse_model_name(resolved_full)
 
         if self.model != self.original_model:
-            logger.debug(f"MODEL MAPPING: '{self.original_model}' -> '{self.model}'")
+            logger.debug(f"MODEL MAPPING: '{self.original_model}' -> '{self.model}' upstream='{self.upstream_model}'")
 
         return self
 
