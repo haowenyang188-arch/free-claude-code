@@ -6,10 +6,7 @@ from pathlib import Path
 from messaging.platforms.factory import create_messaging_platform
 from providers.base import BaseProvider
 from providers.deepseek import DeepSeekProvider
-from providers.llamacpp import LlamaCppProvider
-from providers.lmstudio import LMStudioProvider
-from providers.nvidia_nim import NvidiaNimProvider
-from providers.open_router import OpenRouterProvider
+from providers.minimax import MiniMaxProvider
 from smoke.features import FEATURE_INVENTORY, README_FEATURES, feature_ids
 
 VALID_COVERAGE = {"pytest", "live_smoke", "both"}
@@ -56,11 +53,8 @@ def test_feature_inventory_test_owners_exist() -> None:
 
 def test_provider_and_platform_registries_include_advertised_builtins() -> None:
     provider_classes = {
-        "nvidia_nim": NvidiaNimProvider,
-        "open_router": OpenRouterProvider,
+        "minimax": MiniMaxProvider,
         "deepseek": DeepSeekProvider,
-        "lmstudio": LMStudioProvider,
-        "llamacpp": LlamaCppProvider,
     }
     for provider_class in provider_classes.values():
         assert issubclass(provider_class, BaseProvider)

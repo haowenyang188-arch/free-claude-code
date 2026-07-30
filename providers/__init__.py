@@ -10,12 +10,7 @@ from .exceptions import (
     ProviderError,
     RateLimitError,
 )
-from .llamacpp import LlamaCppProvider
-from .lmstudio import LMStudioProvider
 from .minimax import MiniMaxProvider
-from .nvidia_nim import NvidiaNimProvider
-from .open_router import OpenRouterProvider
-from .xiaomi import XiaomiProvider
 
 __all__ = [
     "APIError",
@@ -23,12 +18,7 @@ __all__ = [
     "BaseProvider",
     "DeepSeekProvider",
     "InvalidRequestError",
-    "LMStudioProvider",
-    "LlamaCppProvider",
     "MiniMaxProvider",
-    "NvidiaNimProvider",
-    "OpenRouterProvider",
-    "XiaomiProvider",
     "OverloadedError",
     "ProviderConfig",
     "ProviderError",

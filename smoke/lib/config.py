@@ -15,8 +15,6 @@ DEFAULT_TARGETS = frozenset(
         "auth",
         "cli",
         "clients",
-        "llamacpp",
-        "lmstudio",
         "providers",
         "rate_limit",
         "tools",
@@ -41,8 +39,6 @@ TARGET_REQUIRED_ENV: dict[str, tuple[str, ...]] = {
     "providers": ("MODEL or MODEL_* with usable provider configuration",),
     "rate_limit": ("configured provider model",),
     "tools": ("configured tool-capable provider model",),
-    "lmstudio": ("LM_STUDIO_BASE_URL with a running LM Studio server",),
-    "llamacpp": ("LLAMACPP_BASE_URL with a running llama-server",),
     "telegram": (
         "TELEGRAM_BOT_TOKEN",
         "ALLOWED_TELEGRAM_USER_ID or FCC_SMOKE_TELEGRAM_CHAT_ID",
@@ -126,16 +122,10 @@ class SmokeConfig:
         return models
 
     def has_provider_configuration(self, provider: str) -> bool:
-        if provider == "nvidia_nim":
-            return bool(self.settings.nvidia_nim_api_key.strip())
-        if provider == "open_router":
-            return bool(self.settings.open_router_api_key.strip())
         if provider == "deepseek":
             return bool(self.settings.deepseek_api_key.strip())
-        if provider == "lmstudio":
-            return bool(self.settings.lm_studio_base_url.strip())
-        if provider == "llamacpp":
-            return bool(self.settings.llamacpp_base_url.strip())
+        if provider == "minimax":
+            return bool(self.settings.minimax_api_key.strip())
         return False
 
 

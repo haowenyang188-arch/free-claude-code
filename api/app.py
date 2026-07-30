@@ -36,7 +36,9 @@ def _clean_proxy_env() -> None:
         os.environ.pop(var, None)
 
     no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
-    entries = [entry.strip() for entry in no_proxy.split(",") if entry.strip()]
+    entries: list[str] = [
+        entry.strip() for entry in no_proxy.split(",") if entry.strip()
+    ]
     local_entries = ["127.0.0.1", "localhost"]
     for entry in local_entries:
         if entry not in entries:

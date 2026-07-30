@@ -9,12 +9,7 @@ from providers.base import BaseProvider, ProviderConfig
 from providers.common import get_user_facing_error_message
 from providers.deepseek import DEEPSEEK_BASE_URL, DeepSeekProvider
 from providers.exceptions import AuthenticationError
-from providers.llamacpp import LlamaCppProvider
-from providers.lmstudio import LMStudioProvider
 from providers.minimax import MINIMAX_BASE_URL, MiniMaxProvider
-from providers.nvidia_nim import NVIDIA_NIM_BASE_URL, NvidiaNimProvider
-from providers.open_router import OPENROUTER_BASE_URL, OpenRouterProvider
-from providers.xiaomi import XIAOMI_BASE_URL, XiaomiProvider
 
 # Provider registry: keyed by provider type string, lazily populated
 _providers: dict[str, BaseProvider] = {}
@@ -34,53 +29,10 @@ def _get_proxy_value(settings: Settings, attr_name: str) -> str:
 def _create_provider_for_type(provider_type: str, settings: Settings) -> BaseProvider:
     """Construct and return a new provider instance for the given provider type."""
     _proxy_map = {
-        "nvidia_nim": _get_proxy_value(settings, "nvidia_nim_proxy"),
-        "open_router": _get_proxy_value(settings, "open_router_proxy"),
-        "lmstudio": _get_proxy_value(settings, "lmstudio_proxy"),
-        "llamacpp": _get_proxy_value(settings, "llamacpp_proxy"),
         "minimax": _get_proxy_value(settings, "minimax_proxy"),
-        "xiaomi": _get_proxy_value(settings, "xiaomi_proxy"),
     }
     proxy = _proxy_map.get(provider_type, "")
 
-    if provider_type == "nvidia_nim":
-        if not settings.nvidia_nim_api_key or not settings.nvidia_nim_api_key.strip():
-            raise AuthenticationError(
-                "NVIDIA_NIM_API_KEY is not set. Add it to your .env file. "
-                "Get a key at https://build.nvidia.com/settings/api-keys"
-            )
-        config = ProviderConfig(
-            api_key=settings.nvidia_nim_api_key,
-            base_url=NVIDIA_NIM_BASE_URL,
-            rate_limit=settings.provider_rate_limit,
-            rate_window=settings.provider_rate_window,
-            max_concurrency=settings.provider_max_concurrency,
-            http_read_timeout=settings.http_read_timeout,
-            http_write_timeout=settings.http_write_timeout,
-            http_connect_timeout=settings.http_connect_timeout,
-            enable_thinking=settings.enable_thinking,
-            proxy=proxy,
-        )
-        return NvidiaNimProvider(config, nim_settings=settings.nim)
-    if provider_type == "open_router":
-        if not settings.open_router_api_key or not settings.open_router_api_key.strip():
-            raise AuthenticationError(
-                "OPENROUTER_API_KEY is not set. Add it to your .env file. "
-                "Get a key at https://openrouter.ai/keys"
-            )
-        config = ProviderConfig(
-            api_key=settings.open_router_api_key,
-            base_url=OPENROUTER_BASE_URL,
-            rate_limit=settings.provider_rate_limit,
-            rate_window=settings.provider_rate_window,
-            max_concurrency=settings.provider_max_concurrency,
-            http_read_timeout=settings.http_read_timeout,
-            http_write_timeout=settings.http_write_timeout,
-            http_connect_timeout=settings.http_connect_timeout,
-            enable_thinking=settings.enable_thinking,
-            proxy=proxy,
-        )
-        return OpenRouterProvider(config)
     if provider_type == "deepseek":
         if not settings.deepseek_api_key or not settings.deepseek_api_key.strip():
             raise AuthenticationError(
@@ -99,34 +51,6 @@ def _create_provider_for_type(provider_type: str, settings: Settings) -> BasePro
             enable_thinking=settings.enable_thinking,
         )
         return DeepSeekProvider(config)
-    if provider_type == "lmstudio":
-        config = ProviderConfig(
-            api_key="lm-studio",
-            base_url=settings.lm_studio_base_url,
-            rate_limit=settings.provider_rate_limit,
-            rate_window=settings.provider_rate_window,
-            max_concurrency=settings.provider_max_concurrency,
-            http_read_timeout=settings.http_read_timeout,
-            http_write_timeout=settings.http_write_timeout,
-            http_connect_timeout=settings.http_connect_timeout,
-            enable_thinking=settings.enable_thinking,
-            proxy=proxy,
-        )
-        return LMStudioProvider(config)
-    if provider_type == "llamacpp":
-        config = ProviderConfig(
-            api_key="llamacpp",
-            base_url=settings.llamacpp_base_url,
-            rate_limit=settings.provider_rate_limit,
-            rate_window=settings.provider_rate_window,
-            max_concurrency=settings.provider_max_concurrency,
-            http_read_timeout=settings.http_read_timeout,
-            http_write_timeout=settings.http_write_timeout,
-            http_connect_timeout=settings.http_connect_timeout,
-            enable_thinking=settings.enable_thinking,
-            proxy=proxy,
-        )
-        return LlamaCppProvider(config)
     if provider_type == "minimax":
         if not settings.minimax_api_key or not settings.minimax_api_key.strip():
             raise AuthenticationError(
@@ -145,31 +69,12 @@ def _create_provider_for_type(provider_type: str, settings: Settings) -> BasePro
             proxy=proxy,
         )
         return MiniMaxProvider(config)
-    if provider_type == "xiaomi":
-        if not settings.xiaomi_api_key or not settings.xiaomi_api_key.strip():
-            raise AuthenticationError(
-                "XIAOMI_API_KEY is not set. Add it to your .env file."
-            )
-        config = ProviderConfig(
-            api_key=settings.xiaomi_api_key,
-            base_url=settings.xiaomi_base_url or XIAOMI_BASE_URL,
-            rate_limit=settings.provider_rate_limit,
-            rate_window=settings.provider_rate_window,
-            max_concurrency=settings.provider_max_concurrency,
-            http_read_timeout=settings.http_read_timeout,
-            http_write_timeout=settings.http_write_timeout,
-            http_connect_timeout=settings.http_connect_timeout,
-            enable_thinking=settings.enable_thinking,
-            proxy=proxy,
-        )
-        return XiaomiProvider(config)
     logger.error(
-        "Unknown provider_type: '{}'. Supported: 'nvidia_nim', 'open_router', 'deepseek', 'lmstudio', 'llamacpp', 'minimax', 'xiaomi'",
+        "Unknown provider_type: '{}'. Supported: 'minimax', 'deepseek'",
         provider_type,
     )
     raise ValueError(
-        f"Unknown provider_type: '{provider_type}'. "
-        f"Supported: 'nvidia_nim', 'open_router', 'deepseek', 'lmstudio', 'llamacpp', 'minimax', 'xiaomi'"
+        f"Unknown provider_type: '{provider_type}'. Supported: 'minimax', 'deepseek'"
     )
 
 
@@ -196,7 +101,7 @@ def require_api_key(
 ) -> None:
     """Require a server API key (Anthropic-style).
 
-    Checks `x-api-key` header or `Authorization: Bearer ...` against
+    Checks `x-api-key` header or `Authorization: Bearer *** against
     `Settings.anthropic_auth_token`. If `ANTHROPIC_AUTH_TOKEN` is empty, this is a no-op.
     """
     anthropic_auth_token = settings.anthropic_auth_token

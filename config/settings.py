@@ -10,8 +10,6 @@ from dotenv import dotenv_values
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .nim import NimSettings
-
 
 def _env_files() -> tuple[Path, ...]:
     """Return env file paths in priority order (later overrides earlier)."""
@@ -89,24 +87,14 @@ def _removed_env_var_message(model_config: Mapping[str, Any]) -> str | None:
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
-    # ==================== OpenRouter Config ====================
-    open_router_api_key: str = Field(default="", validation_alias="OPENROUTER_API_KEY")
-
     # ==================== DeepSeek Config ====================
     deepseek_api_key: str = Field(default="", validation_alias="DEEPSEEK_API_KEY")
 
     # ==================== MiniMax Config ====================
     minimax_api_key: str = Field(default="", validation_alias="MINIMAX_API_KEY")
     minimax_base_url: str = Field(
-        default="https://api.minimax.io/anthropic",
+        default="https://api.minimaxi.com/anthropic",
         validation_alias="MINIMAX_BASE_URL",
-    )
-
-    # ==================== Xiaomi MiMo Config ====================
-    xiaomi_api_key: str = Field(default="", validation_alias="XIAOMI_API_KEY")
-    xiaomi_base_url: str = Field(
-        default="https://token-plan-cn.xiaomimimo.com/v1",
-        validation_alias="XIAOMI_BASE_URL",
     )
 
     # ==================== Messaging Platform Selection ====================
@@ -115,25 +103,11 @@ class Settings(BaseSettings):
         default="discord", validation_alias="MESSAGING_PLATFORM"
     )
 
-    # ==================== NVIDIA NIM Config ====================
-    nvidia_nim_api_key: str = ""
-
-    # ==================== LM Studio Config ====================
-    lm_studio_base_url: str = Field(
-        default="http://localhost:1234/v1",
-        validation_alias="LM_STUDIO_BASE_URL",
-    )
-
-    # ==================== Llama.cpp Config ====================
-    llamacpp_base_url: str = Field(
-        default="http://localhost:8080/v1",
-        validation_alias="LLAMACPP_BASE_URL",
-    )
-
     # ==================== Model ====================
     # All Claude model requests are mapped to this single model (fallback)
     # Format: provider_type/model/name
-    model: str = "nvidia_nim/z-ai/glm4.7"
+    # Valid providers: "minimax" | "deepseek"
+    model: str = "minimax/MiniMax-M3"
 
     # Per-model overrides (optional, falls back to MODEL)
     # Each can use a different provider
@@ -142,12 +116,7 @@ class Settings(BaseSettings):
     model_haiku: str | None = Field(default=None, validation_alias="MODEL_HAIKU")
 
     # ==================== Per-Provider Proxy ====================
-    nvidia_nim_proxy: str = Field(default="", validation_alias="NVIDIA_NIM_PROXY")
-    open_router_proxy: str = Field(default="", validation_alias="OPENROUTER_PROXY")
-    lmstudio_proxy: str = Field(default="", validation_alias="LMSTUDIO_PROXY")
-    llamacpp_proxy: str = Field(default="", validation_alias="LLAMACPP_PROXY")
     minimax_proxy: str = Field(default="", validation_alias="MINIMAX_PROXY")
-    xiaomi_proxy: str = Field(default="", validation_alias="XIAOMI_PROXY")
 
     # ==================== Provider Rate Limiting ====================
     provider_rate_limit: int = Field(default=40, validation_alias="PROVIDER_RATE_LIMIT")
@@ -179,20 +148,15 @@ class Settings(BaseSettings):
     enable_suggestion_mode_skip: bool = True
     enable_filepath_extraction_mock: bool = True
 
-    # ==================== NIM Settings ====================
-    nim: NimSettings = Field(default_factory=NimSettings)
-
     # ==================== Voice Note Transcription ====================
+    # Local Whisper transcription (requires the voice_local extra).
     voice_note_enabled: bool = Field(
         default=True, validation_alias="VOICE_NOTE_ENABLED"
     )
-    # Device: "cpu" | "cuda" | "nvidia_nim"
+    # Device: "cpu" | "cuda"
     # - "cpu"/"cuda": local Whisper (requires voice_local extra: uv sync --extra voice_local)
-    # - "nvidia_nim": NVIDIA NIM Whisper API (requires voice extra: uv sync --extra voice)
     whisper_device: str = Field(default="cpu", validation_alias="WHISPER_DEVICE")
-    # Whisper model ID or short name (for local Whisper) or NVIDIA NIM model (for nvidia_nim)
-    # Local Whisper: "tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo"
-    # NVIDIA NIM: "nvidia/parakeet-ctc-1.1b-asr", "openai/whisper-large-v3", etc.
+    # Whisper model ID or short name (for local Whisper)
     whisper_model: str = Field(default="base", validation_alias="WHISPER_MODEL")
     # Hugging Face token for faster model downloads (optional, for local Whisper)
     hf_token: str = Field(default="", validation_alias="HF_TOKEN")
@@ -247,10 +211,8 @@ class Settings(BaseSettings):
     @field_validator("whisper_device")
     @classmethod
     def validate_whisper_device(cls, v: str) -> str:
-        if v not in ("cpu", "cuda", "nvidia_nim"):
-            raise ValueError(
-                f"whisper_device must be 'cpu', 'cuda', or 'nvidia_nim', got {v!r}"
-            )
+        if v not in ("cpu", "cuda"):
+            raise ValueError(f"whisper_device must be 'cpu' or 'cuda', got {v!r}")
         return v
 
     @field_validator("model", "model_opus", "model_sonnet", "model_haiku")
@@ -258,15 +220,7 @@ class Settings(BaseSettings):
     def validate_model_format(cls, v: str | None) -> str | None:
         if v is None:
             return None
-        valid_providers = (
-            "nvidia_nim",
-            "open_router",
-            "deepseek",
-            "lmstudio",
-            "llamacpp",
-            "minimax",
-            "xiaomi",
-        )
+        valid_providers = ("minimax", "deepseek")
         if "/" not in v:
             raise ValueError(
                 f"Model must be prefixed with provider type. "
@@ -276,8 +230,7 @@ class Settings(BaseSettings):
         provider = v.split("/", 1)[0]
         if provider not in valid_providers:
             raise ValueError(
-                f"Invalid provider: '{provider}'. "
-                f"Supported: 'nvidia_nim', 'open_router', 'deepseek', 'lmstudio', 'llamacpp', 'minimax', 'xiaomi'"
+                f"Invalid provider: '{provider}'. Supported: 'minimax', 'deepseek'"
             )
         return v
 
@@ -286,29 +239,13 @@ class Settings(BaseSettings):
         """Let explicit .env secrets override stale shell/client values."""
         secret_fields = {
             "ANTHROPIC_AUTH_TOKEN": "anthropic_auth_token",
-            "OPENROUTER_API_KEY": "open_router_api_key",
             "DEEPSEEK_API_KEY": "deepseek_api_key",
             "MINIMAX_API_KEY": "minimax_api_key",
-            "XIAOMI_API_KEY": "xiaomi_api_key",
-            "NVIDIA_NIM_API_KEY": "nvidia_nim_api_key",
         }
         for env_key, field_name in secret_fields.items():
             dotenv_value = _env_file_override(self.model_config, env_key)
             if dotenv_value is not None:
                 setattr(self, field_name, dotenv_value)
-        return self
-
-    @model_validator(mode="after")
-    def check_nvidia_nim_api_key(self) -> Settings:
-        if (
-            self.voice_note_enabled
-            and self.whisper_device == "nvidia_nim"
-            and not self.nvidia_nim_api_key.strip()
-        ):
-            raise ValueError(
-                "NVIDIA_NIM_API_KEY is required when WHISPER_DEVICE is 'nvidia_nim'. "
-                "Set it in your .env file."
-            )
         return self
 
     def _has_dotenv_anthropic_auth_token(self) -> bool:

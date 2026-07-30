@@ -116,7 +116,9 @@ class MessagesRequest(BaseModel):
         self.upstream_model = Settings.parse_model_name(resolved_full)
 
         if self.model != self.original_model:
-            logger.debug(f"MODEL MAPPING: '{self.original_model}' -> '{self.model}' upstream='{self.upstream_model}'")
+            logger.debug(
+                f"MODEL MAPPING: '{self.original_model}' -> '{self.model}' upstream='{self.upstream_model}'"
+            )
 
         return self
 

@@ -3,10 +3,10 @@ from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
 from api.app import app
-from providers.nvidia_nim import NvidiaNimProvider
+from providers.minimax import MiniMaxProvider
 
 # Mock provider
-mock_provider = MagicMock(spec=NvidiaNimProvider)
+mock_provider = MagicMock(spec=MiniMaxProvider)
 
 # Track stream_response calls for test_model_mapping
 _stream_response_calls = []

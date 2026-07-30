@@ -10,8 +10,8 @@ from pydantic import BaseModel
 class ProviderConfig(BaseModel):
     """Configuration for a provider.
 
-    Base fields apply to all providers. Provider-specific parameters
-    (e.g. NIM temperature, top_p) are passed by the provider constructor.
+    Base fields apply to all providers. Provider-specific parameters are passed
+    by the provider constructor.
     """
 
     api_key: str

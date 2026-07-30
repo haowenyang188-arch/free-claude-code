@@ -12,7 +12,7 @@
 [![Code style: Ruff](https://img.shields.io/badge/code%20formatting-ruff-f5a623.svg?style=for-the-badge)](https://github.com/astral-sh/ruff)
 [![Logging: Loguru](https://img.shields.io/badge/logging-loguru-4ecdc4.svg?style=for-the-badge)](https://github.com/Delgan/loguru)
 
-A lightweight proxy that routes Claude Code's Anthropic API calls to **NVIDIA NIM** (40 req/min free), **OpenRouter** (hundreds of models), **DeepSeek** (direct API), **LM Studio** (fully local), or **llama.cpp** (local with Anthropic endpoints).
+A lightweight proxy that routes Claude Code's Anthropic API calls to **MiniMax** or **DeepSeek**.
 
 [Quick Start](#quick-start) · [Providers](#providers) · [Discord Bot](#discord-bot) · [Configuration](#configuration) · [Development](#development) · [Contributing](#contributing)
 
@@ -22,16 +22,16 @@ A lightweight proxy that routes Claude Code's Anthropic API calls to **NVIDIA NI
 
 <div align="center">
   <img src="pic.png" alt="Free Claude Code in action" width="700">
-  <p><em>Claude Code running via NVIDIA NIM, completely free</em></p>
+  <p><em>Claude Code running through an alternative model provider</em></p>
 </div>
 
 ## Features
 
 | Feature                    | Description                                                                                     |
 | -------------------------- | ----------------------------------------------------------------------------------------------- |
-| **Zero Cost**              | 40 req/min free on NVIDIA NIM. Free models on OpenRouter. Fully local with LM Studio            |
+| **Alternative Providers**  | Route Claude Code through MiniMax or DeepSeek APIs                                               |
 | **Drop-in Replacement**    | Set 2 env vars. No modifications to Claude Code CLI or VSCode extension needed                  |
-| **5 Providers**            | NVIDIA NIM, OpenRouter, DeepSeek, LM Studio (local), llama.cpp (`llama-server`)                  |
+| **2 Providers**            | MiniMax and DeepSeek                                                                             |
 | **Per-Model Mapping**      | Route Opus / Sonnet / Haiku to different models and providers. Mix providers freely             |
 | **Thinking Token Support** | Parses `<think>` tags and `reasoning_content` into native Claude thinking blocks                |
 | **Heuristic Tool Parser**  | Models outputting tool calls as text are auto-parsed into structured tool use                   |
@@ -45,12 +45,9 @@ A lightweight proxy that routes Claude Code's Anthropic API calls to **NVIDIA NI
 
 ### Prerequisites
 
-1. Get an API key (or use LM Studio / llama.cpp locally):
-   - **NVIDIA NIM**: [build.nvidia.com/settings/api-keys](https://build.nvidia.com/settings/api-keys)
-   - **OpenRouter**: [openrouter.ai/keys](https://openrouter.ai/keys)
+1. Get an API key:
+   - **MiniMax**: [platform.minimax.io](https://platform.minimax.io)
    - **DeepSeek**: [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
-   - **LM Studio**: No API key needed. Run locally with [LM Studio](https://lmstudio.ai)
-   - **llama.cpp**: No API key needed. Run `llama-server` locally.
 2. Install [Claude Code](https://github.com/anthropics/claude-code)
 
 ### Install `uv`
@@ -71,32 +68,19 @@ cp .env.example .env
 Choose your provider and edit `.env`:
 
 <details>
-<summary><b>NVIDIA NIM</b> (40 req/min free, recommended)</summary>
+<summary><b>MiniMax</b></summary>
 
 ```dotenv
-NVIDIA_NIM_API_KEY="nvapi-your-key-here"
+MINIMAX_API_KEY="your-minimax-key-here"
+MINIMAX_BASE_URL="https://api.minimaxi.com/anthropic"
 
 MODEL_OPUS=
 MODEL_SONNET=
 MODEL_HAIKU=
-MODEL="nvidia_nim/z-ai/glm4.7"                     # fallback
+MODEL="minimax/MiniMax-M3"                         # fallback
 
 # Global switch for provider reasoning requests and Claude thinking blocks.
 ENABLE_THINKING=true
-```
-
-</details>
-
-<details>
-<summary><b>OpenRouter</b> (hundreds of models)</summary>
-
-```dotenv
-OPENROUTER_API_KEY="sk-or-your-key-here"
-
-MODEL_OPUS="open_router/deepseek/deepseek-r1-0528:free"
-MODEL_SONNET="open_router/openai/gpt-oss-120b:free"
-MODEL_HAIKU="open_router/stepfun/step-3.5-flash:free"
-MODEL="open_router/stepfun/step-3.5-flash:free"     # fallback
 ```
 
 </details>
@@ -116,44 +100,18 @@ MODEL="deepseek/deepseek-chat"                      # fallback
 </details>
 
 <details>
-<summary><b>LM Studio</b> (fully local, no API key)</summary>
-
-```dotenv
-MODEL_OPUS="lmstudio/unsloth/MiniMax-M2.5-GGUF"
-MODEL_SONNET="lmstudio/unsloth/Qwen3.5-35B-A3B-GGUF"
-MODEL_HAIKU="lmstudio/unsloth/GLM-4.7-Flash-GGUF"
-MODEL="lmstudio/unsloth/GLM-4.7-Flash-GGUF"         # fallback
-```
-
-</details>
-
-<details>
-<summary><b>llama.cpp</b> (fully local, no API key)</summary>
-
-```dotenv
-LLAMACPP_BASE_URL="http://localhost:8080/v1"
-
-MODEL_OPUS="llamacpp/local-model"
-MODEL_SONNET="llamacpp/local-model"
-MODEL_HAIKU="llamacpp/local-model"
-MODEL="llamacpp/local-model"
-```
-
-</details>
-
-<details>
 <summary><b>Mix providers</b></summary>
 
 Each `MODEL_*` variable can use a different provider. `MODEL` is the fallback for unrecognized Claude models.
 
 ```dotenv
-NVIDIA_NIM_API_KEY="nvapi-your-key-here"
-OPENROUTER_API_KEY="sk-or-your-key-here"
+MINIMAX_API_KEY="your-minimax-key-here"
+DEEPSEEK_API_KEY="your-deepseek-key-here"
 
-MODEL_OPUS="nvidia_nim/moonshotai/kimi-k2.5"
-MODEL_SONNET="open_router/deepseek/deepseek-r1-0528:free"
-MODEL_HAIKU="lmstudio/unsloth/GLM-4.7-Flash-GGUF"
-MODEL="nvidia_nim/z-ai/glm4.7"                      # fallback
+MODEL_OPUS="minimax/MiniMax-M3"
+MODEL_SONNET="deepseek/deepseek-chat"
+MODEL_HAIKU="deepseek/deepseek-chat"
+MODEL="minimax/MiniMax-M3"                         # fallback
 ```
 
 </details>
@@ -261,31 +219,16 @@ To switch back to Anthropic models, comment out the added block and reload exten
 </details>
 
 <details>
-<summary><b>Multi-Model Support (Model Picker)</b></summary>
+<summary><b>Configured Model Launcher</b></summary>
 
-`claude-pick` is an interactive model selector that lets you choose any model from your active provider each time you launch Claude, without editing `MODEL` in `.env`.
-
-https://github.com/user-attachments/assets/9a33c316-90f8-4418-9650-97e7d33ad645
-
-**1. Install [fzf](https://github.com/junegunn/fzf)**:
-
-```bash
-brew install fzf        # macOS/Linux
-```
-
-**2. Add the alias to `~/.zshrc` or `~/.bashrc`:**
+`claude-pick` keeps its historical name but now launches Claude using the
+`MODEL` configured in `.env`. Add an alias to `~/.zshrc` or `~/.bashrc`:
 
 ```bash
 alias claude-pick="/absolute/path/to/free-claude-code/claude-pick"
 ```
 
 Then reload your shell (`source ~/.zshrc` or `source ~/.bashrc`) and run `claude-pick`.
-
-**Or use a fixed model alias** (no picker needed):
-
-```bash
-alias claude-kimi='ANTHROPIC_BASE_URL="http://localhost:8082" ANTHROPIC_AUTH_TOKEN="freecc:moonshotai/kimi-k2.5" claude'
-```
 
 </details>
 
@@ -311,16 +254,16 @@ free-claude-code    # starts the server
 ```
 ┌─────────────────┐        ┌──────────────────────┐        ┌──────────────────┐
 │  Claude Code    │───────>│  Free Claude Code    │───────>│  LLM Provider    │
-│  CLI / VSCode   │<───────│  Proxy (:8082)       │<───────│  NIM / OR / LMS  │
+│  CLI / VSCode   │<───────│  Proxy (:8082)       │<───────│ MiniMax/DeepSeek │
 └─────────────────┘        └──────────────────────┘        └──────────────────┘
-   Anthropic API                                             OpenAI-compatible
-   format (SSE)                                             format (SSE)
+   Anthropic API                                             Provider API
+   format (SSE)                                              format (SSE)
 ```
 
 - **Transparent proxy**: Claude Code sends standard Anthropic API requests; the proxy forwards them to your configured provider
 - **Per-model routing**: Opus / Sonnet / Haiku requests resolve to their model-specific backend, with `MODEL` as fallback
 - **Request optimization**: 5 categories of trivial requests (quota probes, title generation, prefix detection, suggestions, filepath extraction) are intercepted and responded to locally without using API quota
-- **Format translation**: Requests are translated from Anthropic format to the provider's OpenAI-compatible format and streamed back
+- **Format handling**: Requests use each provider's native compatible format and stream back as Anthropic SSE
 - **Thinking tokens**: `<think>` tags and `reasoning_content` fields are converted into native Claude thinking blocks when `ENABLE_THINKING=true`
 
 The proxy also exposes Claude-compatible probe routes: `GET /v1/models`, `POST /v1/messages`, `POST /v1/messages/count_tokens`, plus `HEAD`/`OPTIONS` support for the common probe endpoints.
@@ -329,50 +272,24 @@ The proxy also exposes Claude-compatible probe routes: `GET /v1/models`, `POST /
 
 ## Providers
 
-| Provider       | Cost         | Rate Limit | Best For                             |
-| -------------- | ------------ | ---------- | ------------------------------------ |
-| **NVIDIA NIM** | Free         | 40 req/min | Daily driver, generous free tier     |
-| **OpenRouter** | Free / Paid  | Varies     | Model variety, fallback options      |
-| **DeepSeek**   | Usage-based  | Varies     | Direct access to DeepSeek chat/reasoner |
-| **LM Studio**  | Free (local) | Unlimited  | Privacy, offline use, no rate limits |
-| **llama.cpp**  | Free (local) | Unlimited  | Lightweight local inference engine   |
+| Provider     | Cost        | Rate Limit | Best For                              |
+| ------------ | ----------- | ---------- | ------------------------------------- |
+| **MiniMax**  | Usage-based | Varies     | Anthropic-compatible MiniMax models   |
+| **DeepSeek** | Usage-based | Varies     | Direct DeepSeek chat/reasoner access  |
 
 Models use a prefix format: `provider_prefix/model/name`. An invalid prefix causes an error.
 
-| Provider   | `MODEL` prefix    | API Key Variable     | Default Base URL              |
-| ---------- | ----------------- | -------------------- | ----------------------------- |
-| NVIDIA NIM | `nvidia_nim/...`  | `NVIDIA_NIM_API_KEY` | `integrate.api.nvidia.com/v1` |
-| OpenRouter | `open_router/...` | `OPENROUTER_API_KEY` | `openrouter.ai/api/v1`        |
-| DeepSeek   | `deepseek/...`    | `DEEPSEEK_API_KEY`   | `api.deepseek.com`            |
-| LM Studio  | `lmstudio/...`    | (none)               | `localhost:1234/v1`           |
-| llama.cpp  | `llamacpp/...`    | (none)               | `localhost:8080/v1`           |
+| Provider | `MODEL` prefix | API Key Variable   | Default Base URL                 |
+| -------- | -------------- | ------------------ | -------------------------------- |
+| MiniMax  | `minimax/...`  | `MINIMAX_API_KEY`  | `api.minimaxi.com/anthropic`     |
+| DeepSeek | `deepseek/...` | `DEEPSEEK_API_KEY` | `api.deepseek.com`               |
 
 <details>
-<summary><b>NVIDIA NIM models</b></summary>
+<summary><b>MiniMax models</b></summary>
 
-Popular models (full list in [`nvidia_nim_models.json`](nvidia_nim_models.json)):
+- `minimax/MiniMax-M3`
 
-- `nvidia_nim/minimaxai/minimax-m2.5`
-- `nvidia_nim/qwen/qwen3.5-397b-a17b`
-- `nvidia_nim/z-ai/glm5`
-- `nvidia_nim/moonshotai/kimi-k2.5`
-- `nvidia_nim/stepfun-ai/step-3.5-flash`
-
-Browse: [build.nvidia.com](https://build.nvidia.com/explore/discover) · Update list: `curl "https://integrate.api.nvidia.com/v1/models" > nvidia_nim_models.json`
-
-</details>
-
-<details>
-<summary><b>OpenRouter models</b></summary>
-
-Popular free models:
-
-- `open_router/arcee-ai/trinity-large-preview:free`
-- `open_router/stepfun/step-3.5-flash:free`
-- `open_router/deepseek/deepseek-r1-0528:free`
-- `open_router/openai/gpt-oss-120b:free`
-
-Browse: [openrouter.ai/models](https://openrouter.ai/models) · [Free models](https://openrouter.ai/collections/free-models)
+Browse: [platform.minimax.io](https://platform.minimax.io)
 
 </details>
 
@@ -385,32 +302,6 @@ DeepSeek currently exposes the direct API models:
 - `deepseek/deepseek-reasoner`
 
 Browse: [api-docs.deepseek.com](https://api-docs.deepseek.com)
-
-</details>
-
-<details>
-<summary><b>LM Studio models</b></summary>
-
-Run models locally with [LM Studio](https://lmstudio.ai). Load a model in the Chat or Developer tab, then set `MODEL` to its identifier.
-
-Examples with native tool-use support:
-
-- `LiquidAI/LFM2-24B-A2B-GGUF`
-- `unsloth/MiniMax-M2.5-GGUF`
-- `unsloth/GLM-4.7-Flash-GGUF`
-- `unsloth/Qwen3.5-35B-A3B-GGUF`
-
-Browse: [model.lmstudio.ai](https://model.lmstudio.ai)
-
-</details>
-
-<details>
-<summary><b>llama.cpp models</b></summary>
-
-Run models locally using `llama-server`. Ensure you have a tool-capable GGUF. Set `MODEL` to whatever arbitrary name you'd like (e.g. `llamacpp/my-model`), as `llama-server` ignores the model name when run via `/v1/messages`.
-
-See the Unsloth docs for detailed instructions and capable models:
-[https://unsloth.ai/docs/models/qwen3.5#qwen3.5-small-0.8b-2b-4b-9b](https://unsloth.ai/docs/models/qwen3.5#qwen3.5-small-0.8b-2b-4b-9b)
 
 </details>
 
@@ -473,26 +364,19 @@ Get a token from [@BotFather](https://t.me/BotFather); find your user ID via [@u
 
 Send voice messages on Discord or Telegram; they are transcribed and processed as regular prompts.
 
-| Backend                     | Description                                                                                                   | API Key              |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------- | -------------------- |
-| **Local Whisper** (default) | [Hugging Face Whisper](https://huggingface.co/openai/whisper-large-v3-turbo) — free, offline, CUDA compatible | not required         |
-| **NVIDIA NIM**              | Whisper/Parakeet models via gRPC                                                                              | `NVIDIA_NIM_API_KEY` |
+Voice notes use local [Hugging Face Whisper](https://huggingface.co/openai/whisper-large-v3-turbo), with CPU and CUDA support.
 
 **Install the voice extras:**
 
 ```bash
 # If you cloned the repo:
-uv sync --extra voice_local          # Local Whisper
-uv sync --extra voice                # NVIDIA NIM
-uv sync --extra voice --extra voice_local  # Both
+uv sync --extra voice_local
 
 # If you installed as a package (no clone):
 uv tool install "free-claude-code[voice_local] @ git+https://github.com/Alishahryar1/free-claude-code.git"
-uv tool install "free-claude-code[voice] @ git+https://github.com/Alishahryar1/free-claude-code.git"
-uv tool install "free-claude-code[voice,voice_local] @ git+https://github.com/Alishahryar1/free-claude-code.git"
 ```
 
-Configure via `WHISPER_DEVICE` (`cpu` | `cuda` | `nvidia_nim`) and `WHISPER_MODEL`. See the [Configuration](#configuration) table for all voice variables and supported model values.
+Configure via `WHISPER_DEVICE` (`cpu` | `cuda`) and `WHISPER_MODEL`. See the [Configuration](#configuration) table for all voice variables and supported model values.
 
 ---
 
@@ -502,20 +386,15 @@ Configure via `WHISPER_DEVICE` (`cpu` | `cuda` | `nvidia_nim`) and `WHISPER_MODE
 
 | Variable             | Description                                                           | Default                                           |
 | -------------------- | --------------------------------------------------------------------- | ------------------------------------------------- |
-| `MODEL`              | Fallback model (`provider/model/name` format; invalid prefix → error) | `nvidia_nim/z-ai/glm4.7`                          |
+| `MODEL`              | Fallback model (`provider/model/name` format; invalid prefix → error) | `minimax/MiniMax-M3`                              |
 | `MODEL_OPUS`         | Model for Claude Opus requests; empty falls back to `MODEL`           | empty                                             |
 | `MODEL_SONNET`       | Model for Claude Sonnet requests; empty falls back to `MODEL`         | empty                                             |
 | `MODEL_HAIKU`        | Model for Claude Haiku requests; empty falls back to `MODEL`          | empty                                             |
-| `NVIDIA_NIM_API_KEY`    | NVIDIA API key                                                        | required for NIM                                  |
 | `ENABLE_THINKING`    | Global switch for provider reasoning requests and Claude thinking blocks. Set `false` to hide thinking across all providers. | `true` |
-| `OPENROUTER_API_KEY` | OpenRouter API key                                                    | required for OpenRouter                           |
+| `MINIMAX_API_KEY`    | MiniMax API key                                                       | required for MiniMax                              |
+| `MINIMAX_BASE_URL`   | MiniMax Anthropic-compatible endpoint                                 | `https://api.minimaxi.com/anthropic`              |
 | `DEEPSEEK_API_KEY`   | DeepSeek API key                                                      | required for DeepSeek                             |
-| `LM_STUDIO_BASE_URL` | LM Studio server URL                                                  | `http://localhost:1234/v1`                        |
-| `LLAMACPP_BASE_URL`  | llama.cpp server URL                                                  | `http://localhost:8080/v1`                        |
-| `NVIDIA_NIM_PROXY`   | Optional proxy URL for NVIDIA NIM requests (`http://...` or `socks5://...`) | `""` |
-| `OPENROUTER_PROXY`   | Optional proxy URL for OpenRouter requests (`http://...` or `socks5://...`) | `""` |
-| `LMSTUDIO_PROXY`     | Optional proxy URL for LM Studio requests (`http://...` or `socks5://...`) | `""` |
-| `LLAMACPP_PROXY`     | Optional proxy URL for llama.cpp requests (`http://...` or `socks5://...`) | `""` |
+| `MINIMAX_PROXY`      | Optional proxy URL for MiniMax requests                               | `""`                                             |
 
 ### Rate Limiting & Timeouts
 
@@ -542,8 +421,8 @@ Configure via `WHISPER_DEVICE` (`cpu` | `cuda` | `nvidia_nim`) and `WHISPER_MODE
 | `MESSAGING_RATE_LIMIT`     | Messaging messages per window                                                                                                                                      | `1`                 |
 | `MESSAGING_RATE_WINDOW`    | Messaging window (seconds)                                                                                                                                         | `1`                 |
 | `VOICE_NOTE_ENABLED`       | Enable voice note handling                                                                                                                                         | `true`              |
-| `WHISPER_DEVICE`           | `cpu` \| `cuda` \| `nvidia_nim`                                                                                                                                    | `cpu`               |
-| `WHISPER_MODEL`            | Whisper model (local: `tiny`/`base`/`small`/`medium`/`large-v2`/`large-v3`/`large-v3-turbo`; NIM: `openai/whisper-large-v3`, `nvidia/parakeet-ctc-1.1b-asr`, etc.) | `base`              |
+| `WHISPER_DEVICE`           | `cpu` \| `cuda`                                                                                                                                                     | `cpu`               |
+| `WHISPER_MODEL`            | Whisper model (`tiny`/`base`/`small`/`medium`/`large-v2`/`large-v3`/`large-v3-turbo`, or a Hugging Face model ID)                                               | `base`              |
 | `HF_TOKEN`                 | Hugging Face token for faster downloads (local Whisper, optional)                                                                                                  | —                   |
 
 <details>
@@ -573,10 +452,10 @@ See [`.env.example`](.env.example) for all supported parameters.
 free-claude-code/
 ├── server.py              # Entry point
 ├── api/                   # FastAPI routes, request detection, optimization handlers
-├── providers/             # BaseProvider, OpenAICompatibleProvider, NIM, OpenRouter, DeepSeek, LM Studio, llamacpp
+├── providers/             # BaseProvider, MiniMax, DeepSeek, and shared provider utilities
 │   └── common/            # Shared utils (SSE builder, message converter, parsers, error mapping)
 ├── messaging/             # MessagingPlatform ABC + Discord/Telegram bots, session management
-├── config/                # Settings, NIM config, logging
+├── config/                # Settings and logging
 ├── cli/                   # CLI session and process management
 └── tests/                 # Pytest test suite
 ```

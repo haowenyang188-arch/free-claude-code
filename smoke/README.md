@@ -27,8 +27,6 @@ Default targets do not require bot tokens or voice backends:
 | `providers` | configured provider model streams | provider keys or local provider URLs |
 | `tools` | configured model emits live tool use | tool-capable configured provider |
 | `rate_limit` | client disconnect does not crash a provider stream | configured provider |
-| `lmstudio` | LM Studio `/models` endpoint is reachable | running LM Studio server |
-| `llamacpp` | llama.cpp `/models` endpoint is reachable | running `llama-server` |
 
 Side-effectful targets are opt-in:
 

@@ -1,4 +1,4 @@
-"""Tests for providers/nvidia_nim/errors.py error mapping."""
+"""Tests for shared provider error mapping."""
 
 from unittest.mock import MagicMock, patch
 

@@ -36,7 +36,7 @@ class FeatureCoverage:
 
 
 README_FEATURES: tuple[str, ...] = (
-    "zero_cost_provider_access",
+    "alternative_provider_access",
     "drop_in_claude_code_replacement",
     "provider_matrix",
     "per_model_mapping",
@@ -56,15 +56,15 @@ README_FEATURES: tuple[str, ...] = (
 
 FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
     FeatureCoverage(
-        "zero_cost_provider_access",
+        "alternative_provider_access",
         "Configured provider accepts a real prompt",
         "readme",
         "both",
-        ("tests/api/test_dependencies.py", "tests/providers/test_open_router.py"),
+        ("tests/api/test_dependencies.py", "tests/providers/test_deepseek.py"),
         ("test_configured_provider_models_stream_successfully",),
         ("providers",),
-        ("NVIDIA_NIM_API_KEY|OPENROUTER_API_KEY|DEEPSEEK_API_KEY|local provider",),
-        "skip when no usable provider credentials or local provider endpoint exists",
+        ("MINIMAX_API_KEY|DEEPSEEK_API_KEY",),
+        "skip when no usable provider credentials exist",
     ),
     FeatureCoverage(
         "drop_in_claude_code_replacement",
@@ -306,28 +306,6 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
         (),
         (),
         "hermetic config coverage",
-    ),
-    FeatureCoverage(
-        "lmstudio_endpoint",
-        "Configured LM Studio endpoint exposes an OpenAI-compatible models route",
-        "public_surface",
-        "both",
-        ("tests/providers/test_lmstudio.py",),
-        ("test_lmstudio_models_endpoint_when_available",),
-        ("lmstudio",),
-        ("LM_STUDIO_BASE_URL",),
-        "skip when the local LM Studio server is not reachable",
-    ),
-    FeatureCoverage(
-        "llamacpp_endpoint",
-        "Configured llama.cpp endpoint exposes an OpenAI-compatible models route",
-        "public_surface",
-        "both",
-        ("tests/providers/test_llamacpp.py",),
-        ("test_llamacpp_models_endpoint_when_available",),
-        ("llamacpp",),
-        ("LLAMACPP_BASE_URL",),
-        "skip when the local llama.cpp server is not reachable",
     ),
     FeatureCoverage(
         "package_cli_entrypoints",

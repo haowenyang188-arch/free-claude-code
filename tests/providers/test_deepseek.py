@@ -69,7 +69,7 @@ def deepseek_provider(deepseek_config):
 
 def test_init(deepseek_config):
     """Test provider initialization."""
-    with patch("providers.openai_compat.AsyncOpenAI") as mock_openai:
+    with patch("providers.openai_compat._AuthHeaderOpenAI") as mock_openai:
         provider = DeepSeekProvider(deepseek_config)
         assert provider._api_key == "test_deepseek_key"
         assert provider._base_url == DEEPSEEK_BASE_URL

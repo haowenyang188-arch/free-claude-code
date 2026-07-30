@@ -1,4 +1,4 @@
-"""Shared base class for OpenAI-compatible providers (NIM, OpenRouter, LM Studio)."""
+"""Shared base class for OpenAI-compatible providers."""
 
 import json
 import uuid
@@ -104,7 +104,7 @@ class OpenAICompatibleProvider(BaseProvider):
     def _handle_extra_reasoning(
         self, delta: Any, sse: SSEBuilder, *, thinking_enabled: bool
     ) -> Iterator[str]:
-        """Hook for provider-specific reasoning (e.g. OpenRouter reasoning_details)."""
+        """Hook for provider-specific reasoning fields."""
         return iter(())
 
     def _get_retry_request_body(self, error: Exception, body: dict) -> dict | None:
@@ -251,7 +251,7 @@ class OpenAICompatibleProvider(BaseProvider):
                             yield event
                         yield sse.emit_thinking_delta(reasoning)
 
-                    # Provider-specific extra reasoning (e.g. OpenRouter reasoning_details)
+                    # Provider-specific extra reasoning fields
                     for event in self._handle_extra_reasoning(
                         delta,
                         sse,

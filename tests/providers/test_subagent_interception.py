@@ -3,17 +3,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from config.nim import NimSettings
 from providers.base import ProviderConfig
 from providers.common import ContentBlockManager
-from providers.nvidia_nim import NvidiaNimProvider
+from providers.deepseek import DeepSeekProvider
 
 
 @pytest.mark.asyncio
 async def test_task_tool_interception():
-    # Setup provider
-    config = ProviderConfig(api_key="test")
-    provider = NvidiaNimProvider(config, nim_settings=NimSettings())
+    # Setup provider (uses OpenAI-compatible subclass so _process_tool_call exists)
+    config = ProviderConfig(api_key="test", base_url="https://test/deepseek")
+    provider = DeepSeekProvider(config)
 
     # Mock request and sse builder with real ContentBlockManager
     request = MagicMock()

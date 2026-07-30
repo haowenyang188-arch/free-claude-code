@@ -1,4 +1,4 @@
-"""Shared provider utilities used by NIM, OpenRouter, and LM Studio."""
+"""Shared provider utilities."""
 
 from .error_mapping import append_request_id, get_user_facing_error_message, map_error
 from .heuristic_tool_parser import HeuristicToolParser

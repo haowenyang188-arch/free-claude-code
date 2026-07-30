@@ -1,4 +1,4 @@
-"""Tests for streaming error handling in providers/nvidia_nim/client.py."""
+"""Tests for streaming error handling in OpenAI-compatible providers."""
 
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -6,9 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from config.nim import NimSettings
 from providers.base import ProviderConfig
-from providers.nvidia_nim import NvidiaNimProvider
+from providers.deepseek import DeepSeekProvider
 
 
 class AsyncStreamMock:
@@ -32,23 +31,23 @@ def _make_provider():
     """Create a provider instance for testing."""
     config = ProviderConfig(
         api_key="test_key",
-        base_url="https://test.api.nvidia.com/v1",
+        base_url="https://test.api.deepseek.com/v1",
         rate_limit=10,
         rate_window=60,
     )
-    return NvidiaNimProvider(config, nim_settings=NimSettings())
+    return DeepSeekProvider(config)
 
 
 def _make_provider_with_thinking_enabled(enabled: bool):
     """Create a provider instance with thinking explicitly enabled or disabled."""
     config = ProviderConfig(
         api_key="test_key",
-        base_url="https://test.api.nvidia.com/v1",
+        base_url="https://test.api.deepseek.com/v1",
         rate_limit=10,
         rate_window=60,
         enable_thinking=enabled,
     )
-    return NvidiaNimProvider(config, nim_settings=NimSettings())
+    return DeepSeekProvider(config)
 
 
 def _make_request(model="test-model", stream=True):
@@ -349,7 +348,7 @@ class TestStreamingExceptionHandling:
 
         event_text = "".join(events)
         assert (
-            "Upstream provider NIM rejected the request method or endpoint (HTTP 405)."
+            "Upstream provider DEEPSEEK rejected the request method or endpoint (HTTP 405)."
             in event_text
         )
         assert "request_id=REQ405" in event_text

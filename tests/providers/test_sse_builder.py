@@ -1,4 +1,4 @@
-"""Tests for providers/nvidia_nim/utils/sse_builder.py."""
+"""Tests for the shared SSE builder."""
 
 import json
 from unittest.mock import patch

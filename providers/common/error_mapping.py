@@ -1,4 +1,4 @@
-"""Error mapping for OpenAI-compatible providers (NIM, OpenRouter, LM Studio)."""
+"""Error mapping for OpenAI-compatible providers."""
 
 import httpx
 import openai

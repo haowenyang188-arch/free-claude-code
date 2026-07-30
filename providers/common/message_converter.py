@@ -26,7 +26,6 @@ class AnthropicToOpenAIConverter:
         messages: list[Any],
         *,
         include_thinking: bool = True,
-        include_reasoning_for_openrouter: bool = False,
         include_reasoning_content: bool = False,
     ) -> list[dict[str, Any]]:
         """Convert a list of Anthropic messages to OpenAI format.
@@ -49,7 +48,6 @@ class AnthropicToOpenAIConverter:
                         AnthropicToOpenAIConverter._convert_assistant_message(
                             content,
                             include_thinking=include_thinking,
-                            include_reasoning_for_openrouter=include_reasoning_for_openrouter,
                             include_reasoning_content=include_reasoning_content,
                         )
                     )
@@ -67,16 +65,12 @@ class AnthropicToOpenAIConverter:
         content: list[Any],
         *,
         include_thinking: bool = True,
-        include_reasoning_for_openrouter: bool = False,
         include_reasoning_content: bool = False,
     ) -> list[dict[str, Any]]:
         """Convert assistant message blocks, preserving interleaved thinking+text order."""
         content_parts: list[str] = []
         thinking_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
-        emit_reasoning_content = (
-            include_reasoning_for_openrouter or include_reasoning_content
-        )
 
         for block in content:
             block_type = get_block_type(block)
@@ -88,7 +82,7 @@ class AnthropicToOpenAIConverter:
                     continue
                 thinking = get_block_attr(block, "thinking", "")
                 content_parts.append(f"<think>\n{thinking}\n</think>")
-                if emit_reasoning_content:
+                if include_reasoning_content:
                     thinking_parts.append(thinking)
             elif block_type == "tool_use":
                 tool_input = get_block_attr(block, "input", {})
@@ -107,8 +101,8 @@ class AnthropicToOpenAIConverter:
 
         content_str = "\n\n".join(content_parts)
 
-        # Ensure content is never an empty string for assistant messages
-        # NIM (especially Mistral models) requires non-empty content if there are no tool calls
+        # Some OpenAI-compatible APIs require non-empty assistant content
+        # when there are no tool calls.
         if not content_str and not tool_calls:
             content_str = " "
 
@@ -118,7 +112,7 @@ class AnthropicToOpenAIConverter:
         }
         if tool_calls:
             msg["tool_calls"] = tool_calls
-        if emit_reasoning_content and thinking_parts:
+        if include_reasoning_content and thinking_parts:
             msg["reasoning_content"] = "\n".join(thinking_parts)
 
         return [msg]
@@ -216,21 +210,19 @@ def build_base_request_body(
     *,
     default_max_tokens: int | None = None,
     include_thinking: bool = True,
-    include_reasoning_for_openrouter: bool = False,
     include_reasoning_content: bool = False,
 ) -> dict[str, Any]:
     """Build the common parts of an OpenAI-format request body.
 
     Handles message conversion, system prompt, max_tokens, temperature,
     top_p, stop sequences, tools, and tool_choice. Provider-specific
-    parameters (extra_body, penalties, NIM settings) are added by callers.
+    Extra provider-specific parameters are added by callers.
     """
     from providers.common.utils import set_if_not_none
 
     messages = AnthropicToOpenAIConverter.convert_messages(
         request_data.messages,
         include_thinking=include_thinking,
-        include_reasoning_for_openrouter=include_reasoning_for_openrouter,
         include_reasoning_content=include_reasoning_content,
     )
 
