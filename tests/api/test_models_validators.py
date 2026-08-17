@@ -70,6 +70,29 @@ def test_messages_request_model_mapping_logs(mock_settings):
         assert "minimax/target-model-from-settings" in args
 
 
+def test_messages_request_preserves_explicit_deepseek_harness_route(mock_settings):
+    """An explicit dsh route is a dispatch instruction, not a Claude alias."""
+    with patch("api.models.anthropic.get_settings", return_value=mock_settings):
+        request = MessagesRequest(
+            model="dsh/deepseek/deepseek-v4-flash",
+            max_tokens=100,
+            messages=[Message(role="user", content="hello")],
+        )
+
+    assert request.original_model == "dsh/deepseek/deepseek-v4-flash"
+    assert request.model == "dsh/deepseek/deepseek-v4-flash"
+    assert request.resolved_provider_model == "dsh/deepseek/deepseek-v4-flash"
+    assert request.upstream_model == "deepseek/deepseek-v4-flash"
+
+
+def test_settings_accepts_only_complete_deepseek_harness_routes():
+    settings = Settings(model="dsh/deepseek/deepseek-v4-flash")
+    assert settings.model == "dsh/deepseek/deepseek-v4-flash"
+
+    with pytest.raises(ValueError, match="dsh/<provider>/<model>"):
+        Settings(model="dsh/deepseek")
+
+
 def test_messages_request_resolved_provider_model_default(mock_settings):
     """resolved_provider_model is set to the full model string."""
     with patch("api.models.anthropic.get_settings", return_value=mock_settings):

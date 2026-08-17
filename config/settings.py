@@ -89,6 +89,7 @@ class Settings(BaseSettings):
 
     # ==================== DeepSeek Config ====================
     deepseek_api_key: str = Field(default="", validation_alias="DEEPSEEK_API_KEY")
+    deepseek_base_url: str = Field(default="", validation_alias="DEEPSEEK_BASE_URL")
 
     # ==================== MiniMax Config ====================
     minimax_api_key: str = Field(default="", validation_alias="MINIMAX_API_KEY")
@@ -106,7 +107,7 @@ class Settings(BaseSettings):
     # ==================== Model ====================
     # All Claude model requests are mapped to this single model (fallback)
     # Format: provider_type/model/name
-    # Valid providers: "minimax" | "deepseek"
+    # Valid providers: "minimax" | "deepseek" | "dsh"
     model: str = "minimax/MiniMax-M3"
 
     # Per-model overrides (optional, falls back to MODEL)
@@ -174,11 +175,10 @@ class Settings(BaseSettings):
     allowed_dir: str = ""
 
     # ==================== Server ====================
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8082
     log_file: str = "server.log"
-    # Optional server API key to protect endpoints (Anthropic-style)
-    # Set via env `ANTHROPIC_AUTH_TOKEN`. When empty, no auth is required.
+    # Optional on loopback; required for non-loopback binds and DSH execution.
     anthropic_auth_token: str = Field(
         default="", validation_alias="ANTHROPIC_AUTH_TOKEN"
     )
@@ -220,7 +220,7 @@ class Settings(BaseSettings):
     def validate_model_format(cls, v: str | None) -> str | None:
         if v is None:
             return None
-        valid_providers = ("minimax", "deepseek")
+        valid_providers = ("minimax", "deepseek", "dsh")
         if "/" not in v:
             raise ValueError(
                 f"Model must be prefixed with provider type. "
@@ -230,8 +230,15 @@ class Settings(BaseSettings):
         provider = v.split("/", 1)[0]
         if provider not in valid_providers:
             raise ValueError(
-                f"Invalid provider: '{provider}'. Supported: 'minimax', 'deepseek'"
+                "Invalid provider: "
+                f"'{provider}'. Supported: 'minimax', 'deepseek', 'dsh'"
             )
+        if provider == "dsh":
+            parts = v.split("/", 2)
+            if len(parts) != 3 or not parts[1] or not parts[2]:
+                raise ValueError(
+                    "DeepSeek Harness models must use dsh/<provider>/<model>"
+                )
         return v
 
     @model_validator(mode="after")

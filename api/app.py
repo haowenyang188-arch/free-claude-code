@@ -95,6 +95,43 @@ async def lifespan(app: FastAPI):
     messaging_platform = None
     message_handler = None
     cli_manager = None
+    harness_bridge = None
+    harness_config = None
+    harness_error = None
+
+    # The official DSH runtime is optional and starts lazily on the first DSH
+    # request.  Invalid opt-in configuration fails closed for DSH routes while
+    # leaving native Provider startup untouched.
+    try:
+        from harness.bridge import DeepSeekHarnessManager
+        from harness.config import HarnessConfig, HarnessConfigError
+
+        harness_config = HarnessConfig.from_env()
+        if harness_config.enabled:
+            auth_token = getattr(settings, "anthropic_auth_token", "")
+            if not isinstance(auth_token, str) or not auth_token.strip():
+                harness_error = (
+                    "ANTHROPIC_AUTH_TOKEN must be configured when DSH_ENABLED=true"
+                )
+                logger.error(
+                    "DeepSeek Harness configuration rejected: {}", harness_error
+                )
+            else:
+                try:
+                    harness_config.validate_cordis_config()
+                except HarnessConfigError as exc:
+                    harness_error = str(exc)
+                    logger.error("DeepSeek Harness configuration rejected: {}", exc)
+                else:
+                    harness_bridge = DeepSeekHarnessManager(
+                        harness_config,
+                        api_key=getattr(settings, "deepseek_api_key", "") or None,
+                        base_url=getattr(settings, "deepseek_base_url", "") or None,
+                    )
+                    logger.info("DeepSeek Harness integration enabled (lazy runtime)")
+    except HarnessConfigError as exc:
+        harness_error = str(exc)
+        logger.error("DeepSeek Harness configuration rejected: {}", exc)
 
     try:
         # Use the messaging factory to create the right platform
@@ -195,6 +232,9 @@ async def lifespan(app: FastAPI):
     app.state.messaging_platform = messaging_platform
     app.state.message_handler = message_handler
     app.state.cli_manager = cli_manager
+    app.state.harness_bridge = harness_bridge
+    app.state.harness_config = harness_config
+    app.state.harness_error = harness_error
 
     yield
 
@@ -209,6 +249,8 @@ async def lifespan(app: FastAPI):
         await _best_effort("messaging_platform.stop", messaging_platform.stop())
     if cli_manager:
         await _best_effort("cli_manager.stop_all", cli_manager.stop_all())
+    if harness_bridge:
+        await _best_effort("harness_bridge.close", harness_bridge.close())
     await _best_effort("cleanup_provider", cleanup_provider())
 
     # Ensure background limiter worker doesn't keep the loop alive.

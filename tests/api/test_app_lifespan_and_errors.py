@@ -196,6 +196,96 @@ def test_app_lifespan_sets_state_and_cleans_up(tmp_path, messaging_enabled):
     cleanup_provider.assert_awaited_once()
 
 
+def test_app_lifespan_passes_deepseek_endpoint_to_harness_manager(tmp_path):
+    from api.app import create_app
+
+    app = create_app()
+    settings = SimpleNamespace(
+        messaging_platform="telegram",
+        telegram_bot_token=None,
+        allowed_telegram_user_id=None,
+        discord_bot_token=None,
+        allowed_discord_channels=None,
+        anthropic_auth_token="server-token",
+        deepseek_api_key="test-key",
+        deepseek_base_url="http://127.0.0.1:9010/v1",
+        allowed_dir=str(tmp_path / "workspace"),
+        claude_workspace=str(tmp_path / "data"),
+        host="127.0.0.1",
+        port=8082,
+        log_file=str(tmp_path / "server.log"),
+    )
+    fake_manager = MagicMock()
+
+    api_app_mod = importlib.import_module("api.app")
+    with (
+        patch.object(api_app_mod, "get_settings", return_value=settings),
+        patch.object(api_app_mod, "cleanup_provider", new=AsyncMock()),
+        patch(
+            "harness.config.HarnessConfig.from_env",
+            return_value=MagicMock(enabled=True),
+        ) as from_env,
+        patch(
+            "harness.bridge.DeepSeekHarnessManager",
+            return_value=fake_manager,
+        ) as manager_class,
+        patch(
+            "messaging.platforms.factory.create_messaging_platform",
+            return_value=None,
+        ),
+        TestClient(app),
+    ):
+        from_env.assert_called_once_with()
+
+    manager_class.assert_called_once_with(
+        from_env.return_value,
+        api_key="test-key",
+        base_url="http://127.0.0.1:9010/v1",
+    )
+
+
+def test_app_lifespan_rejects_harness_without_server_auth(tmp_path):
+    from api.app import create_app
+
+    app = create_app()
+    settings = SimpleNamespace(
+        messaging_platform="telegram",
+        telegram_bot_token=None,
+        allowed_telegram_user_id=None,
+        discord_bot_token=None,
+        allowed_discord_channels=None,
+        anthropic_auth_token="",
+        deepseek_api_key="test-key",
+        deepseek_base_url="http://127.0.0.1:9010/v1",
+        allowed_dir=str(tmp_path / "workspace"),
+        claude_workspace=str(tmp_path / "data"),
+        host="127.0.0.1",
+        port=8082,
+        log_file=str(tmp_path / "server.log"),
+    )
+    harness_config = MagicMock(enabled=True)
+
+    api_app_mod = importlib.import_module("api.app")
+    with (
+        patch.object(api_app_mod, "get_settings", return_value=settings),
+        patch.object(api_app_mod, "cleanup_provider", new=AsyncMock()),
+        patch(
+            "harness.config.HarnessConfig.from_env",
+            return_value=harness_config,
+        ),
+        patch("harness.bridge.DeepSeekHarnessManager") as manager_class,
+        patch(
+            "messaging.platforms.factory.create_messaging_platform",
+            return_value=None,
+        ),
+        TestClient(app),
+    ):
+        assert app.state.harness_bridge is None
+        assert "ANTHROPIC_AUTH_TOKEN" in app.state.harness_error
+
+    manager_class.assert_not_called()
+
+
 def test_app_lifespan_cleanup_continues_if_platform_stop_raises(tmp_path):
     from api.app import create_app
 

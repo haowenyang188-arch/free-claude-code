@@ -154,7 +154,7 @@ Use this feature if:
 **Terminal 1:** Start the proxy server:
 
 ```bash
-uv run uvicorn server:app --host 0.0.0.0 --port 8082
+uv run uvicorn server:app --host 127.0.0.1 --port 8082
 ```
 
 **Terminal 2:** Run Claude Code:
@@ -305,6 +305,48 @@ Browse: [api-docs.deepseek.com](https://api-docs.deepseek.com)
 
 </details>
 
+### DeepSeek Harness plugins
+
+The optional DeepSeek Harness route runs the official Cordis graph behind a
+JSON-RPC subprocess and projects its events to Claude-compatible SSE. The
+sandbox-backed graph uses the pinned Node closure in `harness/runtime`; install
+it once before enabling DSH:
+
+```bash
+cd harness/runtime
+npm ci
+```
+
+The rc.6 single-file runtime is not selected because its closed module resolver
+cannot load the sandbox providers from this external graph. Configure DSH with:
+
+```dotenv
+DSH_ENABLED=true
+MODEL="dsh/deepseek/deepseek-chat"
+DEEPSEEK_API_KEY="your-deepseek-key-here"
+# Empty selects the official full plugin allowlist.
+DSH_PLUGIN_ALLOWLIST=""
+```
+
+The default `harness/runtime/cordis.yml` includes the JSON-RPC server, agent
+spine, DeepSeek LLM, JSONL persistence/checkpoints, subprocess, bash and
+filesystem plugins. It contains no credentials; the bridge passes
+`DEEPSEEK_API_KEY` and optional `DEEPSEEK_BASE_URL` only to the runtime child.
+
+The repository selects the pinned Node launcher automatically. To override it,
+set an explicit argv command (the bridge does not invoke a shell):
+
+```dotenv
+DSH_RUNTIME_COMMAND="node /absolute/path/to/free-claude-code/harness/runtime/runner.mjs"
+DSH_CORDIS_CONFIG="/absolute/path/to/free-claude-code/harness/runtime/cordis.yml"
+```
+
+Custom Cordis configs must retain the JSON-RPC server and list every configured
+plugin in `DSH_PLUGIN_ALLOWLIST`. The route can also be selected per request
+with `dsh/<provider>/<model>`. Check `GET /v1/harness/status` before sending
+traffic; missing runtime dependencies or invalid Cordis configuration are
+reported as an actionable 503 instead of a misleading successful stream.
+
 ---
 
 ## Discord Bot
@@ -344,7 +386,7 @@ ALLOWED_DIR="C:/Users/yourname/projects"
 4. **Start the server:**
 
 ```bash
-uv run uvicorn server:app --host 0.0.0.0 --port 8082
+uv run uvicorn server:app --host 127.0.0.1 --port 8082
 ```
 
 5. **Invite the bot** via OAuth2 URL Generator (scopes: `bot`, permissions: Read Messages, Send Messages, Manage Messages, Read Message History).
@@ -394,6 +436,7 @@ Configure via `WHISPER_DEVICE` (`cpu` | `cuda`) and `WHISPER_MODEL`. See the [Co
 | `MINIMAX_API_KEY`    | MiniMax API key                                                       | required for MiniMax                              |
 | `MINIMAX_BASE_URL`   | MiniMax Anthropic-compatible endpoint                                 | `https://api.minimaxi.com/anthropic`              |
 | `DEEPSEEK_API_KEY`   | DeepSeek API key                                                      | required for DeepSeek                             |
+| `DEEPSEEK_BASE_URL`  | Optional DeepSeek-compatible endpoint for DSH                         | empty (official default)                          |
 | `MINIMAX_PROXY`      | Optional proxy URL for MiniMax requests                               | `""`                                             |
 
 ### Rate Limiting & Timeouts

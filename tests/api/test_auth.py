@@ -1,9 +1,10 @@
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from api.app import app
-from api.dependencies import get_settings
+from api.dependencies import _is_loopback_bind, get_settings
 from config.settings import Settings
 
 
@@ -71,3 +72,40 @@ def test_anthropic_auth_token_applies_to_models_endpoint():
     assert "data" in r.json()
 
     app.dependency_overrides.clear()
+
+
+def test_non_loopback_bind_requires_api_key_configuration():
+    client = TestClient(app)
+    settings = Settings()
+    settings.host = "0.0.0.0"
+    settings.anthropic_auth_token = ""
+    app.dependency_overrides[get_settings] = lambda: settings
+
+    try:
+        response = client.get("/v1/models")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 503
+    assert "ANTHROPIC_AUTH_TOKEN" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("localhost", True),
+        (" LOCALHOST ", True),
+        ("127.0.0.1", True),
+        ("127.255.255.254", True),
+        ("::1", True),
+        ("[::1]", True),
+        ("0.0.0.0", False),
+        ("::", False),
+        ("localhost.localdomain", False),
+        ("", False),
+        (None, False),
+        (8082, False),
+    ],
+)
+def test_is_loopback_bind_fails_closed(host, expected):
+    assert _is_loopback_bind(host) is expected

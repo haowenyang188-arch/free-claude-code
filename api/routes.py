@@ -8,6 +8,10 @@ from fastapi.responses import StreamingResponse
 from loguru import logger
 
 from config.settings import Settings
+from harness.bridge import (
+    HarnessUnsupportedContentError,
+    messages_to_content_blocks,
+)
 from providers.common import get_user_facing_error_message
 from providers.exceptions import InvalidRequestError, ProviderError
 
@@ -80,6 +84,15 @@ async def create_message(
         if not request_data.messages:
             raise InvalidRequestError("messages cannot be empty")
 
+        resolved_model = request_data.resolved_provider_model or settings.model
+        if _is_dsh_model(resolved_model):
+            return await _create_harness_message(
+                request_data,
+                raw_request,
+                settings,
+                resolved_model,
+            )
+
         optimized = try_optimizations(request_data, settings)
         if optimized is not None:
             return optimized
@@ -125,6 +138,116 @@ async def create_message(
             status_code=getattr(e, "status_code", 500),
             detail=get_user_facing_error_message(e),
         ) from e
+
+
+async def _create_harness_message(
+    request_data: MessagesRequest,
+    raw_request: Request,
+    settings: Settings,
+    resolved_model: str,
+) -> StreamingResponse:
+    """Route a fully-qualified DSH request without touching native providers."""
+    manager = getattr(raw_request.app.state, "harness_bridge", None)
+    if manager is None:
+        configured_error = getattr(raw_request.app.state, "harness_error", None)
+        detail = (
+            f"DeepSeek Harness is unavailable: {configured_error}"
+            if configured_error
+            else "DeepSeek Harness is not configured or enabled"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=detail,
+        )
+    if request_data.tools:
+        raise InvalidRequestError(
+            "DeepSeek Harness routes do not support dynamic Anthropic tools"
+        )
+    if request_data.tool_choice is not None:
+        raise InvalidRequestError(
+            "DeepSeek Harness routes do not support Anthropic tool_choice"
+        )
+
+    try:
+        provider_name, runtime_model = _parse_dsh_model(resolved_model)
+        content_blocks = messages_to_content_blocks(
+            request_data.messages,
+            system=request_data.system,
+        )
+    except HarnessUnsupportedContentError as exc:
+        raise InvalidRequestError(str(exc)) from exc
+
+    ensure_ready = getattr(manager, "ensure_ready", None)
+    if callable(ensure_ready):
+        try:
+            await ensure_ready(provider=provider_name, model=runtime_model)
+        except Exception as exc:
+            detail = _harness_failure_detail(manager, exc)
+            raise HTTPException(status_code=503, detail=detail) from exc
+
+    request_id = f"req_{uuid.uuid4().hex[:12]}"
+    logger.info(
+        "API_REQUEST: request_id={} dsh_provider={} dsh_model={} messages={}",
+        request_id,
+        provider_name,
+        runtime_model,
+        len(request_data.messages),
+    )
+    session_id = _session_id_from_metadata(request_data.metadata)
+    return StreamingResponse(
+        manager.stream_messages(
+            content_blocks,
+            provider=provider_name,
+            model=runtime_model,
+            response_model=request_data.model,
+            session_id=session_id,
+            request_id=request_id,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+def _is_dsh_model(model: str) -> bool:
+    return isinstance(model, str) and model.startswith("dsh/")
+
+
+def _parse_dsh_model(model: str) -> tuple[str, str]:
+    parts = model.split("/", 2)
+    if len(parts) != 3 or parts[0] != "dsh" or not parts[1] or not parts[2]:
+        raise InvalidRequestError(
+            "DeepSeek Harness models must use dsh/<provider>/<model>"
+        )
+    return parts[1], parts[2]
+
+
+def _session_id_from_metadata(metadata: dict | None) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("conversation_id", "conversationId", "session_id", "sessionId"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _harness_failure_detail(manager: object, exc: Exception) -> str:
+    diagnostics = getattr(manager, "diagnostics", None)
+    if callable(diagnostics):
+        try:
+            payload = diagnostics()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, str) and error.strip():
+                return f"DeepSeek Harness is not ready: {error[:512]}"
+    message = str(exc).strip() or type(exc).__name__
+    return f"DeepSeek Harness is not ready: {message[:512]}"
 
 
 @router.api_route("/v1/messages", methods=["HEAD", "OPTIONS"])
@@ -190,6 +313,33 @@ async def probe_root(_auth=Depends(require_api_key)):
 async def health():
     """Health check endpoint."""
     return {"status": "healthy"}
+
+
+@router.get("/v1/harness/status")
+async def harness_status(request: Request, _auth=Depends(require_api_key)):
+    """Return safe local readiness diagnostics for the optional DSH sidecar."""
+    manager = getattr(request.app.state, "harness_bridge", None)
+    if manager is not None:
+        diagnostics = getattr(manager, "diagnostics", None)
+        if callable(diagnostics):
+            payload = diagnostics()
+            if isinstance(payload, dict):
+                return payload
+
+    config = getattr(request.app.state, "harness_config", None)
+    error = getattr(request.app.state, "harness_error", None)
+    enabled = bool(getattr(config, "enabled", False))
+    return {
+        "enabled": enabled,
+        "configured": config is not None,
+        "ready": False,
+        "running": False,
+        "runtime_version": None,
+        "runtime_command": [],
+        "cordis_config": None,
+        "plugin_allowlist": [],
+        "error": error or (None if enabled else "DeepSeek Harness is disabled"),
+    }
 
 
 @router.api_route("/health", methods=["HEAD", "OPTIONS"])

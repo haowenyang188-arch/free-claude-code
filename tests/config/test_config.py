@@ -19,10 +19,12 @@ class TestSettings:
         from config.settings import Settings
 
         monkeypatch.delenv("MODEL", raising=False)
+        monkeypatch.delenv("HOST", raising=False)
         monkeypatch.delenv("HTTP_READ_TIMEOUT", raising=False)
         monkeypatch.setitem(Settings.model_config, "env_file", ())
         settings = Settings()
         assert settings.model == "minimax/MiniMax-M3"
+        assert settings.host == "127.0.0.1"
         assert isinstance(settings.provider_rate_limit, int)
         assert isinstance(settings.provider_rate_window, int)
         assert isinstance(settings.fast_prefix_detection, bool)
@@ -66,6 +68,14 @@ class TestSettings:
         monkeypatch.setenv("PROVIDER_RATE_LIMIT", "20")
         settings = Settings()
         assert settings.provider_rate_limit == 20
+
+    def test_deepseek_base_url_from_env(self, monkeypatch):
+        """DEEPSEEK_BASE_URL is loaded for the optional DSH endpoint."""
+        from config.settings import Settings
+
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", "http://127.0.0.1:9010/v1")
+        settings = Settings()
+        assert settings.deepseek_base_url == "http://127.0.0.1:9010/v1"
 
     def test_provider_rate_window_from_env(self, monkeypatch):
         """PROVIDER_RATE_WINDOW env var is loaded into settings."""

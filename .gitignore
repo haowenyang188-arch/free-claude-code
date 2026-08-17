@@ -6,6 +6,7 @@ __pycache__
 .serena
 .venv
 agent_workspace
+.dsh-sessions
 .env
 .env.bak.*
 server.log

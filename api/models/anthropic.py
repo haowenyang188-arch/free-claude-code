@@ -108,7 +108,13 @@ class MessagesRequest(BaseModel):
         if self.original_model is None:
             self.original_model = self.model
 
-        resolved_full = settings.resolve_model(self.original_model)
+        # A fully-qualified DSH route is an explicit runtime dispatch request;
+        # treating it as a Claude alias would silently send it to the native
+        # provider configured in MODEL.
+        if self.original_model.startswith("dsh/"):
+            resolved_full = self.original_model
+        else:
+            resolved_full = settings.resolve_model(self.original_model)
         self.resolved_provider_model = resolved_full
         # Keep full provider/model string in self.model for provider routing context
         self.model = resolved_full
@@ -136,5 +142,5 @@ class TokenCountRequest(BaseModel):
     def validate_model_field(cls, v: str, info) -> str:
         """Map any Claude model name to the configured model (model-aware)."""
         settings = get_settings()
-        resolved_full = settings.resolve_model(v)
+        resolved_full = v if v.startswith("dsh/") else settings.resolve_model(v)
         return Settings.parse_model_name(resolved_full)

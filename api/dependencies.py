@@ -1,5 +1,8 @@
 """Dependency injection for FastAPI."""
 
+from ipaddress import ip_address
+from secrets import compare_digest
+
 from fastapi import Depends, HTTPException, Request
 from loguru import logger
 
@@ -101,13 +104,21 @@ def require_api_key(
 ) -> None:
     """Require a server API key (Anthropic-style).
 
-    Checks `x-api-key` header or `Authorization: Bearer *** against
-    `Settings.anthropic_auth_token`. If `ANTHROPIC_AUTH_TOKEN` is empty, this is a no-op.
+    Checks `x-api-key` or `Authorization: Bearer ***` against the configured
+    token. Tokenless access is allowed only when the server bind is explicitly
+    loopback; non-loopback binds fail closed.
     """
-    anthropic_auth_token = settings.anthropic_auth_token
+    anthropic_auth_token = settings.anthropic_auth_token.strip()
     if not anthropic_auth_token:
-        # No API key configured -> allow
-        return
+        if _is_loopback_bind(settings.host):
+            return
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "ANTHROPIC_AUTH_TOKEN must be configured when HOST is not a "
+                "loopback address"
+            ),
+        )
 
     header = (
         request.headers.get("x-api-key")
@@ -126,8 +137,23 @@ def require_api_key(
     if token and ":" in token:
         token = token.split(":", 1)[0]
 
-    if token != anthropic_auth_token:
+    if not compare_digest(token, anthropic_auth_token):
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+def _is_loopback_bind(host: object) -> bool:
+    """Return whether a configured bind address is explicitly loopback."""
+    if not isinstance(host, str):
+        return False
+    normalized = host.strip().lower()
+    if normalized == "localhost":
+        return True
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def get_provider() -> BaseProvider:

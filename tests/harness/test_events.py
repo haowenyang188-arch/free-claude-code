@@ -1,0 +1,213 @@
+"""Pure contract tests for the DeepSeek Harness event projection."""
+
+from __future__ import annotations
+
+import json
+
+from harness.events import (
+    SOURCE,
+    project_notification,
+    project_sse,
+    safe_log_context,
+)
+
+
+def _sse_payload(frame: str) -> tuple[str, dict]:
+    """Parse the small SSE frame emitted by ``project_sse``."""
+    lines = frame.splitlines()
+    event_line = next(line for line in lines if line.startswith("event: "))
+    data_line = next(line for line in lines if line.startswith("data: "))
+    return event_line.removeprefix("event: "), json.loads(
+        data_line.removeprefix("data: ")
+    )
+
+
+def test_session_event_envelope_preserves_full_runtime_event() -> None:
+    event = {
+        "type": "assistant/message",
+        "seq": 7,
+        "data": {
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hello"}],
+            }
+        },
+    }
+
+    envelope = project_notification(
+        "session.event", {"sessionId": "root", "event": event}
+    )
+
+    assert envelope["type"] == "session_event"
+    assert envelope["source"] == SOURCE == "deepseek_harness"
+    assert envelope["method"] == "session.event"
+    assert envelope["session_id"] == "root"
+    assert envelope["runtime_session_id"] == "root"
+    assert envelope["event_type"] == "assistant/message"
+    assert envelope["event"] == event
+    assert envelope["payload"] == {"sessionId": "root", "event": event}
+
+    # The projection owns its copy and cannot mutate a runtime notification.
+    event["data"]["message"]["content"][0]["text"] = "changed"
+    projected_event = envelope["event"]
+    assert isinstance(projected_event, dict)
+    assert projected_event["data"]["message"]["content"][0]["text"] == "hello"
+
+
+def test_session_status_envelope_normalizes_status_without_dropping_payload() -> None:
+    params = {"sessionId": "root", "status": "running", "extra": {"n": 1}}
+
+    envelope = project_notification("session.status", params)
+
+    assert envelope["type"] == "session_status"
+    assert envelope["session_id"] == "root"
+    assert envelope["runtime_session_id"] == "root"
+    assert envelope["status"] == "running"
+    assert envelope["payload"] == params
+
+
+def test_subagent_lifecycle_envelopes_keep_parent_and_child_ids() -> None:
+    started = project_notification(
+        "subagent.started",
+        {"parentSessionId": "root", "childSessionId": "child"},
+    )
+    finished = project_notification(
+        "subagent.finished",
+        {
+            "provider": "deepseek-official",
+            "agentId": "agent-1",
+            "parentSessionId": "root",
+            "childSessionId": "child",
+            "status": "ok",
+            "stopReason": {"kind": "completed"},
+            "lastAssistantMessage": [{"type": "text", "text": "done"}],
+        },
+    )
+
+    assert started["type"] == "subagent_started"
+    assert started["session_id"] == "root"
+    assert started["runtime_session_id"] == "child"
+    assert started["parent_session_id"] == "root"
+    assert started["child_session_id"] == "child"
+
+    assert finished["type"] == "subagent_finished"
+    assert finished["session_id"] == "root"
+    assert finished["runtime_session_id"] == "child"
+    assert finished["provider"] == "deepseek-official"
+    assert finished["agent_id"] == "agent-1"
+    assert finished["status"] == "ok"
+    assert finished["stop_reason"] == {"kind": "completed"}
+    assert finished["last_assistant_message"] == [{"type": "text", "text": "done"}]
+
+
+def test_unknown_notification_keeps_raw_payload_and_is_not_logged() -> None:
+    params = {
+        "sessionId": "root",
+        "secret": "do-not-log",
+        "nested": {"value": [1, True]},
+    }
+
+    envelope = project_notification("future.notification", params)
+
+    assert envelope["type"] == "unknown"
+    assert envelope["method"] == "future.notification"
+    assert envelope["session_id"] == "root"
+    assert envelope["raw"] == params
+    assert envelope["payload"] == params
+
+    context = safe_log_context(envelope)
+    assert context["type"] == "unknown"
+    assert context["method"] == "future.notification"
+    assert "secret" not in context
+    assert "raw" not in context
+    assert "payload" not in context
+
+
+def test_malformed_notification_is_safe_and_retains_raw_value() -> None:
+    envelope = project_notification("session.event", ["not", "an", "object"])
+
+    assert envelope["type"] == "session_event"
+    assert envelope["session_id"] is None
+    assert envelope["runtime_session_id"] is None
+    assert envelope["event"] is None
+    assert envelope["event_type"] is None
+    assert envelope["raw"] == ["not", "an", "object"]
+    assert envelope["payload"] == ["not", "an", "object"]
+
+
+def test_malformed_fields_are_not_coerced_into_untrusted_identifiers() -> None:
+    envelope = project_notification(
+        "subagent.finished",
+        {
+            "parentSessionId": 123,
+            "childSessionId": {"id": "child"},
+            "status": ["ok"],
+            "stopReason": object(),
+            "lastAssistantMessage": {"text": "not-a-list"},
+        },
+    )
+
+    assert envelope["session_id"] is None
+    assert envelope["runtime_session_id"] is None
+    assert envelope["parent_session_id"] is None
+    assert envelope["child_session_id"] is None
+    assert envelope["status"] is None
+    assert envelope["stop_reason"] is None
+    assert envelope["last_assistant_message"] is None
+    raw = envelope["raw"]
+    assert isinstance(raw, dict)
+    assert raw["parentSessionId"] == 123
+
+
+def test_session_event_with_unknown_event_type_keeps_event_verbatim() -> None:
+    event = {"type": "plugin/private", "data": {"token": "opaque"}}
+    envelope = project_notification(
+        "session.event", {"sessionId": "root", "event": event}
+    )
+
+    assert envelope["event_type"] == "plugin/private"
+    assert envelope["event"] == event
+    assert envelope["raw_event"] == event
+
+
+def test_project_sse_emits_one_safe_custom_frame_without_fake_anthropic_turn() -> None:
+    envelope = project_notification(
+        "session.status", {"sessionId": "root", "status": "idle"}
+    )
+
+    frames = project_sse(envelope)
+
+    assert len(frames) == 1
+    event_name, data = _sse_payload(frames[0])
+    assert event_name == "harness_session_status"
+    assert data["type"] == "session_status"
+    assert data["session_id"] == "root"
+    assert data["status"] == "idle"
+    assert "message_start" not in frames[0]
+    assert frames[0].endswith("\n\n")
+
+
+def test_project_sse_preserves_unknown_raw_event_data() -> None:
+    envelope = project_notification(
+        "session.event",
+        {
+            "sessionId": "root",
+            "event": {"type": "future/event", "data": {"secret": "opaque"}},
+        },
+    )
+
+    frames = project_sse(envelope)
+
+    event_name, data = _sse_payload(frames[0])
+    assert event_name == "harness_session_event"
+    assert data["event"] == envelope["event"]
+    assert data["event"]["data"]["secret"] == "opaque"
+
+
+def test_project_sse_handles_non_mapping_input() -> None:
+    frames = project_sse(None)
+
+    assert len(frames) == 1
+    event_name, data = _sse_payload(frames[0])
+    assert event_name == "harness_unknown"
+    assert data["type"] == "unknown"
