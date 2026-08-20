@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import re
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 from urllib.parse import unquote, urlsplit
@@ -36,6 +37,94 @@ ALLOWED_FRONTMATTER_FIELDS = {
     "allowed-tools",
 }
 RESOURCE_DIRECTORIES = {"references", "scripts", "assets"}
+
+
+class SemanticRule(NamedTuple):
+    code: str
+    pattern: re.Pattern[str]
+    message: str
+
+
+# These patterns deliberately target stateful assertions, rather than words such
+# as "batch", "authorization", or ordinary absolute system paths in isolation.
+DEFAULT_SEMANTIC_RULES = (
+    SemanticRule(
+        "stale-task-decision",
+        re.compile(
+            r"(?:用户|客户)\s*(?:已|已经|此前|早已)\s*(?:明确\s*)?"
+            r"(?:选择|选定|决定|确认(?:采用|使用)?)"
+            r"[^\n\u3002\uff01\uff1f.!?]{0,100}(?:撤回|旧版|旧方案|交付|拒绝|批次)"
+            r"|(?:已|已经|此前|早已)\s*(?:按|根据)\s*(?:用户|客户)(?:的)?\s*"
+            r"(?:选择|选定|决定|确认)"
+            r"[^\n\u3002\uff01\uff1f.!?]{0,100}(?:撤回|旧版|旧方案|交付|拒绝|批次)"
+            r"|\b(?:user|customer)\b[^\n.!?]{0,30}"
+            r"\b(?:already|previously|explicitly)\s+"
+            r"(?:selected|chose|decided)\b[^\n.!?]{0,100}"
+            r"\b(?:withdraw|old|delivery|batch|option)\b",
+            re.IGNORECASE,
+        ),
+        "skill content contains a prior task decision that must be supplied by the current task",
+    ),
+    SemanticRule(
+        "static-authorization",
+        re.compile(
+            r"(?:当前|本|该)\s*批次\s*(?:已|已经|此前|早已)\s*"
+            r"(?:获(?:得|取)|得到|取得|拥有|有)?\s*(?:由\s*)?"
+            r"(?:用户|客户)?\s*(?:明确\s*)?(?:授权|批准)"
+            r"|(?:用户|客户)\s*(?:已|已经|此前|早已)\s*(?:明确\s*)?"
+            r"(?:授权|批准|授予)"
+            r"|(?:用户|客户)\s*对\s*(?:当前|本|该)\s*批次\s*"
+            r"(?:一次性\s*)?(?:授权|批准)"
+            r"|\b(?:this|current)\s+(?:batch|run|task)\b"
+            r"[^\n.!?]{0,40}\b(?:is|was|has been|already)\s+"
+            r"(?:authorized|approved)\b"
+            r"|\b(?:user|customer)\b[^\n.!?]{0,20}"
+            r"\b(?:has already|already|previously|has)\s+"
+            r"(?:authorized|approved)\b",
+            re.IGNORECASE,
+        ),
+        "skill content claims that authorization already exists for a task or batch",
+    ),
+    SemanticRule(
+        "personal-absolute-path",
+        re.compile(
+            r"(?<![\w.-])(?:"
+            r"/mnt/[A-Za-z]/Users/(?!(?:user(?:name)?|root|runner|app|service|example)(?:[/\\]|$))"
+            r"[A-Za-z0-9][A-Za-z0-9._-]*(?:[/\\][^\s`'\"<>()\[\],;\u3002\uff01\uff1f]*)?"
+            r"|/(?:home|Users)/(?!(?:user(?:name)?|root|runner|app|service|example)(?:[/\\]|$))"
+            r"[A-Za-z0-9][A-Za-z0-9._-]*(?:[/\\][^\s`'\"<>()\[\],;\u3002\uff01\uff1f]*)?"
+            r"|[A-Za-z]:[\\/]Users[\\/]+(?!(?:user(?:name)?|root|runner|app|service|example)(?:[/\\]|$))"
+            r"[A-Za-z0-9][A-Za-z0-9._-]*(?:[\\/][^\s`'\"<>()\[\],;\u3002\uff01\uff1f]*)?"
+            r")",
+            re.IGNORECASE,
+        ),
+        "skill content contains a personal absolute path; use host configuration instead",
+    ),
+    SemanticRule(
+        "stale-batch-state",
+        re.compile(
+            r"(?:当前|本|该)\s*(?:批次|任务|运行)\s*(?:状态|阶段)\s*[:\uFF1A=]?"
+            r"[^\n\u3002\uff01\uff1f.!?]{0,60}(?:已|正在|等待|完成|失败|采集|生图|交付)"
+            r"|\b(?:current|previous|old)\s+(?:batch|run|task)\b"
+            r"[^\n.!?]{0,60}\b(?:status|stage|completed|failed|waiting)\b"
+            r"|\b(?:batch|run)[_-]?id\s*[:=]\s*"
+            r"(?:20\d{2}[-_/]\d{1,2}[-_/]\d{1,2}|[A-Za-z0-9][A-Za-z0-9_-]{7,})",
+            re.IGNORECASE,
+        ),
+        "skill content contains a persisted batch or run state that must be task-local",
+    ),
+    SemanticRule(
+        "fixed-persona-default",
+        re.compile(
+            r"(?:默认|固定|始终|必须|同一位|always|default|fixed|same)"
+            r"[^\n\u3002\uff01\uff1f.!?]{0,80}"
+            r"(?:\d{1,3}\s*(?:岁|years?\s*[- ]?old)[^\n\u3002\uff01\uff1f.!?]{0,40})?"
+            r"(?:中国女性|中国男性|女性|男性|woman|man)",
+            re.IGNORECASE,
+        ),
+        "skill content hard-codes a persona as a default; persona must come from the current task",
+    ),
+)
 
 
 class Issue(NamedTuple):
@@ -376,6 +465,130 @@ def _validate_references(skill_file: Path) -> list[Issue]:
     return issues
 
 
+def _default_prompt_values(metadata_file: Path) -> list[str]:
+    """Return only default-prompt values from an agent metadata file.
+
+    Agent metadata can contain descriptive text that is not an active prompt.
+    Restricting the semantic scan to this field avoids treating arbitrary
+    examples or implementation notes as executable instructions.
+    """
+
+    try:
+        loaded = yaml.safe_load(metadata_file.read_text(encoding="utf-8"))
+    except OSError, UnicodeDecodeError, yaml.YAMLError:
+        return []
+
+    prompts: list[str] = []
+
+    def visit(value: object, key: str | None = None) -> None:
+        if key is not None and key.replace("-", "_").lower() == "default_prompt":
+            if isinstance(value, str):
+                prompts.append(value)
+            return
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                if isinstance(child_key, str):
+                    visit(child_value, child_key)
+        elif isinstance(value, list):
+            for child_value in value:
+                visit(child_value)
+
+    visit(loaded)
+    return prompts
+
+
+def _semantic_sources(skill_root: Path) -> Iterator[tuple[Path, str]]:
+    """Yield skill bodies and active default prompts for semantic inspection."""
+
+    for skill_directory in sorted(
+        (path for path in skill_root.iterdir() if path.is_dir()),
+        key=lambda path: path.name,
+    ):
+        skill_file = skill_directory / "SKILL.md"
+        if skill_file.is_file():
+            with contextlib.suppress(OSError, UnicodeDecodeError):
+                yield skill_file, skill_file.read_text(encoding="utf-8")
+
+        agents_directory = skill_directory / "agents"
+        if not agents_directory.is_dir():
+            continue
+        for metadata_file in sorted(agents_directory.glob("openai.y*")):
+            if metadata_file.suffix.lower() not in {".yaml", ".yml"}:
+                continue
+            for prompt in _default_prompt_values(metadata_file):
+                yield metadata_file, prompt
+
+
+def _compile_forbidden_patterns(
+    forbidden_patterns: Iterable[str | re.Pattern[str]],
+) -> list[re.Pattern[str]]:
+    compiled: list[re.Pattern[str]] = []
+    for pattern in forbidden_patterns:
+        if isinstance(pattern, str):
+            try:
+                compiled.append(re.compile(pattern, re.IGNORECASE | re.MULTILINE))
+            except re.error as error:
+                raise ValueError(
+                    f"invalid forbidden pattern {pattern!r}: {error}"
+                ) from error
+        else:
+            compiled.append(pattern)
+    return compiled
+
+
+def _forbidden_pattern_argument(value: str) -> str:
+    try:
+        re.compile(value)
+    except re.error as error:
+        raise argparse.ArgumentTypeError(
+            f"invalid forbidden pattern {value!r}: {error}"
+        ) from error
+    return value
+
+
+def validate_semantic_pollution(
+    skill_root: Path,
+    *,
+    forbidden_patterns: Iterable[str | re.Pattern[str]] = (),
+) -> list[Issue]:
+    """Reject task state and other non-portable content in active skill inputs.
+
+    The check is intentionally opt-in. ``forbidden_patterns`` are regular
+    expressions supplied by the host and are evaluated only against SKILL.md
+    and ``agents/openai.yaml`` default-prompt values.
+    """
+
+    skill_root = skill_root.resolve()
+    issues: list[Issue] = []
+    custom_patterns = _compile_forbidden_patterns(forbidden_patterns)
+
+    for source_path, text in _semantic_sources(skill_root):
+        for rule in DEFAULT_SEMANTIC_RULES:
+            match = rule.pattern.search(text)
+            if match is None:
+                continue
+            issues.append(
+                Issue(
+                    rule.code,
+                    source_path,
+                    f"{rule.message} (line {text.count(chr(10), 0, match.start()) + 1})",
+                )
+            )
+        for pattern in custom_patterns:
+            match = pattern.search(text)
+            if match is None:
+                continue
+            issues.append(
+                Issue(
+                    "custom-forbidden-pattern",
+                    source_path,
+                    f"content matches configured forbidden pattern {pattern.pattern!r} "
+                    f"(line {text.count(chr(10), 0, match.start()) + 1})",
+                )
+            )
+    return issues
+
+
 def _walk_entries(root: Path) -> Iterator[Path]:
     for directory, directory_names, file_names in os.walk(root, followlinks=False):
         base = Path(directory)
@@ -410,7 +623,12 @@ def _validate_tree(skill_root: Path) -> list[Issue]:
     return issues
 
 
-def validate_skill_root(skill_root: Path) -> list[Issue]:
+def validate_skill_root(
+    skill_root: Path,
+    *,
+    semantic_checks: bool = False,
+    forbidden_patterns: Iterable[str | re.Pattern[str]] = (),
+) -> list[Issue]:
     skill_root = skill_root.resolve()
     if not skill_root.is_dir():
         return [
@@ -460,6 +678,14 @@ def validate_skill_root(skill_root: Path) -> list[Issue]:
                 )
             )
 
+    if semantic_checks or forbidden_patterns:
+        issues.extend(
+            validate_semantic_pollution(
+                skill_root,
+                forbidden_patterns=forbidden_patterns,
+            )
+        )
+
     return sorted(
         issues, key=lambda issue: (str(issue.path), issue.code, issue.message)
     )
@@ -474,12 +700,30 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_SKILL_ROOT,
         help=f"skill directory to validate (default: {_display_path(DEFAULT_SKILL_ROOT)})",
     )
+    parser.add_argument(
+        "--check-semantics",
+        action="store_true",
+        help="also reject stale task state and non-portable active prompt content",
+    )
+    parser.add_argument(
+        "--forbid-pattern",
+        dest="forbidden_patterns",
+        action="append",
+        default=[],
+        metavar="REGEX",
+        type=_forbidden_pattern_argument,
+        help="additional case-insensitive regular expression to reject (repeatable)",
+    )
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
-    issues = validate_skill_root(args.skill_root)
+    issues = validate_skill_root(
+        args.skill_root,
+        semantic_checks=args.check_semantics,
+        forbidden_patterns=args.forbidden_patterns,
+    )
     if issues:
         for issue in issues:
             print(f"ERROR [{issue.code}] {_display_path(issue.path)}: {issue.message}")
