@@ -57,6 +57,8 @@ dev = [
     "ty>=0.0.32",
     "ruff>=0.15.12",
     "pytest-xdist>=3.8.0",
+    "pillow>=12.3.0",
+    "python-docx>=1.2.0",
 ]
 
 [tool.ruff]
