@@ -18,6 +18,31 @@ def get_block_type(block: Any) -> str | None:
     return get_block_attr(block, "type")
 
 
+def convert_image_block(block: Any) -> dict[str, Any] | None:
+    """Convert an Anthropic image block to an OpenAI image_url part.
+
+    Supports base64 and url sources. Returns None if the source is empty or
+    of an unrecognized type, so the caller can skip it.
+    """
+    source = get_block_attr(block, "source")
+    if source is None:
+        return None
+    source_type = get_block_attr(source, "type")
+    if source_type == "base64":
+        data = get_block_attr(source, "data", "")
+        if not data:
+            return None
+        media_type = get_block_attr(source, "media_type", "image/jpeg")
+        url = f"data:{media_type};base64,{data}"
+    elif source_type == "url":
+        url = get_block_attr(source, "url", "")
+        if not url:
+            return None
+    else:
+        return None
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
 class AnthropicToOpenAIConverter:
     """Converts Anthropic message format to OpenAI format."""
 
@@ -122,9 +147,20 @@ class AnthropicToOpenAIConverter:
         """Convert user message blocks (including tool results), preserving order."""
         result: list[dict[str, Any]] = []
         text_parts: list[str] = []
+        image_parts: list[dict[str, Any]] = []
 
         def flush_text() -> None:
-            if text_parts:
+            if image_parts:
+                parts: list[dict[str, Any]] = (
+                    [{"type": "text", "text": "\n".join(text_parts)}]
+                    if text_parts
+                    else []
+                )
+                parts.extend(image_parts)
+                result.append({"role": "user", "content": parts})
+                text_parts.clear()
+                image_parts.clear()
+            elif text_parts:
                 result.append({"role": "user", "content": "\n".join(text_parts)})
                 text_parts.clear()
 
@@ -133,6 +169,10 @@ class AnthropicToOpenAIConverter:
 
             if block_type == "text":
                 text_parts.append(get_block_attr(block, "text", ""))
+            elif block_type == "image":
+                image_part = convert_image_block(block)
+                if image_part is not None:
+                    image_parts.append(image_part)
             elif block_type == "tool_result":
                 flush_text()
                 tool_content = get_block_attr(block, "content", "")

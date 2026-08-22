@@ -170,6 +170,79 @@ def test_convert_user_message_mixed_text_and_tool_result():
     assert result[1] == {"role": "tool", "tool_call_id": "tool_789", "content": "42"}
 
 
+def test_convert_user_message_image_base64():
+    content = [
+        MockBlock(
+            type="image",
+            source={
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "aGVsbG8=",
+            },
+        )
+    ]
+    messages = [MockMessage("user", content)]
+    result = AnthropicToOpenAIConverter.convert_messages(messages)
+    assert len(result) == 1
+    assert result[0] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,aGVsbG8="},
+            }
+        ],
+    }
+
+
+def test_convert_user_message_text_and_image():
+    content = [
+        MockBlock(type="text", text="What is in this image?"),
+        MockBlock(
+            type="image",
+            source={"type": "base64", "media_type": "image/jpeg", "data": "eHl6"},
+        ),
+    ]
+    messages = [MockMessage("user", content)]
+    result = AnthropicToOpenAIConverter.convert_messages(messages)
+    assert len(result) == 1
+    assert result[0] == {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What is in this image?"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,eHl6"},
+            },
+        ],
+    }
+
+
+def test_convert_user_message_image_url_source():
+    content = [
+        MockBlock(
+            type="image",
+            source={"type": "url", "url": "https://example.com/cat.png"},
+        )
+    ]
+    messages = [MockMessage("user", content)]
+    result = AnthropicToOpenAIConverter.convert_messages(messages)
+    assert result[0]["content"] == [
+        {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}
+    ]
+
+
+def test_convert_user_message_image_empty_data_skipped():
+    content = [
+        MockBlock(type="text", text="hello"),
+        MockBlock(type="image", source={"type": "base64", "data": ""}),
+    ]
+    messages = [MockMessage("user", content)]
+    result = AnthropicToOpenAIConverter.convert_messages(messages)
+    # Empty image is skipped; falls back to plain text string content.
+    assert result[0] == {"role": "user", "content": "hello"}
+
+
 # --- Message Conversion Tests: Assistant ---
 
 
