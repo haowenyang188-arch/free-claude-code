@@ -69,6 +69,58 @@ class TestCodexSession:
         assert spawn.await_args.kwargs.get("shell", False) is False
 
     @pytest.mark.asyncio
+    async def test_successful_exit_with_stderr_does_not_emit_error(self) -> None:
+        from cli.codex_session import CodexSession
+
+        process = MagicMock()
+        process.pid = 123
+        process.stdout.readline = AsyncMock(side_effect=[b""])
+        process.stderr.read = AsyncMock(return_value=b"warning: informational")
+        process.wait = AsyncMock(return_value=0)
+
+        session = CodexSession("/tmp/project")
+        with (
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn,
+            patch("cli.codex_session.register_pid"),
+            patch("cli.codex_session.unregister_pid"),
+            patch("cli.codex_session.logger.debug") as debug_log,
+        ):
+            spawn.return_value = process
+            events = [event async for event in session.start_task("inspect")]
+
+        assert not any(event["type"] == "error" for event in events)
+        assert events[-1] == {
+            "type": "exit",
+            "code": 0,
+            "stderr": "warning: informational",
+        }
+        logged = " ".join(str(value) for value in debug_log.call_args.args)
+        assert "warning: informational" not in logged
+
+    @pytest.mark.asyncio
+    async def test_failed_exit_with_non_benign_stderr_emits_one_error(self) -> None:
+        from cli.codex_session import CodexSession
+
+        process = MagicMock()
+        process.pid = 123
+        process.stdout.readline = AsyncMock(side_effect=[b""])
+        process.stderr.read = AsyncMock(return_value=b"fatal: failed")
+        process.wait = AsyncMock(return_value=1)
+
+        session = CodexSession("/tmp/project")
+        with (
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn,
+            patch("cli.codex_session.register_pid"),
+            patch("cli.codex_session.unregister_pid"),
+        ):
+            spawn.return_value = process
+            events = [event async for event in session.start_task("inspect")]
+
+        errors = [event for event in events if event["type"] == "error"]
+        assert errors == [{"type": "error", "error": {"message": "fatal: failed"}}]
+        assert events[-1] == {"type": "exit", "code": 1, "stderr": "fatal: failed"}
+
+    @pytest.mark.asyncio
     async def test_cancel_terminates_running_process(self) -> None:
         from cli.codex_session import CodexSession
 
@@ -120,6 +172,45 @@ class TestCodexSession:
         result = await session.approve()
         assert result["changed_paths"] == ["before.txt"]
         assert (workspace / "before.txt").read_text(encoding="utf-8") == "after\n"
+
+    @pytest.mark.asyncio
+    async def test_approval_state_is_set_before_first_approval_yield(self, tmp_path):
+        from cli.codex_session import CodexSession
+
+        workspace = tmp_path / "project"
+        workspace.mkdir()
+        (workspace / "before.txt").write_text("before\n", encoding="utf-8")
+        process = MagicMock()
+        process.pid = 123
+        process.stdout.readline = AsyncMock(side_effect=[b""])
+        process.stderr.read = AsyncMock(return_value=b"")
+        process.wait = AsyncMock(return_value=0)
+
+        async def spawn(*_args, **kwargs):
+            Path(kwargs["cwd"]).joinpath("before.txt").write_text(
+                "after\n", encoding="utf-8"
+            )
+            return process
+
+        session = CodexSession(
+            workspace,
+            sandbox_mode="workspace-write",
+            approval_mode=True,
+        )
+        with patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            task = session.start_task("edit")
+            first = await anext(task)
+            assert first["type"] == "approval_required"
+            assert session._staged_workspace is not None
+            staged_path = session._staged_workspace.path
+            assert staged_path.exists()
+            await task.aclose()
+
+        assert session._staged_workspace is not None
+        assert session._staged_workspace.path == staged_path
+        session.reject()
+        assert session._staged_workspace is None
+        assert not staged_path.exists()
 
     @pytest.mark.asyncio
     async def test_approval_mode_stages_resumed_threads_in_the_copy(self, tmp_path):

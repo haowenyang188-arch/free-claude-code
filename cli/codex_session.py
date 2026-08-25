@@ -8,6 +8,7 @@ existing messaging layer while keeping Codex-specific JSONL parsing here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -143,31 +144,46 @@ class CodexSession:
                 if self.process.stderr:
                     stderr_bytes = await self.process.stderr.read()
                     stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-                    if stderr_text:
-                        # Filter out benign Codex CLI informational messages
-                        is_benign = any(
-                            msg in stderr_text
-                            for msg in [
-                                "Reading additional input from stdin",
-                                "Waiting for input",
-                            ]
-                        )
-                        if is_benign:
-                            logger.debug(
-                                "Codex CLI informational message: {} bytes",
-                                len(stderr_bytes),
-                            )
-                        else:
-                            # Do not put command arguments or credentials in logs.
-                            logger.warning(
-                                "Codex CLI returned stderr ({} bytes)", len(stderr_bytes)
-                            )
-                            yield {"type": "error", "error": {"message": stderr_text}}
 
                 return_code = await self.process.wait()
+                logger.info(
+                    f"Codex CLI exited with code {return_code}, stderr_present={bool(stderr_text)}"
+                )
+
+                if stderr_text:
+                    # Filter out benign Codex CLI informational messages
+                    is_benign = any(
+                        msg in stderr_text
+                        for msg in [
+                            "Reading additional input from stdin",
+                            "Waiting for input",
+                        ]
+                    )
+                    if is_benign:
+                        logger.debug(
+                            "Codex CLI informational message: {} bytes",
+                            len(stderr_bytes),
+                        )
+                    elif return_code != 0:
+                        # Do not put command arguments or credentials in logs.
+                        logger.warning(
+                            "Codex CLI returned stderr ({} bytes)", len(stderr_bytes)
+                        )
+                        yield {"type": "error", "error": {"message": stderr_text}}
+                    else:
+                        logger.debug(
+                            "Codex CLI stderr captured on successful exit ({} bytes)",
+                            len(stderr_bytes),
+                        )
+                elif return_code != 0:
+                    logger.warning(
+                        f"CODEX_SESSION: Process exited with code {return_code} but no stderr captured"
+                    )
+
                 if self._staged_workspace is not None:
                     changes = self._staged_workspace.changes()
                     if changes and return_code == 0:
+                        awaiting_approval = True
                         yield {
                             "type": "approval_required",
                             "diff": self._staged_workspace.diff(),
@@ -177,7 +193,6 @@ class CodexSession:
                             "type": "approval_waiting",
                             "awaiting_approval": True,
                         }
-                        awaiting_approval = True
                         return
                     if changes:
                         self.reject()
@@ -209,10 +224,8 @@ class CodexSession:
                 # Clean up staged workspace only if not awaiting approval
                 # If awaiting approval, workspace must survive until approve()/reject()
                 if self._staged_workspace is not None and not awaiting_approval:
-                    try:
+                    with contextlib.suppress(Exception):
                         self._staged_workspace.cleanup()
-                    except Exception:
-                        pass  # Cleanup failure should not block finally
                     self._staged_workspace = None
                 self._is_busy = False
                 self.process = None

@@ -203,12 +203,19 @@ class CLISession:
                 # Only emit stderr as error if exit code is non-zero
                 # This avoids false errors from warnings/info messages
                 if stderr_text and return_code != 0:
-                    logger.error(f"Claude CLI Stderr: {stderr_text}")
+                    logger.error(
+                        "Claude CLI exited with code {} and stderr ({} bytes)",
+                        return_code,
+                        len(stderr_output),
+                    )
                     logger.info("CLI_SESSION: Yielding error event from stderr")
                     yield {"type": "error", "error": {"message": stderr_text}}
                 elif stderr_text:
-                    # Log but don't emit error for non-zero exit with stderr
-                    logger.debug(f"Claude CLI Stderr (exit {return_code}): {stderr_text}")
+                    # Keep successful stderr out of logs; it can contain provider details.
+                    logger.debug(
+                        "Claude CLI stderr captured on successful exit ({} bytes)",
+                        len(stderr_output),
+                    )
                 elif return_code != 0:
                     logger.warning(
                         f"CLI_SESSION: Process exited with code {return_code} but no stderr captured"
