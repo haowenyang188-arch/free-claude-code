@@ -171,6 +171,19 @@ class Settings(BaseSettings):
     allowed_discord_channels: str | None = Field(
         default=None, validation_alias="ALLOWED_DISCORD_CHANNELS"
     )
+    # Local agent gateway.  The safe default keeps Claude in planning mode and
+    # selects Claude for backwards compatibility; Codex is opt-in per process.
+    agent_backend: str = Field(default="claude", validation_alias="AGENT_BACKEND")
+    agent_permission_mode: str = Field(
+        default="plan", validation_alias="AGENT_PERMISSION_MODE"
+    )
+    claude_auth_mode: str = Field(default="proxy", validation_alias="CLAUDE_AUTH_MODE")
+    codex_bin: str = Field(default="codex", validation_alias="CODEX_BIN")
+    codex_model: str | None = Field(default=None, validation_alias="CODEX_MODEL")
+    codex_sandbox: str = Field(default="read-only", validation_alias="CODEX_SANDBOX")
+    codex_approval_required: bool = Field(
+        default=True, validation_alias="CODEX_APPROVAL_REQUIRED"
+    )
     claude_workspace: str = "./agent_workspace"
     allowed_dir: str = ""
 
@@ -200,6 +213,7 @@ class Settings(BaseSettings):
         "model_opus",
         "model_sonnet",
         "model_haiku",
+        "codex_model",
         mode="before",
     )
     @classmethod
@@ -213,6 +227,42 @@ class Settings(BaseSettings):
     def validate_whisper_device(cls, v: str) -> str:
         if v not in ("cpu", "cuda"):
             raise ValueError(f"whisper_device must be 'cpu' or 'cuda', got {v!r}")
+        return v
+
+    @field_validator("agent_backend")
+    @classmethod
+    def validate_agent_backend(cls, v: str) -> str:
+        if v not in ("claude", "codex"):
+            raise ValueError("AGENT_BACKEND must be one of: 'claude', 'codex'")
+        return v
+
+    @field_validator("agent_permission_mode")
+    @classmethod
+    def validate_agent_permission_mode(cls, v: str) -> str:
+        allowed = ("plan", "acceptEdits", "auto", "bypassPermissions")
+        if v not in allowed:
+            raise ValueError(
+                "AGENT_PERMISSION_MODE must be one of: "
+                + ", ".join(repr(item) for item in allowed)
+            )
+        return v
+
+    @field_validator("claude_auth_mode")
+    @classmethod
+    def validate_claude_auth_mode(cls, v: str) -> str:
+        if v not in ("proxy", "local"):
+            raise ValueError("CLAUDE_AUTH_MODE must be 'proxy' or 'local'")
+        return v
+
+    @field_validator("codex_sandbox")
+    @classmethod
+    def validate_codex_sandbox(cls, v: str) -> str:
+        allowed = ("read-only", "workspace-write", "danger-full-access")
+        if v not in allowed:
+            raise ValueError(
+                "CODEX_SANDBOX must be one of: "
+                + ", ".join(repr(item) for item in allowed)
+            )
         return v
 
     @field_validator("model", "model_opus", "model_sonnet", "model_haiku")

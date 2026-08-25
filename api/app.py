@@ -141,22 +141,24 @@ async def lifespan(app: FastAPI):
             platform_type=settings.messaging_platform,
             bot_token=settings.telegram_bot_token,
             allowed_user_id=settings.allowed_telegram_user_id,
+            agent_backend=getattr(settings, "agent_backend", "claude"),
             discord_bot_token=settings.discord_bot_token,
             allowed_discord_channels=settings.allowed_discord_channels,
         )
 
         if messaging_platform:
             from cli.manager import CLISessionManager
+            from cli.workspace import resolve_workspace_root
             from messaging.handler import ClaudeMessageHandler
             from messaging.session import SessionStore
 
-            # Setup workspace - CLI runs in allowed_dir if set (e.g. project root)
-            workspace = (
-                os.path.abspath(settings.allowed_dir)
-                if settings.allowed_dir
-                else os.getcwd()
+            # Setup workspace - configured roots must already exist and are
+            # canonicalized before any CLI process receives them.
+            workspace = str(
+                resolve_workspace_root(
+                    settings.allowed_dir or None, create=bool(settings.allowed_dir)
+                )
             )
-            os.makedirs(workspace, exist_ok=True)
 
             # Session data stored in agent_workspace
             data_path = os.path.abspath(settings.claude_workspace)
@@ -173,6 +175,17 @@ async def lifespan(app: FastAPI):
                 api_url=api_url,
                 allowed_dirs=allowed_dirs,
                 plans_directory=plans_directory,
+                agent_backend=getattr(settings, "agent_backend", "claude"),
+                agent_permission_mode=getattr(
+                    settings, "agent_permission_mode", "plan"
+                ),
+                claude_auth_mode=getattr(settings, "claude_auth_mode", "proxy"),
+                codex_bin=getattr(settings, "codex_bin", "codex"),
+                codex_model=getattr(settings, "codex_model", None),
+                codex_sandbox=getattr(settings, "codex_sandbox", "read-only"),
+                codex_approval_required=getattr(
+                    settings, "codex_approval_required", True
+                ),
             )
 
             # Initialize session store

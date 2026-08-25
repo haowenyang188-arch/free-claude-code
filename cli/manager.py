@@ -11,7 +11,10 @@ import uuid
 
 from loguru import logger
 
+from .codex_session import CodexSession
 from .session import CLISession
+
+SessionBackend = CLISession | CodexSession
 
 
 class CLISessionManager:
@@ -28,6 +31,13 @@ class CLISessionManager:
         api_url: str,
         allowed_dirs: list[str] | None = None,
         plans_directory: str | None = None,
+        agent_backend: str = "claude",
+        agent_permission_mode: str = "plan",
+        claude_auth_mode: str = "proxy",
+        codex_bin: str = "codex",
+        codex_model: str | None = None,
+        codex_sandbox: str = "read-only",
+        codex_approval_required: bool = True,
     ):
         """
         Initialize the session manager.
@@ -42,9 +52,28 @@ class CLISessionManager:
         self.api_url = api_url
         self.allowed_dirs = allowed_dirs or []
         self.plans_directory = plans_directory
+        if agent_backend not in ("claude", "codex"):
+            raise ValueError("agent_backend must be 'claude' or 'codex'")
+        self.agent_backend = agent_backend
+        self.agent_permission_mode = agent_permission_mode
+        if claude_auth_mode not in ("proxy", "local"):
+            raise ValueError("claude_auth_mode must be 'proxy' or 'local'")
+        self.claude_auth_mode = claude_auth_mode
+        self.codex_bin = codex_bin
+        self.codex_model = codex_model
+        self.codex_sandbox = codex_sandbox
+        self.codex_approval_required = codex_approval_required
+        if (
+            self.agent_backend == "codex"
+            and self.codex_approval_required
+            and self.codex_sandbox == "danger-full-access"
+        ):
+            raise ValueError(
+                "codex_approval_required cannot be used with danger-full-access"
+            )
 
-        self._sessions: dict[str, CLISession] = {}
-        self._pending_sessions: dict[str, CLISession] = {}
+        self._sessions: dict[str, SessionBackend] = {}
+        self._pending_sessions: dict[str, SessionBackend] = {}
         self._temp_to_real: dict[str, str] = {}
         self._real_to_temp: dict[str, str] = {}
         self._lock = asyncio.Lock()
@@ -53,7 +82,7 @@ class CLISessionManager:
 
     async def get_or_create_session(
         self, session_id: str | None = None
-    ) -> tuple[CLISession, str, bool]:
+    ) -> tuple[SessionBackend, str, bool]:
         """
         Get an existing session or create a new one.
 
@@ -71,12 +100,23 @@ class CLISessionManager:
 
             temp_id = session_id if session_id else f"pending_{uuid.uuid4().hex[:8]}"
 
-            new_session = CLISession(
-                workspace_path=self.workspace,
-                api_url=self.api_url,
-                allowed_dirs=self.allowed_dirs,
-                plans_directory=self.plans_directory,
-            )
+            if self.agent_backend == "codex":
+                new_session = CodexSession(
+                    workspace_path=self.workspace,
+                    codex_bin=self.codex_bin,
+                    sandbox_mode=self.codex_sandbox,
+                    model=self.codex_model,
+                    approval_mode=self.codex_approval_required,
+                )
+            else:
+                new_session = CLISession(
+                    workspace_path=self.workspace,
+                    api_url=self.api_url,
+                    allowed_dirs=self.allowed_dirs,
+                    plans_directory=self.plans_directory,
+                    permission_mode=self.agent_permission_mode,
+                    use_proxy=self.claude_auth_mode == "proxy",
+                )
             self._pending_sessions[temp_id] = new_session
             logger.info(f"Created new session: {temp_id}")
 
@@ -126,6 +166,9 @@ class CLISessionManager:
             for session in all_sessions:
                 try:
                     await session.stop()
+                    reject = getattr(session, "reject", None)
+                    if callable(reject):
+                        reject()
                 except Exception as e:
                     logger.error(f"Error stopping session: {e}")
 
@@ -138,6 +181,7 @@ class CLISessionManager:
     def get_stats(self) -> dict:
         """Get session statistics."""
         return {
+            "backend": self.agent_backend,
             "active_sessions": len(self._sessions),
             "pending_sessions": len(self._pending_sessions),
             "busy_count": sum(1 for s in self._sessions.values() if s.is_busy),
