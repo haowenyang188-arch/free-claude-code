@@ -20,11 +20,26 @@ class CLISession:
         api_url: str,
         allowed_dirs: list[str] | None = None,
         plans_directory: str | None = None,
+        permission_mode: str = "plan",
+        use_proxy: bool = True,
     ):
         self.workspace = os.path.normpath(os.path.abspath(workspace_path))
         self.api_url = api_url
         self.allowed_dirs = [os.path.normpath(d) for d in (allowed_dirs or [])]
         self.plans_directory = plans_directory
+        allowed_permission_modes = {
+            "plan",
+            "acceptEdits",
+            "auto",
+            "bypassPermissions",
+        }
+        if permission_mode not in allowed_permission_modes:
+            raise ValueError(
+                "permission_mode must be one of: "
+                + ", ".join(sorted(allowed_permission_modes))
+            )
+        self.permission_mode = permission_mode
+        self.use_proxy = use_proxy
         self.process: asyncio.subprocess.Process | None = None
         self.current_session_id: str | None = None
         self._is_busy = False
@@ -52,14 +67,20 @@ class CLISession:
             self._is_busy = True
             env = os.environ.copy()
 
-            if "ANTHROPIC_API_KEY" not in env:
-                env["ANTHROPIC_API_KEY"] = "sk-placeholder-key-for-proxy"
+            if self.use_proxy:
+                if "ANTHROPIC_API_KEY" not in env:
+                    env["ANTHROPIC_API_KEY"] = "sk-placeholder-key-for-proxy"
 
-            env["ANTHROPIC_API_URL"] = self.api_url
-            if self.api_url.endswith("/v1"):
-                env["ANTHROPIC_BASE_URL"] = self.api_url[:-3]
+                env["ANTHROPIC_API_URL"] = self.api_url
+                if self.api_url.endswith("/v1"):
+                    env["ANTHROPIC_BASE_URL"] = self.api_url[:-3]
+                else:
+                    env["ANTHROPIC_BASE_URL"] = self.api_url
             else:
-                env["ANTHROPIC_BASE_URL"] = self.api_url
+                # Do not let a stale proxy URL in the parent shell override
+                # Claude's local OAuth/keychain authentication.
+                env.pop("ANTHROPIC_API_URL", None)
+                env.pop("ANTHROPIC_BASE_URL", None)
 
             env["TERM"] = "dumb"
             env["PYTHONIOENCODING"] = "utf-8"
@@ -78,7 +99,6 @@ class CLISession:
                     prompt,
                     "--output-format",
                     "stream-json",
-                    "--dangerously-skip-permissions",
                     "--verbose",
                 ]
                 logger.info(f"Resuming Claude session {session_id}")
@@ -89,10 +109,14 @@ class CLISession:
                     prompt,
                     "--output-format",
                     "stream-json",
-                    "--dangerously-skip-permissions",
                     "--verbose",
                 ]
                 logger.info("Starting new Claude session")
+
+            if self.permission_mode == "bypassPermissions":
+                cmd.append("--dangerously-skip-permissions")
+            else:
+                cmd.extend(["--permission-mode", self.permission_mode])
 
             if self.allowed_dirs:
                 for d in self.allowed_dirs:
@@ -170,20 +194,26 @@ class CLISession:
                         stderr_text = stderr_output.decode(
                             "utf-8", errors="replace"
                         ).strip()
-                        logger.error(f"Claude CLI Stderr: {stderr_text}")
-                        # Yield stderr as error event so it shows in UI
-                        if stderr_text:
-                            logger.info("CLI_SESSION: Yielding error event from stderr")
-                            yield {"type": "error", "error": {"message": stderr_text}}
 
                 return_code = await self.process.wait()
                 logger.info(
                     f"Claude CLI exited with code {return_code}, stderr_present={bool(stderr_text)}"
                 )
-                if return_code != 0 and not stderr_text:
+
+                # Only emit stderr as error if exit code is non-zero
+                # This avoids false errors from warnings/info messages
+                if stderr_text and return_code != 0:
+                    logger.error(f"Claude CLI Stderr: {stderr_text}")
+                    logger.info("CLI_SESSION: Yielding error event from stderr")
+                    yield {"type": "error", "error": {"message": stderr_text}}
+                elif stderr_text:
+                    # Log but don't emit error for non-zero exit with stderr
+                    logger.debug(f"Claude CLI Stderr (exit {return_code}): {stderr_text}")
+                elif return_code != 0:
                     logger.warning(
                         f"CLI_SESSION: Process exited with code {return_code} but no stderr captured"
                     )
+
                 yield {
                     "type": "exit",
                     "code": return_code,
