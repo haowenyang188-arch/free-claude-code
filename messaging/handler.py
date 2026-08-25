@@ -9,6 +9,7 @@ Uses tree-based queuing for message ordering.
 import asyncio
 import os
 import time
+from typing import Any
 
 from loguru import logger
 
@@ -139,6 +140,8 @@ class ClaudeMessageHandler:
             else render_markdown_to_mdv2,
         )
         self._limit_chars = 1900 if is_discord else 3900
+        # node_id -> (incoming message, backend session) for write approval.
+        self._pending_approvals: dict[str, tuple[IncomingMessage, Any]] = {}
 
     def format_status(self, emoji: str, label: str, suffix: str | None = None) -> str:
         return self._format_status_fn(emoji, label, suffix)
@@ -220,6 +223,12 @@ class ClaudeMessageHandler:
             await self._handle_stats_command(incoming)
             return
 
+        if cmd_base in ("/approve", "/reject"):
+            await self._handle_approval_command(
+                incoming, approve=cmd_base == "/approve"
+            )
+            return
+
         # Filter out status messages (our own messages)
         text = incoming.text or ""
         if any(text.startswith(p) for p in STATUS_MESSAGE_PREFIXES):
@@ -243,6 +252,22 @@ class ClaudeMessageHandler:
                         f"Reply to {incoming.reply_to_message_id} found tree but no valid parent node"
                     )
                     tree = None  # Treat as new conversation
+
+        if parent_node_id and tree:
+            parent_node = tree.get_node(parent_node_id)
+            if parent_node and parent_node.state == MessageState.WAITING_APPROVAL:
+                await self.platform.queue_send_message(
+                    incoming.chat_id,
+                    self.format_status(
+                        "🔐",
+                        "Approval pending",
+                        "Reply /approve or /reject first.",
+                    ),
+                    reply_to=incoming.message_id,
+                    fire_and_forget=False,
+                    message_thread_id=incoming.message_thread_id,
+                )
+                return
 
         # Generate node ID
         node_id = incoming.message_id
@@ -363,7 +388,7 @@ class ClaudeMessageHandler:
         self,
     ) -> tuple[TranscriptBuffer, RenderCtx]:
         """Create transcript buffer and render context for node processing."""
-        transcript = TranscriptBuffer(show_tool_results=False)
+        transcript = TranscriptBuffer(show_tool_results=True)
         return transcript, self.get_render_ctx()
 
     async def _handle_session_info_event(
@@ -478,6 +503,7 @@ class ClaudeMessageHandler:
         captured_session_id = None
         temp_session_id = None
         last_status: str | None = None
+        approval_pending = False
 
         parent_session_id = None
         if tree and node.parent_id:
@@ -587,6 +613,31 @@ class ClaudeMessageHandler:
                 logger.debug(f"HANDLER: Parsed {len(parsed_list)} events from CLI")
 
                 for parsed in parsed_list:
+                    parsed_type = parsed.get("type")
+                    if parsed_type == "approval_required":
+                        approval_pending = True
+                        self._pending_approvals[node_id] = (incoming, cli_session)
+                        if tree:
+                            await tree.update_state(
+                                node_id,
+                                MessageState.WAITING_APPROVAL,
+                                session_id=captured_session_id,
+                            )
+                            self.session_store.save_tree(tree.root_id, tree.to_dict())
+                        approval_status = self.format_status(
+                            "🔐", "Approval required", "reply /approve or /reject"
+                        )
+                        diff = parsed.get("diff")
+                        if isinstance(diff, str) and diff:
+                            approval_status += "\n" + render_ctx.escape_code(
+                                diff[-2800:]
+                            )
+                        await update_ui(approval_status, force=True)
+                        continue
+                    if parsed_type == "approval_waiting":
+                        continue
+                    if approval_pending and parsed_type == "complete":
+                        continue
                     (
                         last_status,
                         had_transcript_events,
@@ -636,12 +687,103 @@ class ClaudeMessageHandler:
             # can be resumed later by ID; we don't need to keep a CLISession instance
             # around after this node completes.
             try:
-                if captured_session_id:
-                    await self.cli_manager.remove_session(captured_session_id)
-                elif temp_session_id:
-                    await self.cli_manager.remove_session(temp_session_id)
+                if not approval_pending:
+                    if captured_session_id:
+                        await self.cli_manager.remove_session(captured_session_id)
+                    elif temp_session_id:
+                        await self.cli_manager.remove_session(temp_session_id)
             except Exception as e:
                 logger.debug(f"Failed to remove session for node {node_id}: {e}")
+
+    async def _handle_approval_command(
+        self, incoming: IncomingMessage, *, approve: bool
+    ) -> None:
+        """Apply or discard one pending Codex staged diff."""
+        node_id = None
+        if incoming.is_reply() and incoming.reply_to_message_id:
+            tree = self.tree_queue.get_tree_for_node(incoming.reply_to_message_id)
+            node_id = (
+                self.tree_queue.resolve_parent_node_id(incoming.reply_to_message_id)
+                if tree
+                else None
+            )
+
+        if node_id is None:
+            matches = [
+                candidate
+                for candidate, (message, _session) in self._pending_approvals.items()
+                if (
+                    message.platform == incoming.platform
+                    and message.chat_id == incoming.chat_id
+                    and message.user_id == incoming.user_id
+                )
+            ]
+            if len(matches) == 1:
+                node_id = matches[0]
+
+        pending = self._pending_approvals.get(node_id) if node_id else None
+        if pending is None:
+            action = "approve" if approve else "reject"
+            await self.platform.queue_send_message(
+                incoming.chat_id,
+                self.format_status("ℹ️", action.title(), "No pending approval found."),
+                fire_and_forget=False,
+                message_thread_id=incoming.message_thread_id,
+            )
+            return
+
+        if node_id is None:
+            return
+
+        message, session = pending
+        if (
+            message.platform != incoming.platform
+            or message.chat_id != incoming.chat_id
+            or message.user_id != incoming.user_id
+        ):
+            await self.platform.queue_send_message(
+                incoming.chat_id,
+                self.format_status(
+                    "⛔", "Approval denied", "Only the task owner can decide."
+                ),
+                fire_and_forget=False,
+                message_thread_id=incoming.message_thread_id,
+            )
+            return
+        tree = self.tree_queue.get_tree_for_node(node_id)
+        try:
+            if approve:
+                result = await session.approve()
+                detail = f"Applied {len(result['changed_paths'])} file(s)."
+                state = MessageState.COMPLETED
+            else:
+                session.reject()
+                detail = "Staged changes discarded."
+                state = MessageState.ERROR
+            self._pending_approvals.pop(node_id, None)
+            if tree:
+                await tree.update_state(node_id, state)
+                self.session_store.save_tree(tree.root_id, tree.to_dict())
+            if message.message_id:
+                await self.platform.queue_edit_message(
+                    message.chat_id,
+                    message.message_id,
+                    self.format_status("✅" if approve else "⏹", "Approval", detail),
+                    parse_mode=self._parse_mode(),
+                    fire_and_forget=False,
+                )
+            if session.current_session_id:
+                await self.cli_manager.remove_session(session.current_session_id)
+        except Exception as exc:
+            logger.warning("Approval action failed: {}", type(exc).__name__)
+            await self.platform.queue_send_message(
+                incoming.chat_id,
+                self.format_status(
+                    "❌", "Approval failed", "The staged workspace was kept."
+                ),
+                fire_and_forget=False,
+                message_thread_id=incoming.message_thread_id,
+            )
 
     async def _propagate_error_to_children(
         self,
