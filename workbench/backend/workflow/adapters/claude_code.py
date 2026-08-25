@@ -153,19 +153,15 @@ class ClaudeCodeAdapter(RuntimeAdapter):
             prompt_file = f.name
 
         try:
-            # Build command: claude <prompt_file>
-            cmd = ['claude', prompt_file]
+            # Build command: claude <prompt_file> --print (non-interactive mode)
+            cmd = ['claude', '--print', prompt_file]
 
-            # Add working directory if specified
-            if cwd:
-                cmd.extend(['--cwd', cwd])
-
-            # Execute Claude Code CLI
+            # Execute Claude Code CLI with optional cwd
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
+                cwd=cwd,  # Set working directory via subprocess, not CLI flag
             )
 
             # Wait for completion with timeout (5 minutes)

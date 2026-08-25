@@ -100,13 +100,16 @@ class TestClaudeCodeCLIIntegration:
                 assert "Research OAuth2 best practices" in written_prompt
                 assert "Focus on PKCE and token storage" in written_prompt
 
-                # Verify claude CLI was called
+                # Verify claude CLI was called with --print flag (not --cwd)
                 mock_exec.assert_called_once()
                 call_args = mock_exec.call_args[0]
                 assert call_args[0] == "claude"
-                assert call_args[1] == "/tmp/prompt-xyz.txt"
-                assert call_args[2] == "--cwd"
-                assert call_args[3] == "/project/auth"
+                assert call_args[1] == "--print"
+                assert call_args[2] == "/tmp/prompt-xyz.txt"
+
+                # Verify cwd was passed to subprocess, not as CLI flag
+                call_kwargs = mock_exec.call_args[1]
+                assert call_kwargs["cwd"] == "/project/auth"
 
                 # Verify artifact was created with response
                 assert artifact.task_id == "task-123"
@@ -247,7 +250,12 @@ class TestClaudeCodeCLIIntegration:
                         context=context,
                     )
 
-                    # Verify claude was called without --cwd
+                    # Verify claude was called with --print but no cwd in command
                     call_args = mock_exec.call_args[0]
                     assert call_args[0] == "claude"
-                    assert "--cwd" not in call_args
+                    assert call_args[1] == "--print"
+                    assert len(call_args) == 3  # claude, --print, prompt_file
+
+                    # Verify cwd=None was passed to subprocess
+                    call_kwargs = mock_exec.call_args[1]
+                    assert call_kwargs["cwd"] is None
