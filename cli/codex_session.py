@@ -267,9 +267,13 @@ class CodexSession:
         if event_type == "error":
             error = record.get("error")
             message = error.get("message") if isinstance(error, dict) else error
+            # Add context to generic error messages
+            error_msg = str(message or "Codex error")
+            if error_msg == "Codex error" and "type" in record:
+                error_msg = f"Codex error (event: {record['type']})"
             return {
                 "type": "error",
-                "error": {"message": str(message or "Codex error")},
+                "error": {"message": error_msg},
             }
 
         # Some Codex versions emit a top-level message/text record.
