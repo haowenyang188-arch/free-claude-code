@@ -318,7 +318,9 @@ def test_explicit_search_prefix_still_rejects_dynamic_execution(
     assert policy.evaluate(request).decision is ApprovalDecision.ASK
 
 
-@pytest.mark.parametrize("command", ["ls -RL .", "dir -LR .", "ls --dereference ."])
+@pytest.mark.parametrize(
+    "command", ["ls -RL .", "dir -LR .", "dir /S", "ls --dereference ."]
+)
 def test_low_risk_policy_does_not_follow_links_or_recurse_during_listing(
     tmp_path: Path, command: str
 ) -> None:
