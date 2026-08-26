@@ -402,6 +402,29 @@ ALLOWED_TELEGRAM_USER_ID="your_telegram_user_id"
 
 Get a token from [@BotFather](https://t.me/BotFather); find your user ID via [@userinfobot](https://t.me/userinfobot).
 
+### Selecting Claude Code or Codex CLI
+
+The messaging adapter runs one local CLI backend per server process. Keep the
+safe defaults below for a read-only phone control surface:
+
+```dotenv
+AGENT_BACKEND="codex"          # or "claude"
+AGENT_PERMISSION_MODE="plan"   # Claude only; never bypasses permissions by default
+CLAUDE_AUTH_MODE="local"       # local Claude OAuth; use "proxy" for this repo's provider proxy
+CODEX_BIN="codex"
+CODEX_MODEL=""                 # optional Codex model override
+CODEX_SANDBOX="read-only"      # read-only | workspace-write | danger-full-access
+CODEX_APPROVAL_REQUIRED="true" # stage write-capable Codex runs until /approve
+ALLOWED_DIR="/home/you/projects/my-repo"
+```
+
+`ALLOWED_DIR` is the only workspace exposed to the messaging process. Run the
+server in WSL and keep the bot in polling mode; no inbound WSL port is needed
+for Telegram. `CODEX_SANDBOX=read-only` and Claude `plan` mode are intentional
+safe defaults. Enabling a write-capable mode is an operator decision and should
+be paired with an external diff/approval workflow until the structured approval
+adapter is enabled.
+
 ### Voice Notes
 
 Send voice messages on Discord or Telegram; they are transcribed and processed as regular prompts.
@@ -459,6 +482,13 @@ Configure via `WHISPER_DEVICE` (`cpu` | `cuda`) and `WHISPER_MODEL`. See the [Co
 | `ALLOWED_DISCORD_CHANNELS` | Comma-separated channel IDs (empty = none allowed)                                                                                                                 | `""`                |
 | `TELEGRAM_BOT_TOKEN`       | Telegram bot token                                                                                                                                                 | `""`                |
 | `ALLOWED_TELEGRAM_USER_ID` | Allowed Telegram user ID                                                                                                                                           | `""`                |
+| `AGENT_BACKEND`            | Local CLI backend: `claude` or `codex`                                                                                                                             | `claude`            |
+| `AGENT_PERMISSION_MODE`    | Claude mode: `plan`, `acceptEdits`, `auto`, or `bypassPermissions`                                                                                                 | `plan`              |
+| `CLAUDE_AUTH_MODE`         | Claude credentials: `proxy` (provider proxy) or `local` (`claude auth login`)                                                                                       | `proxy`             |
+| `CODEX_BIN`                | Codex executable path/name                                                                                                                                          | `codex`             |
+| `CODEX_MODEL`              | Optional Codex model override                                                                                                                                       | empty               |
+| `CODEX_SANDBOX`            | Codex sandbox: `read-only`, `workspace-write`, or `danger-full-access`                                                                                              | `read-only`         |
+| `CODEX_APPROVAL_REQUIRED`  | Stage Codex write-capable runs until an operator sends `/approve`                                                                                                    | `true`              |
 | `CLAUDE_WORKSPACE`         | Directory where the agent operates                                                                                                                                 | `./agent_workspace` |
 | `ALLOWED_DIR`              | Allowed directories for the agent                                                                                                                                  | `""`                |
 | `MESSAGING_RATE_LIMIT`     | Messaging messages per window                                                                                                                                      | `1`                 |
