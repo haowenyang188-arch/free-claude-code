@@ -682,6 +682,45 @@ class TestCLISession:
             assert settings["plansDirectory"] == "./agent_workspace/plans"
 
     @pytest.mark.asyncio
+    async def test_start_task_projects_inline_approval_hook_without_safe_mode(
+        self, tmp_path
+    ):
+        from cli.approval import ApprovalPolicy
+        from cli.session import CLISession
+
+        process = MagicMock()
+        process.pid = 123
+        process.stdout.read = AsyncMock(side_effect=[b""])
+        process.wait = AsyncMock(return_value=0)
+        policy = ApprovalPolicy.low_risk(enabled=True, allowed_workspaces=[tmp_path])
+        session = CLISession(
+            str(tmp_path),
+            "http://localhost:8082/v1",
+            approval_policy=policy,
+            preflight_runtime=False,
+        )
+
+        with (
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn,
+            patch("cli.session.register_process"),
+            patch("cli.session.unregister_process"),
+        ):
+            spawn.return_value = process
+            [event async for event in session.start_task("inspect")]
+
+        call = spawn.await_args
+        assert call is not None
+        args = call.args
+        assert "--safe-mode" not in args
+        assert "--strict-mcp-config" in args
+        assert "--setting-sources" in args
+        settings = json.loads(args[args.index("--settings") + 1])
+        assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == (
+            "fcc-approval-hook"
+        )
+        assert call.kwargs["env"]["FCC_APPROVAL_ENABLED"] == "true"
+
+    @pytest.mark.asyncio
     async def test_start_task_json_error(self):
         """Test handling of non-JSON output from CLI."""
         from cli.session import CLISession

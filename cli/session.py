@@ -130,6 +130,8 @@ class CLISession:
                 # The proxy route needs an API-key-shaped value, but the
                 # gateway must not inherit unrelated account credentials.
                 env["ANTHROPIC_API_KEY"] = "sk-placeholder-key-for-proxy"
+            if self.approval_policy.enabled:
+                env.update(self.approval_policy.to_hook_environment())
 
             # Build command
             if session_id and not session_id.startswith("pending_"):
@@ -159,8 +161,12 @@ class CLISession:
                 ]
                 logger.info("Starting new Claude session")
 
-            if self.isolation_mode == "safe":
+            if self.isolation_mode == "safe" and not self.approval_policy.enabled:
                 cmd.extend(["--safe-mode", "--strict-mcp-config"])
+            elif self.isolation_mode == "safe":
+                # --safe-mode disables hooks. Keep external setting layers
+                # disabled while allowing this explicit inline hook.
+                cmd.extend(["--setting-sources", "", "--strict-mcp-config"])
 
             if self.permission_mode == "bypassPermissions":
                 cmd.append("--dangerously-skip-permissions")
@@ -171,8 +177,12 @@ class CLISession:
                 for d in self.allowed_dirs:
                     cmd.extend(["--add-dir", d])
 
+            settings_payload: dict[str, Any] = {}
             if self.plans_directory is not None:
-                settings_json = json.dumps({"plansDirectory": self.plans_directory})
+                settings_payload["plansDirectory"] = self.plans_directory
+            settings_payload.update(self.approval_policy.claude_hook_settings())
+            if settings_payload:
+                settings_json = json.dumps(settings_payload)
                 cmd.extend(["--settings", settings_json])
 
             generation = uuid.uuid4().hex

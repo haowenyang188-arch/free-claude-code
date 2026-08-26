@@ -100,6 +100,8 @@ class CodexSession:
         if self.model:
             command.extend(["--model", self.model])
         command.append("--skip-git-repo-check")
+        for override in self.approval_policy.codex_hook_config_overrides():
+            command.extend(["--config", override])
 
         # Resume/fork inherit the original thread policy.  New threads must
         # receive the explicit safe sandbox choice.
@@ -166,7 +168,12 @@ class CodexSession:
             )
             self._is_busy = True
             self._cancel_requested = False
-            env = build_cli_environment(RuntimeBackend.CODEX)
+            env = build_cli_environment(
+                RuntimeBackend.CODEX,
+                extra_env=self.approval_policy.to_hook_environment()
+                if self.approval_policy.enabled
+                else None,
+            )
             generation = generation or uuid.uuid4().hex
             self.generation = generation
 

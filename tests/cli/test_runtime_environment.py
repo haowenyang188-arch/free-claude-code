@@ -64,14 +64,10 @@ def test_credentials_are_backend_specific_and_opt_in():
         "PATH": "/usr/bin",
     }
 
-    assert "ANTHROPIC_API_KEY" not in build_cli_environment(
-        "claude", parent_env=parent
-    )
+    assert "ANTHROPIC_API_KEY" not in build_cli_environment("claude", parent_env=parent)
     assert "OPENAI_API_KEY" not in build_cli_environment("claude", parent_env=parent)
 
-    claude = build_cli_environment(
-        "claude", parent_env=parent, allow_credentials=True
-    )
+    claude = build_cli_environment("claude", parent_env=parent, allow_credentials=True)
     assert claude["ANTHROPIC_API_KEY"] == "anthropic-secret"
     assert claude["ANTHROPIC_AUTH_TOKEN"] == "anthropic-token"
     assert claude["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-secret"

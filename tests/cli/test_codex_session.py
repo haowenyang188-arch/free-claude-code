@@ -55,6 +55,43 @@ class TestCodexSession:
         assert "--ignore-rules" not in command
         assert "--strict-config" not in command
 
+    def test_build_command_projects_approval_hooks_when_enabled(self, tmp_path) -> None:
+        from cli.approval import ApprovalPolicy
+        from cli.codex_session import CodexSession
+
+        policy = ApprovalPolicy.low_risk(enabled=True, allowed_workspaces=[tmp_path])
+        command = CodexSession(str(tmp_path), approval_policy=policy).build_command(
+            "inspect"
+        )
+
+        assert command.count("--config") == 2
+        assert any("hooks.PreToolUse" in value for value in command)
+        assert any("hooks.PermissionRequest" in value for value in command)
+
+    @pytest.mark.asyncio
+    async def test_enabled_policy_projects_hook_environment(self, tmp_path) -> None:
+        from cli.approval import ApprovalPolicy
+        from cli.codex_session import CodexSession
+
+        process = MagicMock()
+        process.pid = 123
+        process.stdout.readline = AsyncMock(side_effect=[b""])
+        process.wait = AsyncMock(return_value=0)
+        policy = ApprovalPolicy.low_risk(enabled=True, allowed_workspaces=[tmp_path])
+        session = CodexSession(str(tmp_path), approval_policy=policy)
+
+        with (
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn,
+            patch("cli.codex_session.register_process"),
+            patch("cli.codex_session.unregister_process"),
+        ):
+            spawn.return_value = process
+            [event async for event in session.start_task("inspect")]
+
+        call = spawn.await_args
+        assert call is not None
+        assert call.kwargs["env"]["FCC_APPROVAL_ENABLED"] == "true"
+
     @pytest.mark.asyncio
     async def test_streams_thread_message_and_completion_events(self) -> None:
         from cli.codex_session import CodexSession

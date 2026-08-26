@@ -37,7 +37,9 @@ _CREDENTIAL_KEYS = {
 }
 _ROUTING_KEYS = {
     RuntimeBackend.CLAUDE: frozenset({"ANTHROPIC_API_URL", "ANTHROPIC_BASE_URL"}),
-    RuntimeBackend.CODEX: frozenset({"CODEX_BASE_URL", "OPENAI_API_BASE", "OPENAI_BASE_URL"}),
+    RuntimeBackend.CODEX: frozenset(
+        {"CODEX_BASE_URL", "OPENAI_API_BASE", "OPENAI_BASE_URL"}
+    ),
 }
 _APPROVAL_KEYS = frozenset(
     {
@@ -88,9 +90,11 @@ def build_cli_environment(
             if value is not None:
                 result[key] = value
 
-    allowed_overrides = set(_SAFE_BASE_KEYS) | _APPROVAL_KEYS | {
-        key for key in overrides if key.startswith("LC_")
-    }
+    allowed_overrides = (
+        set(_SAFE_BASE_KEYS)
+        | _APPROVAL_KEYS
+        | {key for key in overrides if key.startswith("LC_")}
+    )
     allowed_overrides.update(_ROUTING_KEYS[runtime])
     if allow_credentials:
         allowed_overrides.update(_CREDENTIAL_KEYS[runtime])
@@ -146,7 +150,9 @@ def _validate_environment(
         if not isinstance(value, str):
             raise ValueError(f"environment value for {key!r} must be a string")
         if "\x00" in value or "\n" in value or "\r" in value:
-            raise ValueError(f"environment value for {key!r} must not contain NUL or newline")
+            raise ValueError(
+                f"environment value for {key!r} must not contain NUL or newline"
+            )
         result[key] = value
     return result
 
