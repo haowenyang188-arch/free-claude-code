@@ -7,10 +7,13 @@ to reduce token usage while preserving semantic meaning.
 import json
 from typing import Any
 
+tiktoken: Any = None
 try:
-    import tiktoken
+    import tiktoken as _tiktoken
+
+    tiktoken = _tiktoken
 except ImportError:
-    tiktoken = None
+    pass
 
 
 class TokenCounter:
@@ -112,10 +115,50 @@ class MessageCompressor:
         Args:
             max_tokens: Maximum allowed tokens (default: 100k)
         """
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
+            raise ValueError("max_tokens must be a non-negative integer")
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be a non-negative integer")
         self.max_tokens = max_tokens
         self.counter = TokenCounter()
 
-    def compress(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _fit_message(
+        self, message: dict[str, Any], token_budget: int
+    ) -> dict[str, Any] | None:
+        """Return a message that fits, truncating text content when possible."""
+        if token_budget <= 0:
+            return None
+        if self.counter.count_messages([message]) <= token_budget:
+            return message
+
+        content = message.get("content")
+        if not isinstance(content, str):
+            return None
+
+        candidate = dict(message)
+        candidate["content"] = ""
+        if self.counter.count_messages([candidate]) > token_budget:
+            return None
+
+        low = 0
+        high = len(content)
+        best = dict(candidate)
+        while low <= high:
+            middle = (low + high) // 2
+            candidate["content"] = content[:middle]
+            if self.counter.count_messages([candidate]) <= token_budget:
+                best = dict(candidate)
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best
+
+    def compress(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        deduplicate: bool = True,
+    ) -> list[dict[str, Any]]:
         """Compress messages if they exceed max_tokens.
 
         Strategy:
@@ -129,43 +172,41 @@ class MessageCompressor:
         Returns:
             Compressed message list
         """
-        # Step 1: Remove duplicates
-        deduped = MessageDeduplicator.deduplicate(messages)
+        # Step 1: Remove duplicates when requested.
+        deduped = (
+            MessageDeduplicator.deduplicate(messages) if deduplicate else list(messages)
+        )
+
+        if self.max_tokens == 0:
+            return []
 
         # Step 2: Check token count
         token_count = self.counter.count_messages(deduped)
         if token_count <= self.max_tokens:
             return deduped
 
-        # Step 3: Truncate from the beginning (keep recent messages)
-        # Always keep system message and last N messages
+        # Step 3: Keep the system prompt and most recent messages. Text content
+        # is shortened to the remaining budget; non-text messages are omitted
+        # when they cannot fit.
+        result: list[dict[str, Any]] = []
+        current_tokens = 0
+        other_msgs = deduped
+
         if deduped and deduped[0].get("role") == "system":
-            system_msg = [deduped[0]]
+            system = self._fit_message(deduped[0], self.max_tokens)
+            if system is not None:
+                result.append(system)
+                current_tokens = self.counter.count_messages([system])
             other_msgs = deduped[1:]
-        else:
-            system_msg = []
-            other_msgs = deduped
 
-        # Keep last messages that fit within budget
-        result = system_msg.copy()
-        current_tokens = self.counter.count_messages(system_msg)
+        selected: list[dict[str, Any]] = []
+        for message in reversed(other_msgs):
+            fitted = self._fit_message(message, self.max_tokens - current_tokens)
+            if fitted is not None:
+                selected.append(fitted)
+                current_tokens += self.counter.count_messages([fitted])
 
-        # Add messages from end, respecting token budget
-        for msg in reversed(other_msgs):
-            msg_tokens = self.counter.count_messages([msg])
-            if current_tokens + msg_tokens <= self.max_tokens:
-                result.insert(len(system_msg), msg)
-                current_tokens += msg_tokens
-            else:
-                # Add truncation notice
-                if system_msg:
-                    notice = {
-                        "role": "system",
-                        "content": f"[Earlier messages truncated to fit {self.max_tokens} token limit]",
-                    }
-                    result.insert(len(system_msg), notice)
-                break
-
+        result.extend(reversed(selected))
         return result
 
 
@@ -222,13 +263,9 @@ def optimize_messages(
     counter = TokenCounter()
     original_tokens = counter.count_messages(messages)
 
-    # Apply optimizations
-    result = messages
-    if deduplicate:
-        result = MessageDeduplicator.deduplicate(result)
-
+    # Apply optimizations while preserving the caller's deduplication choice.
     compressor = MessageCompressor(max_tokens=max_tokens)
-    result = compressor.compress(result)
+    result = compressor.compress(messages, deduplicate=deduplicate)
 
     # Calculate stats
     final_count = len(result)

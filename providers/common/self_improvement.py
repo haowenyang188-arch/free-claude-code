@@ -84,7 +84,9 @@ class CodeQualityAnalyzer:
         return issues
 
     @staticmethod
-    def _calculate_complexity(node: ast.FunctionDef) -> int:
+    def _calculate_complexity(
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> int:
         """Calculate cyclomatic complexity of a function.
 
         Args:
@@ -93,27 +95,58 @@ class CodeQualityAnalyzer:
         Returns:
             Complexity score
         """
-        complexity = 1  # Base complexity
 
-        for child in ast.walk(node):
-            # Decision points increase complexity
-            if isinstance(
-                child,
-                (
-                    ast.If,
-                    ast.While,
-                    ast.For,
-                    ast.AsyncFor,
-                    ast.ExceptHandler,
-                    ast.With,
-                    ast.AsyncWith,
-                ),
-            ):
-                complexity += 1
-            elif isinstance(child, ast.BoolOp):
-                complexity += len(child.values) - 1
+        class _ComplexityVisitor(ast.NodeVisitor):
+            def __init__(self, root: ast.FunctionDef | ast.AsyncFunctionDef):
+                self.root = root
+                self.complexity = 1
 
-        return complexity
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                if node is self.root:
+                    self.generic_visit(node)
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                if node is self.root:
+                    self.generic_visit(node)
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                return
+
+            def visit_If(self, node: ast.If) -> None:
+                self.complexity += 1
+                self.generic_visit(node)
+
+            def visit_While(self, node: ast.While) -> None:
+                self.complexity += 1
+                self.generic_visit(node)
+
+            def visit_For(self, node: ast.For) -> None:
+                self.complexity += 1
+                self.generic_visit(node)
+
+            def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+                self.complexity += 1
+                self.generic_visit(node)
+
+            def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+                self.complexity += 1
+                self.generic_visit(node)
+
+            def visit_With(self, node: ast.With) -> None:
+                self.complexity += 1
+                self.generic_visit(node)
+
+            def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+                self.complexity += 1
+                self.generic_visit(node)
+
+            def visit_BoolOp(self, node: ast.BoolOp) -> None:
+                self.complexity += len(node.values) - 1
+                self.generic_visit(node)
+
+        visitor = _ComplexityVisitor(node)
+        visitor.visit(node)
+        return visitor.complexity
 
     @staticmethod
     def analyze_file_size(file_path: str, max_lines: int = 500) -> list[CodeIssue]:
@@ -345,7 +378,9 @@ class SelfImprovementLoop:
         fixed = 0
 
         for issue in issues:
-            if issue.category == "style" and self.optimizer.apply_formatter(issue.file_path):
+            if issue.category == "style" and self.optimizer.apply_formatter(
+                issue.file_path
+            ):
                 fixed += 1
             # Add more automatic fixes here
 

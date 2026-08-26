@@ -7,6 +7,25 @@ from collections.abc import Callable
 from typing import Any, TypeVar
 
 T = TypeVar("T")
+_CACHE_MISS = object()
+
+
+def _callable_name(func: Callable[..., Any]) -> str:
+    return getattr(func, "__name__", type(func).__name__)
+
+
+def _cache_key(
+    func: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> str:
+    """Build a cache key scoped to the decorated callable.
+
+    A single decorator instance can be applied to multiple callables.  Their
+    names are not unique, so include the callable identity in addition to the
+    argument representation.  ``repr`` preserves the previous support for
+    unhashable arguments such as lists and dictionaries.
+    """
+    keyword_items = sorted(kwargs.items())
+    return f"{id(func)}:{args!r}:{keyword_items!r}"
 
 
 class SimpleCache:
@@ -19,28 +38,28 @@ class SimpleCache:
             ttl: Time-to-live in seconds (default: 5 minutes)
         """
         self.ttl = ttl
-        self._cache: dict[str, tuple[Any, float]] = {}
+        self._cache: dict[Any, tuple[Any, float]] = {}
 
-    def get(self, key: str) -> Any | None:
+    def get(self, key: Any, default: Any | None = None) -> Any:
         """Get value from cache.
 
         Args:
             key: Cache key
 
         Returns:
-            Cached value or None if expired/missing
+            Cached value, or ``default`` if expired/missing
         """
         if key not in self._cache:
-            return None
+            return default
 
         value, timestamp = self._cache[key]
         if time.time() - timestamp > self.ttl:
             del self._cache[key]
-            return None
+            return default
 
         return value
 
-    def set(self, key: str, value: Any) -> None:
+    def set(self, key: Any, value: Any) -> None:
         """Set value in cache.
 
         Args:
@@ -75,8 +94,21 @@ class BatchProcessor:
             batch_size: Maximum batch size
             max_wait: Maximum wait time in seconds
         """
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size <= 0
+        ):
+            raise ValueError("batch_size must be a positive integer")
+        if (
+            isinstance(max_wait, bool)
+            or not isinstance(max_wait, (int, float))
+            or max_wait < 0
+        ):
+            raise ValueError("max_wait must be non-negative")
+
         self.batch_size = batch_size
-        self.max_wait = max_wait
+        self.max_wait = float(max_wait)
         self._queue: list[Any] = []
         self._lock = asyncio.Lock()
 
@@ -135,11 +167,11 @@ def memoize(ttl: float = 300):
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> T:
             # Create cache key from arguments
-            key = f"{func.__name__}:{args}:{sorted(kwargs.items())}"
+            key = _cache_key(func, args, kwargs)
 
             # Check cache
-            result = cache.get(key)
-            if result is not None:
+            result = cache.get(key, _CACHE_MISS)
+            if result is not _CACHE_MISS:
                 return result
 
             # Call function and cache result
@@ -157,10 +189,10 @@ async def async_memoize_wrapper(
     func: Callable[..., Any], cache: SimpleCache, *args: Any, **kwargs: Any
 ) -> Any:
     """Async wrapper for memoization."""
-    key = f"{func.__name__}:{args}:{sorted(kwargs.items())}"
+    key = _cache_key(func, args, kwargs)
 
-    result = cache.get(key)
-    if result is not None:
+    result = cache.get(key, _CACHE_MISS)
+    if result is not _CACHE_MISS:
         return result
 
     result = await func(*args, **kwargs)
@@ -256,7 +288,7 @@ def timed(monitor: PerformanceMonitor, name: str | None = None):
     """
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        metric_name = name or func.__name__
+        metric_name = name or _callable_name(func)
 
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> T:
@@ -284,7 +316,7 @@ def async_timed(monitor: PerformanceMonitor, name: str | None = None):
     """
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-        metric_name = name or func.__name__
+        metric_name = name or _callable_name(func)
 
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:

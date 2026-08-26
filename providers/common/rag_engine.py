@@ -41,6 +41,19 @@ class GitNexusRAG:
             self.conn.close()
             self.conn = None
 
+    def _connection(self) -> sqlite3.Connection:
+        if self.conn is None:
+            self.connect()
+        assert self.conn is not None
+        return self.conn
+
+    @staticmethod
+    def _validate_limit(limit: int, name: str = "limit") -> int:
+        """Validate a SQL result limit before it reaches a query."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+        return limit
+
     def search_symbols(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         """Search for code symbols.
 
@@ -51,11 +64,11 @@ class GitNexusRAG:
         Returns:
             List of matching symbols with metadata
         """
-        if not self.conn:
-            self.connect()
+        limit = self._validate_limit(limit)
+        conn = self._connection()
 
         # Simple text search on symbol names
-        cursor = self.conn.execute(
+        cursor = conn.execute(
             """
             SELECT name, kind, filePath, startLine, endLine
             FROM Symbol
@@ -76,11 +89,10 @@ class GitNexusRAG:
         Returns:
             Symbol context with callers and callees
         """
-        if not self.conn:
-            self.connect()
+        conn = self._connection()
 
         # Get symbol details
-        cursor = self.conn.execute(
+        cursor = conn.execute(
             """
             SELECT uid, name, kind, filePath, startLine, endLine
             FROM Symbol
@@ -97,7 +109,7 @@ class GitNexusRAG:
         symbol = dict(row)
 
         # Get callers (who calls this symbol)
-        cursor = self.conn.execute(
+        cursor = conn.execute(
             """
             SELECT DISTINCT s.name, s.kind, s.filePath
             FROM CodeRelation r
@@ -110,7 +122,7 @@ class GitNexusRAG:
         symbol["callers"] = [dict(row) for row in cursor.fetchall()]
 
         # Get callees (what this symbol calls)
-        cursor = self.conn.execute(
+        cursor = conn.execute(
             """
             SELECT DISTINCT s.name, s.kind, s.filePath
             FROM CodeRelation r
@@ -134,10 +146,10 @@ class GitNexusRAG:
         Returns:
             List of related symbols
         """
-        if not self.conn:
-            self.connect()
+        limit = self._validate_limit(limit)
+        conn = self._connection()
 
-        cursor = self.conn.execute(
+        cursor = conn.execute(
             """
             SELECT name, kind, startLine, endLine
             FROM Symbol
@@ -159,10 +171,9 @@ class GitNexusRAG:
         Returns:
             List of implementing classes
         """
-        if not self.conn:
-            self.connect()
+        conn = self._connection()
 
-        cursor = self.conn.execute(
+        cursor = conn.execute(
             """
             SELECT DISTINCT s.name, s.kind, s.filePath
             FROM CodeRelation r
@@ -191,7 +202,8 @@ def inject_rag_context(
     Returns:
         Messages with injected context
     """
-    if not messages:
+    max_context = GitNexusRAG._validate_limit(max_context, "max_context")
+    if not messages or max_context == 0:
         return messages
 
     # Extract code references from user messages
@@ -254,13 +266,12 @@ def build_knowledge_summary(rag_engine: GitNexusRAG) -> str:
     Returns:
         Markdown summary of codebase structure
     """
-    if not rag_engine.conn:
-        rag_engine.connect()
+    conn = rag_engine._connection()
 
     summary = "# Codebase Knowledge Summary\n\n"
 
     # Count symbols by type
-    cursor = rag_engine.conn.execute(
+    cursor = conn.execute(
         """
         SELECT kind, COUNT(*) as count
         FROM Symbol
@@ -274,7 +285,7 @@ def build_knowledge_summary(rag_engine: GitNexusRAG) -> str:
         summary += f"- {row[0]}: {row[1]}\n"
 
     # List main files
-    cursor = rag_engine.conn.execute(
+    cursor = conn.execute(
         """
         SELECT filePath, COUNT(*) as symbol_count
         FROM Symbol

@@ -149,6 +149,32 @@ class TestMessageCompressor:
         # System message should always be kept
         assert any(msg["role"] == "system" for msg in result)
 
+    def test_compress_truncates_an_oversized_system_message_to_budget(self):
+        compressor = MessageCompressor(max_tokens=20)
+        messages = [
+            {"role": "system", "content": "system instructions " * 100},
+            {"role": "user", "content": "recent question"},
+        ]
+
+        result = compressor.compress(messages)
+
+        assert compressor.counter.count_messages(result) <= 20
+        assert result[0]["role"] == "system"
+
+    def test_compress_truncates_a_single_oversized_message(self):
+        compressor = MessageCompressor(max_tokens=20)
+        messages = [{"role": "user", "content": "long message " * 100}]
+
+        result = compressor.compress(messages)
+
+        assert compressor.counter.count_messages(result) <= 20
+        assert len(result) == 1
+
+    def test_compress_zero_budget_returns_no_messages(self):
+        compressor = MessageCompressor(max_tokens=0)
+
+        assert compressor.compress([{"role": "user", "content": "hello"}]) == []
+
 
 class TestContentSummarizer:
     """Test content summarization."""
@@ -195,13 +221,32 @@ class TestOptimizeMessages:
         assert len(result) < len(messages)
         assert stats["messages_removed"] > 0
 
+    def test_optimize_can_preserve_duplicates_when_requested(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "user", "content": "Hello"},
+        ]
+
+        result, stats = optimize_messages(messages, deduplicate=False)
+
+        assert result == messages
+        assert stats["messages_removed"] == 0
+
+    def test_optimize_zero_budget_obeys_token_limit(self):
+        result, stats = optimize_messages(
+            [{"role": "system", "content": "system"}], max_tokens=0
+        )
+
+        assert result == []
+        assert stats["final_tokens"] == 0
+
     def test_optimize_with_token_limit(self):
         messages = [
             {"role": "user", "content": "A" * 1000},
             {"role": "assistant", "content": "B" * 1000},
             {"role": "user", "content": "C" * 1000},
         ]
-        result, stats = optimize_messages(messages, max_tokens=100)
+        _result, stats = optimize_messages(messages, max_tokens=100)
         assert stats["final_tokens"] <= 100
         assert stats["tokens_saved"] > 0
 
@@ -210,7 +255,7 @@ class TestOptimizeMessages:
             {"role": "user", "content": "Hello"},
             {"role": "user", "content": "Hello"},
         ]
-        result, stats = optimize_messages(messages)
+        _result, stats = optimize_messages(messages)
         assert "compression_ratio" in stats
         assert 0 <= stats["compression_ratio"] <= 1
 
