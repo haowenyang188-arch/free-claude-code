@@ -64,7 +64,9 @@ class CodexSessionWrapper:
 
         command.append("--json")
         if self.isolation_mode == "safe":
-            command.extend(["--ignore-user-config", "--ignore-rules", "--strict-config"])
+            command.extend(
+                ["--ignore-user-config", "--ignore-rules", "--strict-config"]
+            )
         if self.model:
             command.extend(["--model", self.model])
         command.append("--skip-git-repo-check")
@@ -104,7 +106,7 @@ class CodexSessionWrapper:
                     *command,
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
                     cwd=self.workspace,
                     env=env,
                 )
@@ -118,23 +120,21 @@ class CodexSessionWrapper:
                         self.current_session_id = event.get("session_id")
                     yield event
 
-                stderr_text = ""
-                stderr = getattr(self.process, "stderr", None)
-                if stderr:
-                    stderr_bytes = await stderr.read()
-                    stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-
                 return_code = await self.process.wait()
-                logger.info(f"Codex CLI exited with code {return_code}")
-
-                if stderr_text and return_code != 0:
-                    logger.warning(f"Codex CLI stderr: {stderr_text[:200]}")
-                    yield {"type": "error", "error": {"message": stderr_text}}
+                logger.info("Codex CLI exited with code {}", return_code)
+                if return_code != 0:
+                    logger.warning("Codex CLI failed with exit code {}", return_code)
+                    yield {
+                        "type": "error",
+                        "error": {
+                            "message": f"Codex CLI exited with code {return_code}"
+                        },
+                    }
 
                 yield {
                     "type": "exit",
                     "code": return_code,
-                    "stderr": stderr_text or None,
+                    "stderr": None,
                 }
             except Exception as exc:
                 logger.error(f"Codex CLI session failed: {type(exc).__name__}")
@@ -194,7 +194,10 @@ class CodexSessionWrapper:
         if event_type == "error":
             error = record.get("error")
             message = error.get("message") if isinstance(error, dict) else error
-            return {"type": "error", "error": {"message": str(message or "Codex error")}}
+            return {
+                "type": "error",
+                "error": {"message": str(message or "Codex error")},
+            }
 
         text = self._text_from(record)
         if event_type in {"message", "assistant", "agent_message"} and text:
