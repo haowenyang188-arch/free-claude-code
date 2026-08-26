@@ -182,3 +182,21 @@ def test_output_and_diagnostics_are_deterministic_and_never_contain_secret_value
     assert "OPENAI_API_KEY" in diagnostics["credential_keys"]
     assert diagnostics["backend"] == "codex"
     assert diagnostics["key_count"] == len(first) + 1
+
+
+def test_approval_policy_environment_is_allowlisted_without_credentials():
+    from cli.runtime_environment import build_cli_environment
+
+    environment = build_cli_environment(
+        "codex",
+        extra_env={
+            "FCC_APPROVAL_ENABLED": "true",
+            "FCC_APPROVAL_SCOPE": "once",
+            "FCC_APPROVAL_COMMANDS_JSON": '["git status"]',
+            "FCC_APPROVAL_WORKSPACES_JSON": '["/tmp/project"]',
+            "FCC_APPROVAL_ALLOW_PERMANENT": "false",
+        },
+    )
+
+    assert environment["FCC_APPROVAL_ENABLED"] == "true"
+    assert "OPENAI_API_KEY" not in environment

@@ -8,10 +8,11 @@ responsible for the other's side effects.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shlex
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -54,6 +55,9 @@ class ApprovalRequest:
     scope: ApprovalScope = ApprovalScope.ONCE
     process_id: int | None = None
     generation: str | None = None
+    tool_input: Mapping[str, Any] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         backend = _required_text(self.backend, "backend").lower()
@@ -72,6 +76,10 @@ class ApprovalRequest:
         ):
             raise ValueError("process_id must be an integer")
         generation = _optional_text(self.generation, "generation")
+        tool_input = self.tool_input
+        if not isinstance(tool_input, Mapping):
+            raise ValueError("tool_input must be an object")
+        tool_input = dict(tool_input)
 
         object.__setattr__(self, "backend", backend)
         object.__setattr__(self, "tool_name", tool_name)
@@ -80,6 +88,7 @@ class ApprovalRequest:
         object.__setattr__(self, "prompt", prompt)
         object.__setattr__(self, "scope", scope)
         object.__setattr__(self, "generation", generation)
+        object.__setattr__(self, "tool_input", tool_input)
 
     @classmethod
     def from_mapping(
@@ -120,14 +129,6 @@ class ApprovalRequest:
         if not isinstance(prompt, str):
             prompt = ""
 
-        raw_scope = (
-            payload.get("approval_scope")
-            or payload.get("approvalScope")
-            or tool_input.get("approval_scope")
-            or tool_input.get("approvalScope")
-            or ApprovalScope.ONCE.value
-        )
-
         process_id = payload.get("process_id") or payload.get("pid")
         if process_id is not None and not isinstance(process_id, int):
             process_id = None
@@ -142,9 +143,12 @@ class ApprovalRequest:
             command=command,
             workspace=workspace,
             prompt=prompt,
-            scope=raw_scope,
+            # Scope is coordinator-owned. Hook input is untrusted and cannot
+            # upgrade a one-shot request to a session or permanent grant.
+            scope=ApprovalScope.ONCE,
             process_id=process_id,
             generation=generation,
+            tool_input=tool_input,
         )
 
 
@@ -239,6 +243,31 @@ _DANGEROUS_RE = re.compile(
     r"docker\s+system\s+prune\b"
     r")"
 )
+_DANGEROUS_WORD_RE = re.compile(
+    r"\b(?:sudo|rm|rmdir|del|erase|format|dd|mkfs|shutdown|reboot)\b",
+    re.IGNORECASE,
+)
+_SHELL_WRAPPER_NAMES = frozenset(
+    {
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "pwsh",
+        "powershell",
+        "env",
+        "command",
+        "xargs",
+        "find",
+    }
+)
+_SAFE_TOOL_FIELDS = {
+    "read": ("file_path", "path"),
+    "glob": ("pattern", "path"),
+    "grep": ("pattern",),
+    "ls": (),
+    "todoread": (),
+}
 _SCOPE_RANK = {
     ApprovalScope.ONCE: 0,
     ApprovalScope.SESSION: 1,
@@ -253,19 +282,21 @@ class ApprovalPolicy:
         self,
         *,
         enabled: bool = False,
-        allowed_command_prefixes: list[str] | tuple[str, ...] | None = None,
-        allowed_workspaces: list[str | os.PathLike[str]]
-        | tuple[str | os.PathLike[str], ...]
-        | None = None,
+        allowed_command_prefixes: Iterable[str] | None = None,
+        allowed_workspaces: Iterable[str | os.PathLike[str]] | None = None,
         safe_tools: frozenset[str] | set[str] | tuple[str, ...] | None = None,
-        denied_command_prefixes: list[str] | tuple[str, ...] | None = None,
+        denied_command_prefixes: Iterable[str] | None = None,
         max_auto_scope: ApprovalScope = ApprovalScope.ONCE,
         allow_permanent: bool = False,
         backends: frozenset[str] | set[str] | tuple[str, ...] | None = None,
     ) -> None:
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean")
+        if not isinstance(allow_permanent, bool):
+            raise ValueError("allow_permanent must be a boolean")
         if not isinstance(max_auto_scope, ApprovalScope):
             max_auto_scope = ApprovalScope(str(max_auto_scope))
-        self.enabled = bool(enabled)
+        self.enabled = enabled
         self.allowed_command_prefixes = tuple(
             _normalize_prefix(value)
             for value in (allowed_command_prefixes or ())
@@ -281,7 +312,7 @@ class ApprovalPolicy:
         )
         self.safe_tools = frozenset(safe_tools or DEFAULT_SAFE_TOOLS)
         self.max_auto_scope = max_auto_scope
-        self.allow_permanent = bool(allow_permanent)
+        self.allow_permanent = allow_permanent
         self.backends = frozenset(
             str(value).strip().lower() for value in (backends or ("claude", "codex"))
         )
@@ -291,9 +322,7 @@ class ApprovalPolicy:
         cls,
         *,
         enabled: bool = False,
-        allowed_workspaces: list[str | os.PathLike[str]]
-        | tuple[str | os.PathLike[str], ...]
-        | None = None,
+        allowed_workspaces: Iterable[str | os.PathLike[str]] | None = None,
         max_auto_scope: ApprovalScope = ApprovalScope.ONCE,
     ) -> ApprovalPolicy:
         """Create the conservative built-in read-only policy."""
@@ -307,13 +336,35 @@ class ApprovalPolicy:
     @classmethod
     def from_environment(cls) -> ApprovalPolicy:
         """Load the explicit hook configuration without exposing secrets."""
-        enabled = _parse_bool(os.environ.get("FCC_APPROVAL_ENABLED", "false"))
-        scope = ApprovalScope(
-            os.environ.get("FCC_APPROVAL_SCOPE", ApprovalScope.ONCE.value).strip()
+        enabled = _parse_bool(
+            _first_env(
+                "FCC_APPROVAL_ENABLED", "CLI_AUTO_APPROVAL_ENABLED", default="false"
+            )
         )
-        commands = _split_env_list(os.environ.get("FCC_APPROVAL_COMMANDS", ""))
-        workspaces = _split_env_list(os.environ.get("FCC_APPROVAL_WORKSPACES", ""))
-        if not workspaces:
+        scope = ApprovalScope(
+            _first_env(
+                "FCC_APPROVAL_SCOPE",
+                "CLI_AUTO_APPROVAL_SCOPE",
+                default=ApprovalScope.ONCE.value,
+            ).strip()
+        )
+        commands = _load_env_list(
+            "FCC_APPROVAL_COMMANDS_JSON",
+            "FCC_APPROVAL_COMMANDS",
+            "CLI_AUTO_APPROVAL_COMMANDS",
+        )
+        workspaces = _load_env_list(
+            "FCC_APPROVAL_WORKSPACES_JSON",
+            "FCC_APPROVAL_WORKSPACES",
+            "CLI_AUTO_APPROVAL_WORKSPACES",
+        )
+        workspace_keys = (
+            "FCC_APPROVAL_WORKSPACES_JSON",
+            "FCC_APPROVAL_WORKSPACES",
+            "CLI_AUTO_APPROVAL_WORKSPACES",
+        )
+        workspaces_configured = any(key in os.environ for key in workspace_keys)
+        if not workspaces and not workspaces_configured:
             workspaces = [os.getcwd()]
         return cls(
             enabled=enabled,
@@ -321,8 +372,59 @@ class ApprovalPolicy:
             allowed_workspaces=workspaces,
             max_auto_scope=scope,
             allow_permanent=_parse_bool(
-                os.environ.get("FCC_APPROVAL_ALLOW_PERMANENT", "false")
+                _first_env(
+                    "FCC_APPROVAL_ALLOW_PERMANENT",
+                    "CLI_AUTO_APPROVAL_ALLOW_PERMANENT",
+                    default="false",
+                )
             ),
+        )
+
+    def to_hook_environment(self) -> dict[str, str]:
+        """Serialize only non-secret policy data for a child hook process."""
+        workspaces = [str(path) for path in self.allowed_workspaces if path is not None]
+        return {
+            "FCC_APPROVAL_ENABLED": str(self.enabled).lower(),
+            "FCC_APPROVAL_SCOPE": self.max_auto_scope.value,
+            "FCC_APPROVAL_COMMANDS_JSON": json.dumps(
+                self.allowed_command_prefixes, ensure_ascii=True, separators=(",", ":")
+            ),
+            "FCC_APPROVAL_WORKSPACES_JSON": json.dumps(
+                workspaces, ensure_ascii=True, separators=(",", ":")
+            ),
+            "FCC_APPROVAL_ALLOW_PERMANENT": str(self.allow_permanent).lower(),
+        }
+
+    def claude_hook_settings(self) -> dict[str, Any]:
+        """Return a one-shot Claude settings fragment for this policy."""
+        if not self.enabled:
+            return {}
+        return {
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "^(Bash|Read|Glob|Grep|LS|TodoRead)$",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "fcc-approval-hook",
+                                "timeout": 5,
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+
+    def codex_hook_config_overrides(self) -> tuple[str, ...]:
+        """Return inline Codex TOML overrides for supported hook events."""
+        if not self.enabled:
+            return ()
+        handler = '{type="command",command="fcc-approval-hook",timeout=5}'
+        group = f'{{matcher="Bash",hooks=[{handler}]}}'
+        return (
+            f"hooks.PreToolUse=[{group}]",
+            f"hooks.PermissionRequest=[{group}]",
         )
 
     def evaluate(self, request: ApprovalRequest) -> ApprovalResult:
@@ -349,8 +451,22 @@ class ApprovalPolicy:
                 "requested approval scope exceeds the configured limit",
             )
 
+        if request.command:
+            if reason := _dangerous_command_reason(request.command):
+                return ApprovalResult(ApprovalDecision.DENY, reason)
+            if _simple_command_tokens(request.command) is None:
+                return ApprovalResult(
+                    ApprovalDecision.ASK,
+                    "compound or unparseable shell syntax requires review",
+                )
+
         tool_name = request.tool_name.lower()
         if tool_name in {tool.lower() for tool in self.safe_tools}:
+            if not _safe_tool_input_is_valid(request):
+                return ApprovalResult(
+                    ApprovalDecision.ASK,
+                    "tool input does not match the read-only tool schema",
+                )
             return ApprovalResult(
                 ApprovalDecision.ALLOW,
                 "matched a read-only tool",
@@ -365,9 +481,6 @@ class ApprovalPolicy:
             )
         if not request.command:
             return ApprovalResult(ApprovalDecision.ASK, "command text is unavailable")
-
-        if reason := _dangerous_command_reason(request.command):
-            return ApprovalResult(ApprovalDecision.DENY, reason)
 
         tokens = _simple_command_tokens(request.command)
         if tokens is None:
@@ -396,8 +509,8 @@ class ApprovalPolicy:
         return ApprovalResult(ApprovalDecision.ASK, "command is not in the allowlist")
 
     def _workspace_is_allowed(self, workspace: str | None) -> bool:
-        if not self.allowed_workspaces:
-            return True
+        if not self.enabled or not self.allowed_workspaces:
+            return False
         if not workspace:
             return False
         resolved_workspace = _resolve_path(workspace)
@@ -436,7 +549,22 @@ class ApprovalPromptParser:
 
         has_allow = any(option.decision is ApprovalDecision.ALLOW for option in options)
         has_deny = any(option.decision is ApprovalDecision.DENY for option in options)
-        if not has_allow or not has_deny:
+        saw_numbered_option = any(
+            re.match(r"^\d+[.)]\s+", line) is not None for line in lines
+        )
+        has_approval_anchor = any(
+            re.search(
+                r"\b(?:do you want to proceed|permission|approval required|approve|allow this)",
+                line,
+                flags=re.IGNORECASE,
+            )
+            for line in lines
+        )
+        if (
+            not has_allow
+            or not has_deny
+            or not (saw_numbered_option or has_approval_anchor)
+        ):
             return None
 
         prompt_text = "\n".join(lines)
@@ -460,6 +588,10 @@ class ApprovalPromptParser:
 
     @staticmethod
     def _parse_option(line: str) -> ApprovalOption | None:
+        if not (
+            re.match(r"^\d+[.)]\s+", line) or re.search(r"\s+\([^()]+\)\s*$", line)
+        ):
+            return None
         match = re.match(
             r"^(?:\d+[.)]\s*)?(?P<label>.*?)(?:\s+\((?P<key>[^()]+)\))?$",
             line,
@@ -470,11 +602,13 @@ class ApprovalPromptParser:
         key = match.group("key")
         key = key.strip().lower() if key else None
         lowered = label.lower()
+        if re.search(r"\b(?:do\s+not|don't|never)\s+allow\b", lowered):
+            return None
         is_allow = bool(re.search(r"\b(?:yes|allow|approve|proceed)\b", lowered))
         is_deny = bool(
             re.search(r"\b(?:no|cancel|deny|dismiss|abort|esc(?:ape)?)\b", lowered)
         )
-        if not is_allow and not is_deny:
+        if (is_allow and is_deny) or (not is_allow and not is_deny):
             return None
 
         if is_deny and not is_allow:
@@ -544,7 +678,7 @@ class ApprovalHook:
                 }
             }
 
-        if event_name in {None, "PreToolUse"}:
+        if event_name == "PreToolUse":
             output: dict[str, Any] = {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": result.decision.value,
@@ -625,9 +759,170 @@ def _tokens_match_prefix(
 
 
 def _dangerous_command_reason(command: str) -> str | None:
+    tokens = _shell_tokens(command)
+    if not tokens:
+        return "command could not be parsed safely"
+    if _contains_dangerous_command(tokens):
+        return "destructive or unrestricted command requires manual approval"
+    if re.search(
+        r"(?ix)\bgit(?:\s+-\S+)*\s+push\b(?:(?![;&|]).)*(?:^|\s)(?:-f|--force(?:-with-lease)?)(?:\s|$)",
+        command,
+    ):
+        return "force-push requires manual approval"
     if _DANGEROUS_RE.search(command):
         return "destructive or unrestricted command requires manual approval"
     return None
+
+
+def _shell_tokens(command: str) -> tuple[str, ...]:
+    if len(command) > 8_192 or _CONTROL_RE.search(command):
+        return ()
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return tuple(lexer)
+    except ValueError:
+        return ()
+
+
+def _contains_dangerous_command(tokens: tuple[str, ...]) -> bool:
+    separators = {";", "&&", "||", "|", "&", "<", ">", ">>", "<<<"}
+    command_starts = {0}
+    for index, token in enumerate(tokens[:-1]):
+        if token in separators:
+            command_starts.add(index + 1)
+
+    for index in sorted(command_starts):
+        if index >= len(tokens):
+            continue
+        executable_index = _skip_command_wrappers(tokens, index)
+        if executable_index is None:
+            continue
+        executable = _executable_name(tokens[executable_index])
+        if executable in _DANGEROUS_EXECUTABLES:
+            return True
+        if executable in {"git", "git.exe"} and _git_command_is_dangerous(
+            tokens[executable_index:]
+        ):
+            return True
+
+        if executable in {"find", "xargs"} and any(
+            _executable_name(value) in _DANGEROUS_EXECUTABLES
+            for value in tokens[executable_index + 1 :]
+        ):
+            return True
+
+        if executable in _SHELL_WRAPPER_NAMES:
+            for option_index, value in enumerate(
+                tokens[executable_index + 1 :], executable_index + 1
+            ):
+                if value in {"-c", "-Command", "-command"} and option_index + 1 < len(
+                    tokens
+                ):
+                    inner = _shell_tokens(tokens[option_index + 1])
+                    if inner and _contains_dangerous_command(inner):
+                        return True
+
+    return False
+
+
+_DANGEROUS_EXECUTABLES = frozenset(
+    {
+        "sudo",
+        "rm",
+        "rmdir",
+        "del",
+        "erase",
+        "format",
+        "dd",
+        "mkfs",
+        "shutdown",
+        "reboot",
+    }
+)
+
+
+def _skip_command_wrappers(tokens: tuple[str, ...], index: int) -> int | None:
+    while index < len(tokens):
+        token = tokens[index]
+        if not token or token in {";", "&&", "||", "|", "&"}:
+            return None
+        executable = _executable_name(token)
+        if executable in {
+            "env",
+            "command",
+            "sudo",
+            "nohup",
+            "time",
+            "nice",
+            "stdbuf",
+            "timeout",
+        }:
+            index += 1
+            while index < len(tokens) and (
+                tokens[index].startswith("-") or "=" in tokens[index]
+            ):
+                index += 1
+            continue
+        return index
+    return None
+
+
+def _executable_name(value: str) -> str:
+    return value.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _git_command_is_dangerous(tokens: tuple[str, ...]) -> bool:
+    lowered = [token.lower() for token in tokens]
+    if "reset" in lowered and "--hard" in lowered:
+        return True
+    if "clean" in lowered:
+        return True
+    if "branch" in lowered and any(
+        token == "-d" or token == "-D".lower() for token in tokens
+    ):
+        return True
+    try:
+        push_index = lowered.index("push")
+    except ValueError:
+        return False
+    for token in lowered[push_index + 1 :]:
+        if token in {"-f", "--force", "--force-with-lease"} or (
+            token.startswith("-") and not token.startswith("--") and "f" in token[1:]
+        ):
+            return True
+    return False
+
+
+def _safe_tool_input_is_valid(request: ApprovalRequest) -> bool:
+    tool_name = request.tool_name.lower()
+    fields = _SAFE_TOOL_FIELDS.get(tool_name)
+    if fields is None:
+        return False
+    if (
+        request.command is not None
+        or "command" in request.tool_input
+        or "cmd" in request.tool_input
+    ):
+        return False
+    if not fields:
+        return True
+    if not any(
+        isinstance(request.tool_input.get(field), str)
+        and bool(request.tool_input[field].strip())
+        for field in fields
+    ):
+        return False
+    path_value = request.tool_input.get("file_path") or request.tool_input.get("path")
+    return not (
+        isinstance(path_value, str)
+        and re.search(
+            r"(?:^|[/\\])(?:\.env(?:\.|$)|[^/\\]+\.(?:pem|key))",
+            path_value,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _resolve_path(value: str | os.PathLike[str]) -> Path | None:
@@ -654,6 +949,33 @@ def _extract_command_prefix(prompt: str) -> str | None:
 
 def _parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _first_env(*keys: str, default: str) -> str:
+    for key in keys:
+        value = os.environ.get(key)
+        if value is not None:
+            return value
+    return default
+
+
+def _load_env_list(*keys: str) -> list[str]:
+    for key in keys:
+        value = os.environ.get(key)
+        if value is None or not value.strip():
+            continue
+        if key.endswith("_JSON"):
+            try:
+                parsed = json.loads(value)
+            except TypeError, ValueError:
+                continue
+            if isinstance(parsed, list) and all(
+                isinstance(item, str) for item in parsed
+            ):
+                return [item for item in parsed if item.strip()]
+            continue
+        return _split_env_list(value)
+    return []
 
 
 def _split_env_list(value: str) -> list[str]:

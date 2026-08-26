@@ -39,6 +39,15 @@ _ROUTING_KEYS = {
     RuntimeBackend.CLAUDE: frozenset({"ANTHROPIC_API_URL", "ANTHROPIC_BASE_URL"}),
     RuntimeBackend.CODEX: frozenset({"CODEX_BASE_URL", "OPENAI_API_BASE", "OPENAI_BASE_URL"}),
 }
+_APPROVAL_KEYS = frozenset(
+    {
+        "FCC_APPROVAL_ENABLED",
+        "FCC_APPROVAL_SCOPE",
+        "FCC_APPROVAL_COMMANDS_JSON",
+        "FCC_APPROVAL_WORKSPACES_JSON",
+        "FCC_APPROVAL_ALLOW_PERMANENT",
+    }
+)
 _SENSITIVE_PARTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "COOKIE", "AUTH")
 
 
@@ -79,7 +88,7 @@ def build_cli_environment(
             if value is not None:
                 result[key] = value
 
-    allowed_overrides = set(_SAFE_BASE_KEYS) | {
+    allowed_overrides = set(_SAFE_BASE_KEYS) | _APPROVAL_KEYS | {
         key for key in overrides if key.startswith("LC_")
     }
     allowed_overrides.update(_ROUTING_KEYS[runtime])
