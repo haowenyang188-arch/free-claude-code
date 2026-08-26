@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from .codex_session_wrapper import CodexSessionWrapper
+from cli.codex_session import CodexSession
+from cli.runtime_registry import RuntimeBackend, RuntimeRegistry
 
 if __package__:
     from ..models import AgentStatus, AgentType, EventType
@@ -19,27 +20,20 @@ class CodexAdapter(BaseAgentAdapter):
         super().__init__(agent_id, AgentType.CODEX)
         self.cli_path = "codex"
         self.workspace_path: str = ""
-        self.session: CodexSessionWrapper | None = None
+        self.runtime_registry = RuntimeRegistry(
+            executables={RuntimeBackend.CODEX: self.cli_path}
+        )
+        self.session: CodexSession | None = None
         self.session_id: str | None = None
 
     async def check_availability(self) -> bool:
-        """检查Codex CLI是否可用"""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                self.cli_path,
-                "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            return proc.returncode == 0 and b"codex" in stdout.lower()
-        except Exception:
-            return False
+        """Return bounded, cached local Codex CLI readiness."""
+        return (await self.runtime_registry.probe(RuntimeBackend.CODEX)).available
 
     async def start_task(
         self, run_id: str, task_description: str, workspace_path: str
     ) -> bool:
-        """启动Codex任务 - 使用 CodexSessionWrapper"""
+        """Start a Codex task through the shared hardened CLI session."""
         self.current_run_id = run_id
         self.last_run_id = run_id
         self.workspace_path = workspace_path
@@ -56,11 +50,13 @@ class CodexAdapter(BaseAgentAdapter):
                 },
             )
 
-            # 创建 CodexSessionWrapper
+            # Workbench and messaging now share one Codex session contract.
             if self.session is None:
-                self.session = CodexSessionWrapper(
+                self.session = CodexSession(
                     workspace_path=workspace_path,
                     sandbox_mode="read-only",
+                    isolation_mode="safe",
+                    runtime_registry=self.runtime_registry,
                 )
 
             # 启动输出监听任务
@@ -169,7 +165,11 @@ class CodexAdapter(BaseAgentAdapter):
                                 {"error": stderr or f"Process exited with code {exit_code}"},
                                 run_id=run_id,
                             )
-                    break
+                    # Keep draining the one-shot JSONL generator so its
+                    # finally block releases the process lease and busy flag.
+                    # Breaking here leaves a completed session looking busy
+                    # and rejects the next resume/fork turn.
+                    continue
 
             self.status = AgentStatus.ONLINE
             self.current_run_id = None
@@ -241,7 +241,7 @@ class CodexAdapter(BaseAgentAdapter):
     async def resume(self) -> bool:
         """继续执行"""
         if self.session:
-            result = await self.session.resume_process()
+            result = await self.session.resume()
             if result:
                 self.status = AgentStatus.BUSY
                 await self.emit_event(
@@ -276,6 +276,7 @@ class CodexAdapter(BaseAgentAdapter):
             "status": self.status.value,
             "current_run_id": self.current_run_id,
             "session_id": self.session_id,
+            "generation": self.session.generation if self.session else None,
             "workspace": self.workspace_path,
             "is_busy": self.session.is_busy if self.session else False,
         }

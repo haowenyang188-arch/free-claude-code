@@ -10,6 +10,9 @@ from typing import Any
 
 from loguru import logger
 
+from cli.runtime_environment import build_cli_environment
+from cli.runtime_registry import RuntimeBackend, RuntimeRegistry
+
 
 class CodexSessionWrapper:
     """Simplified Codex session manager for workbench integration."""
@@ -21,11 +24,21 @@ class CodexSessionWrapper:
         codex_bin: str = "codex",
         sandbox_mode: str = "read-only",
         model: str | None = None,
+        isolation_mode: str = "safe",
+        runtime_registry: RuntimeRegistry | None = None,
+        preflight_runtime: bool = False,
     ) -> None:
         self.workspace = os.path.normpath(os.path.abspath(workspace_path))
         self.codex_bin = codex_bin
         self.sandbox_mode = sandbox_mode
         self.model = model
+        if isolation_mode not in {"safe", "inherit"}:
+            raise ValueError("isolation_mode must be 'safe' or 'inherit'")
+        self.isolation_mode = isolation_mode
+        self.runtime_registry = runtime_registry or RuntimeRegistry(
+            executables={RuntimeBackend.CODEX: codex_bin}
+        )
+        self.preflight_runtime = preflight_runtime
         self.process: asyncio.subprocess.Process | None = None
         self.current_session_id: str | None = None
         self._is_busy = False
@@ -50,6 +63,8 @@ class CodexSessionWrapper:
             command.extend(["resume", session_id])
 
         command.append("--json")
+        if self.isolation_mode == "safe":
+            command.extend(["--ignore-user-config", "--ignore-rules", "--strict-config"])
         if self.model:
             command.extend(["--model", self.model])
         command.append("--skip-git-repo-check")
@@ -68,12 +83,21 @@ class CodexSessionWrapper:
     ) -> AsyncGenerator[dict[str, Any]]:
         """Run one Codex turn and yield normalized events."""
         async with self._cli_lock:
+            if self.preflight_runtime:
+                probe = await self.runtime_registry.probe(RuntimeBackend.CODEX)
+                if not probe.available:
+                    reason = probe.reason or "runtime_unavailable"
+                    yield {
+                        "type": "error",
+                        "error": {"message": f"Codex CLI preflight failed: {reason}"},
+                    }
+                    yield {"type": "exit", "code": 127, "stderr": reason}
+                    return
+
             command = self.build_command(prompt, session_id=session_id)
             self._is_busy = True
 
-            env = os.environ.copy()
-            env.setdefault("TERM", "dumb")
-            env.setdefault("PYTHONIOENCODING", "utf-8")
+            env = build_cli_environment(RuntimeBackend.CODEX)
 
             try:
                 self.process = await asyncio.create_subprocess_exec(
@@ -95,8 +119,9 @@ class CodexSessionWrapper:
                     yield event
 
                 stderr_text = ""
-                if self.process.stderr:
-                    stderr_bytes = await self.process.stderr.read()
+                stderr = getattr(self.process, "stderr", None)
+                if stderr:
+                    stderr_bytes = await stderr.read()
                     stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
 
                 return_code = await self.process.wait()

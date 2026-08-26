@@ -83,8 +83,15 @@ class _EmptyStdout:
         return b""
 
 
+class _EmptyStderr:
+    async def read(self) -> bytes:
+        return b""
+
+
 class _FinishedProcess:
     stdout = _EmptyStdout()
+    stderr = _EmptyStderr()
+    pid = 0
     returncode = 0
 
     async def wait(self) -> int:
@@ -295,11 +302,30 @@ def test_websocket_init_serializes_datetime_fields() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("adapter_type", [CodexAdapter, ClaudeCodeAdapter])
-async def test_adapters_emit_terminal_event_before_clearing_run_id(
-    adapter_type,
-) -> None:
-    adapter = adapter_type("agent-1")
+async def test_codex_adapter_emits_terminal_event_before_clearing_run_id() -> None:
+    adapter = CodexAdapter("agent-1")
+    adapter.current_run_id = "run-1"
+    events: list[Event] = []
+
+    class _Session:
+        async def start_task(self, *_args, **_kwargs):
+            yield {"type": "exit", "code": 0, "stderr": None}
+
+    async def callback(event: Event) -> None:
+        events.append(event)
+
+    adapter.session = _Session()
+    adapter.set_event_callback(callback)
+    await adapter._run_codex_task("task")
+
+    assert [event.type for event in events] == [EventType.RUN_FINISHED]
+    assert events[0].run_id == "run-1"
+    assert adapter.current_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_claude_adapter_emits_terminal_event_before_clearing_run_id() -> None:
+    adapter = ClaudeCodeAdapter("agent-1")
     adapter.current_run_id = "run-1"
     adapter.process = _FinishedProcess()
     events: list[Event] = []
@@ -317,24 +343,21 @@ async def test_adapters_emit_terminal_event_before_clearing_run_id(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("adapter_type", "module", "expected_prefix"),
+    ("adapter_type", "module"),
     [
         (
             CodexAdapter,
             codex_module,
-            ("codex", "exec", "--json", "--cd"),
         ),
         (
             ClaudeCodeAdapter,
             claude_module,
-            ("claude", "--print", "--output-format", "text"),
         ),
     ],
 )
 async def test_adapters_use_supported_noninteractive_cli_argv(
     adapter_type,
     module,
-    expected_prefix,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -351,7 +374,19 @@ async def test_adapters_use_supported_noninteractive_cli_argv(
     assert adapter.monitor_task is not None
     await adapter.monitor_task
 
-    assert captured["args"][: len(expected_prefix)] == expected_prefix
+    if adapter_type is CodexAdapter:
+        assert captured["args"][:3] == ("codex", "exec", "--json")
+        assert "--ignore-user-config" in captured["args"]
+        assert "--ignore-rules" in captured["args"]
+        assert "--strict-config" in captured["args"]
+        assert "--cd" in captured["args"]
+    else:
+        assert captured["args"][:4] == (
+            "claude",
+            "--print",
+            "--output-format",
+            "text",
+        )
     assert captured["args"][-1] == "do the task"
     assert captured["kwargs"]["cwd"] == str(tmp_path)
     assert captured["kwargs"]["stdin"] is module.asyncio.subprocess.DEVNULL
