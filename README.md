@@ -429,13 +429,17 @@ adapter is enabled.
 
 `fcc-approval-hook` is an opt-in, single-shot hook for Claude `PreToolUse` and
 Codex `PreToolUse` / `PermissionRequest` events. It auto-approves only the
-built-in read-only tool set and explicitly allowlisted command prefixes. It
-returns no output for unknown, compound, out-of-workspace, or otherwise
-ambiguous requests, so the CLI keeps its normal approval prompt. Destructive
-commands are denied by the local policy.
+built-in navigation/file-name-discovery set and explicitly allowlisted command
+prefixes. It
+never grants a session or permanent rule from hook input: external requests are
+treated as one-shot. It returns no output for unknown, compound, out-of-workspace,
+or otherwise ambiguous requests, so the CLI keeps its normal approval prompt.
+Destructive commands and sensitive credential paths are denied by the local
+policy.
 
-The hook is disabled by default. Enable it only in a hook configuration that
-also sets an explicit workspace boundary:
+The messaging runtime projects the hook into each selected CLI session when
+`CLI_AUTO_APPROVAL_ENABLED=true`. Enable it only with an explicit workspace
+boundary:
 
 ```bash
 FCC_APPROVAL_ENABLED=true \
@@ -444,14 +448,19 @@ FCC_APPROVAL_SCOPE=once \
 fcc-approval-hook
 ```
 
-Register the executable through the hook mechanism documented by the CLI you
-use. For Claude Code, add it to the `PreToolUse` hook in
-`~/.claude/settings.json`; Codex supports the same executable through its
-`PreToolUse` and `PermissionRequest` hook configuration. Keep the command
-allowlist narrow, and do not enable permanent approvals unless the explicit
-`FCC_APPROVAL_ALLOW_PERMANENT=true` setting and a permanent scope are both
-required by your workflow. The hook never executes the command from the input
-payload and never records the command or credentials in a log.
+For standalone use, register the executable through the hook mechanism
+documented by the CLI you use. Claude Code needs
+`CLI_ISOLATION_MODE=inherit`, because `--safe-mode` deliberately disables all
+hooks. Codex can use the normal safe profile with its inline hook config, but
+requires a one-time `/hooks` review/trust action for a non-managed hook; do not
+use `--dangerously-bypass-hook-trust`. Keep the command allowlist narrow. The
+hook never executes the command from the input payload and never records the
+command or credentials in a log.
+
+An MCP configuration is never auto-discovered from the working repository.
+Set `CLI_MCP_CONFIG` to an existing absolute path and use
+`CLI_ISOLATION_MODE=inherit` only after you have reviewed the server command.
+Safe mode ignores that setting and always keeps `--safe-mode` enabled.
 
 ### Voice Notes
 
@@ -518,10 +527,11 @@ Configure via `WHISPER_DEVICE` (`cpu` | `cuda`) and `WHISPER_MODEL`. See the [Co
 | `CODEX_SANDBOX`            | Codex sandbox: `read-only`, `workspace-write`, or `danger-full-access`                                                                                              | `read-only`         |
 | `CODEX_APPROVAL_REQUIRED`  | Stage Codex write-capable runs until an operator sends `/approve`                                                                                                    | `true`              |
 | `CLI_AUTO_APPROVAL_ENABLED` | Enable the protocol-level low-risk approval hook (opt-in)                                                                                                             | `false`             |
-| `CLI_AUTO_APPROVAL_SCOPE` | Maximum automatic approval scope: `once`, `session`, or `permanent`                                                                                                  | `once`              |
-| `CLI_AUTO_APPROVAL_COMMANDS` | Comma-separated command prefixes; empty uses the built-in read-only set                                                                                              | empty               |
+| `CLI_AUTO_APPROVAL_SCOPE` | Maximum scope for trusted internal approval callers; hook payloads remain one-shot                                                                                   | `once`              |
+| `CLI_AUTO_APPROVAL_COMMANDS` | Comma-separated command prefixes; empty uses the built-in navigation set                                                                                            | empty               |
 | `CLI_AUTO_APPROVAL_WORKSPACES` | Comma-separated absolute workspace roots; empty uses the current manager workspace                                                                                  | empty               |
 | `CLI_AUTO_APPROVAL_ALLOW_PERMANENT` | Allow permanent-scope decisions when explicitly requested                                                                                                           | `false`             |
+| `CLI_MCP_CONFIG` | Existing absolute MCP configuration path, loaded only in explicit `inherit` isolation mode                                                                            | empty               |
 | `CLAUDE_WORKSPACE`         | Directory where the agent operates                                                                                                                                 | `./agent_workspace` |
 | `ALLOWED_DIR`              | Allowed directories for the agent                                                                                                                                  | `""`                |
 | `MESSAGING_RATE_LIMIT`     | Messaging messages per window                                                                                                                                      | `1`                 |

@@ -18,7 +18,7 @@ from typing import Any
 
 from loguru import logger
 
-from .approval import ApprovalPolicy, ApprovalRequest, ApprovalResult
+from .approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalResult
 from .process_registry import register_process, unregister_process
 from .runtime_environment import build_cli_environment
 from .runtime_registry import RuntimeBackend, RuntimeRegistry
@@ -461,4 +461,16 @@ class CodexSession:
 
     def evaluate_approval(self, request: ApprovalRequest) -> ApprovalResult:
         """Evaluate a hook or PTY approval request without executing it."""
+        if request.process_id is not None and (
+            self.process is None or self.process.pid != request.process_id
+        ):
+            return ApprovalResult(
+                ApprovalDecision.ASK,
+                "approval process identity does not match the active session",
+            )
+        if request.generation is not None and request.generation != self.generation:
+            return ApprovalResult(
+                ApprovalDecision.ASK,
+                "approval generation does not match the active session",
+            )
         return self.approval_policy.evaluate(request)

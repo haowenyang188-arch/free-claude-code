@@ -201,6 +201,7 @@ class Settings(BaseSettings):
     cli_auto_approval_allow_permanent: bool = Field(
         default=False, validation_alias="CLI_AUTO_APPROVAL_ALLOW_PERMANENT"
     )
+    cli_mcp_config: str = Field(default="", validation_alias="CLI_MCP_CONFIG")
     cli_runtime_preflight: bool = Field(
         default=True, validation_alias="CLI_RUNTIME_PREFLIGHT"
     )

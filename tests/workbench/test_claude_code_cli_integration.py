@@ -122,6 +122,80 @@ class TestClaudeCodeCLIIntegration:
             assert artifact.task_id == "task-123"
             assert "OAuth2 recommendations" in artifact.content
 
+    async def test_inherit_mode_uses_explicit_project_mcp_config(
+        self, tmp_path, sample_task, sample_assignment, sample_context
+    ):
+        """Project MCP is explicit while Claude remains in plan permission mode."""
+        sample_context.workspace_scope = str(tmp_path)
+        (tmp_path / ".mcp.json").write_text(
+            '{"mcpServers":{"windows-mcp":{"command":"powershell.exe"}}}',
+            encoding="utf-8",
+        )
+        mock_process = AsyncMock()
+        mock_process.communicate = AsyncMock(return_value=(b"Response", b""))
+        mock_process.returncode = 0
+
+        with (
+            patch(
+                "asyncio.create_subprocess_exec", return_value=mock_process
+            ) as mock_exec,
+            patch("tempfile.NamedTemporaryFile") as mock_temp,
+        ):
+            mock_file = MagicMock()
+            mock_file.name = "/tmp/prompt-xyz.txt"
+            mock_file.__enter__ = Mock(return_value=mock_file)
+            mock_file.__exit__ = Mock(return_value=None)
+            mock_temp.return_value = mock_file
+            await ClaudeCodeAdapter(
+                isolation_mode="inherit",
+                mcp_config_path=str(tmp_path / ".mcp.json"),
+            ).execute_step(
+                task=sample_task,
+                assignment=sample_assignment,
+                context=sample_context,
+            )
+
+        args = mock_exec.call_args[0]
+        assert "--safe-mode" not in args
+        assert "--strict-mcp-config" in args
+        assert args[args.index("--mcp-config") + 1] == str(tmp_path / ".mcp.json")
+        assert args[args.index("--permission-mode") + 1] == "plan"
+
+    async def test_safe_mode_ignores_project_mcp_config(
+        self, tmp_path, sample_task, sample_assignment, sample_context
+    ):
+        sample_context.workspace_scope = str(tmp_path)
+        (tmp_path / ".mcp.json").write_text(
+            '{"mcpServers":{"untrusted":{"command":"powershell.exe"}}}',
+            encoding="utf-8",
+        )
+        mock_process = AsyncMock()
+        mock_process.communicate = AsyncMock(return_value=(b"Response", b""))
+        mock_process.returncode = 0
+
+        with (
+            patch(
+                "asyncio.create_subprocess_exec", return_value=mock_process
+            ) as mock_exec,
+            patch("tempfile.NamedTemporaryFile") as mock_temp,
+        ):
+            mock_file = MagicMock()
+            mock_file.name = "/tmp/prompt-xyz.txt"
+            mock_file.__enter__ = Mock(return_value=mock_file)
+            mock_file.__exit__ = Mock(return_value=None)
+            mock_temp.return_value = mock_file
+            await ClaudeCodeAdapter(
+                mcp_config_path=str(tmp_path / ".mcp.json")
+            ).execute_step(
+                task=sample_task,
+                assignment=sample_assignment,
+                context=sample_context,
+            )
+
+        args = mock_exec.call_args[0]
+        assert "--safe-mode" in args
+        assert "--mcp-config" not in args
+
     async def test_invoke_passes_cwd_to_subprocess(
         self, adapter, sample_task, sample_assignment, sample_context
     ):

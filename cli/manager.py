@@ -49,6 +49,7 @@ class CLISessionManager:
         preflight_runtime: bool = True,
         isolation_mode: str = "safe",
         approval_policy: ApprovalPolicy | None = None,
+        mcp_config_path: str | None = None,
     ):
         """
         Initialize the session manager.
@@ -92,6 +93,16 @@ class CLISessionManager:
             raise ValueError("isolation_mode must be 'safe' or 'inherit'")
         self.isolation_mode = isolation_mode
         self.approval_policy = approval_policy or ApprovalPolicy()
+        self.mcp_config_path = mcp_config_path
+        if (
+            self.agent_backend == "claude"
+            and self.approval_policy.enabled
+            and self.isolation_mode == "safe"
+        ):
+            raise ValueError(
+                "Claude automatic approval hooks require isolation_mode='inherit'; "
+                "safe mode disables all hooks"
+            )
 
         self._sessions: dict[str, SessionBackend] = {}
         self._pending_sessions: dict[str, SessionBackend] = {}
@@ -146,6 +157,7 @@ class CLISessionManager:
                     runtime_registry=self.runtime_registry,
                     preflight_runtime=self.preflight_runtime,
                     approval_policy=self.approval_policy,
+                    mcp_config_path=self.mcp_config_path,
                 )
             self._pending_sessions[temp_id] = new_session
             logger.info(f"Created new session: {temp_id}")

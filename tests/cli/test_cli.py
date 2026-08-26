@@ -240,6 +240,81 @@ class TestCLISession:
             assert session.current_session_id == "sess_1"
 
     @pytest.mark.asyncio
+    async def test_inherit_mode_loads_explicit_project_mcp_without_safe_mode(
+        self, tmp_path
+    ):
+        """Project MCP servers remain available without safe-mode suppression."""
+        from cli.session import CLISession
+
+        (tmp_path / ".mcp.json").write_text(
+            '{"mcpServers":{"windows-mcp":{"command":"powershell.exe"}}}',
+            encoding="utf-8",
+        )
+        mock_process = AsyncMock()
+        mock_process.stdout.read.side_effect = [b""]
+        mock_process.stderr.read.return_value = b""
+        mock_process.wait.return_value = 0
+        mock_process.returncode = 0
+
+        with patch(
+            "asyncio.create_subprocess_exec", new_callable=AsyncMock
+        ) as mock_exec:
+            mock_exec.return_value = mock_process
+            _events = [
+                event
+                async for event in CLISession(
+                    str(tmp_path),
+                    "http://localhost:8082/v1",
+                    isolation_mode="inherit",
+                    mcp_config_path=str(tmp_path / ".mcp.json"),
+                ).start_task("probe")
+            ]
+
+        args = mock_exec.call_args[0]
+        assert "--safe-mode" not in args
+        assert "--strict-mcp-config" in args
+        assert args[args.index("--mcp-config") + 1] == str(tmp_path / ".mcp.json")
+
+    @pytest.mark.asyncio
+    async def test_safe_mode_ignores_project_mcp_config(self, tmp_path):
+        from cli.session import CLISession
+
+        (tmp_path / ".mcp.json").write_text(
+            '{"mcpServers":{"untrusted":{"command":"powershell.exe"}}}',
+            encoding="utf-8",
+        )
+        process = AsyncMock()
+        process.stdout.read.side_effect = [b""]
+        process.stderr.read.return_value = b""
+        process.wait.return_value = 0
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
+            spawn.return_value = process
+            [
+                event
+                async for event in CLISession(
+                    str(tmp_path),
+                    "http://localhost:8082/v1",
+                    mcp_config_path=str(tmp_path / ".mcp.json"),
+                ).start_task("probe")
+            ]
+
+        args = spawn.call_args[0]
+        assert "--safe-mode" in args
+        assert "--mcp-config" not in args
+
+    def test_safe_mode_ignores_invalid_explicit_mcp_config(self, tmp_path):
+        from cli.session import CLISession
+
+        session = CLISession(
+            str(tmp_path),
+            "http://localhost:8082/v1",
+            mcp_config_path="relative-untrusted-mcp.json",
+        )
+
+        assert session.mcp_config_path is None
+
+    @pytest.mark.asyncio
     async def test_generation_rotates_for_each_started_process(self):
         from cli.session import CLISession
 
@@ -697,6 +772,7 @@ class TestCLISession:
             str(tmp_path),
             "http://localhost:8082/v1",
             approval_policy=policy,
+            isolation_mode="inherit",
             preflight_runtime=False,
         )
 
@@ -715,8 +791,8 @@ class TestCLISession:
         assert "--strict-mcp-config" in args
         assert "--setting-sources" in args
         settings = json.loads(args[args.index("--settings") + 1])
-        assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == (
-            "fcc-approval-hook"
+        assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"].endswith(
+            " -m cli.approval_hook"
         )
         assert call.kwargs["env"]["FCC_APPROVAL_ENABLED"] == "true"
 

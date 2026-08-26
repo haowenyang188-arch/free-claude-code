@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -210,21 +211,9 @@ DEFAULT_SAFE_COMMAND_PREFIXES = (
     "pwd",
     "ls",
     "dir",
-    "cat",
-    "head",
-    "tail",
-    "rg",
-    "grep",
-    "find",
-    "git status",
-    "git diff",
-    "git log",
-    "git show",
-    "git branch --show-current",
-    "git rev-parse",
 )
 
-DEFAULT_SAFE_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "TodoRead"})
+DEFAULT_SAFE_TOOLS = frozenset({"Glob", "LS", "TodoRead"})
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", re.ASCII)
 _CONTROL_RE = re.compile(r"[\x00\r\n]")
@@ -243,10 +232,6 @@ _DANGEROUS_RE = re.compile(
     r"docker\s+system\s+prune\b"
     r")"
 )
-_DANGEROUS_WORD_RE = re.compile(
-    r"\b(?:sudo|rm|rmdir|del|erase|format|dd|mkfs|shutdown|reboot)\b",
-    re.IGNORECASE,
-)
 _SHELL_WRAPPER_NAMES = frozenset(
     {
         "sh",
@@ -261,13 +246,6 @@ _SHELL_WRAPPER_NAMES = frozenset(
         "find",
     }
 )
-_SAFE_TOOL_FIELDS = {
-    "read": ("file_path", "path"),
-    "glob": ("pattern", "path"),
-    "grep": ("pattern",),
-    "ls": (),
-    "todoread": (),
-}
 _SCOPE_RANK = {
     ApprovalScope.ONCE: 0,
     ApprovalScope.SESSION: 1,
@@ -284,11 +262,11 @@ class ApprovalPolicy:
         enabled: bool = False,
         allowed_command_prefixes: Iterable[str] | None = None,
         allowed_workspaces: Iterable[str | os.PathLike[str]] | None = None,
-        safe_tools: frozenset[str] | set[str] | tuple[str, ...] | None = None,
+        safe_tools: Iterable[str] | None = None,
         denied_command_prefixes: Iterable[str] | None = None,
         max_auto_scope: ApprovalScope = ApprovalScope.ONCE,
         allow_permanent: bool = False,
-        backends: frozenset[str] | set[str] | tuple[str, ...] | None = None,
+        backends: Iterable[str] | None = None,
     ) -> None:
         if not isinstance(enabled, bool):
             raise ValueError("enabled must be a boolean")
@@ -297,25 +275,40 @@ class ApprovalPolicy:
         if not isinstance(max_auto_scope, ApprovalScope):
             max_auto_scope = ApprovalScope(str(max_auto_scope))
         self.enabled = enabled
+        command_prefixes = _string_iterable(
+            allowed_command_prefixes, "allowed_command_prefixes"
+        )
+        denied_prefixes = _string_iterable(
+            denied_command_prefixes, "denied_command_prefixes"
+        )
+        workspace_values = _path_iterable(allowed_workspaces, "allowed_workspaces")
+        safe_tool_values = (
+            tuple(DEFAULT_SAFE_TOOLS)
+            if safe_tools is None
+            else _string_iterable(safe_tools, "safe_tools")
+        )
+        backend_values = (
+            ("claude", "codex")
+            if backends is None
+            else _string_iterable(backends, "backends")
+        )
         self.allowed_command_prefixes = tuple(
             _normalize_prefix(value)
-            for value in (allowed_command_prefixes or ())
+            for value in command_prefixes
             if _normalize_prefix(value)
         )
         self.denied_command_prefixes = tuple(
             _normalize_prefix(value)
-            for value in (denied_command_prefixes or ())
+            for value in denied_prefixes
             if _normalize_prefix(value)
         )
         self.allowed_workspaces = tuple(
-            _resolve_path(value) for value in (allowed_workspaces or ())
+            _resolve_path(value) for value in workspace_values
         )
-        self.safe_tools = frozenset(safe_tools or DEFAULT_SAFE_TOOLS)
+        self.safe_tools = frozenset(safe_tool_values)
         self.max_auto_scope = max_auto_scope
         self.allow_permanent = allow_permanent
-        self.backends = frozenset(
-            str(value).strip().lower() for value in (backends or ("claude", "codex"))
-        )
+        self.backends = frozenset(value.strip().lower() for value in backend_values)
 
     @classmethod
     def low_risk(
@@ -358,14 +351,6 @@ class ApprovalPolicy:
             "FCC_APPROVAL_WORKSPACES",
             "CLI_AUTO_APPROVAL_WORKSPACES",
         )
-        workspace_keys = (
-            "FCC_APPROVAL_WORKSPACES_JSON",
-            "FCC_APPROVAL_WORKSPACES",
-            "CLI_AUTO_APPROVAL_WORKSPACES",
-        )
-        workspaces_configured = any(key in os.environ for key in workspace_keys)
-        if not workspaces and not workspaces_configured:
-            workspaces = [os.getcwd()]
         return cls(
             enabled=enabled,
             allowed_command_prefixes=commands or DEFAULT_SAFE_COMMAND_PREFIXES,
@@ -403,11 +388,11 @@ class ApprovalPolicy:
             "hooks": {
                 "PreToolUse": [
                     {
-                        "matcher": "^(Bash|Read|Glob|Grep|LS|TodoRead)$",
+                        "matcher": "^(Bash|Glob|LS|TodoRead)$",
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": "fcc-approval-hook",
+                                "command": _approval_hook_command(),
                                 "timeout": 5,
                             }
                         ],
@@ -420,7 +405,10 @@ class ApprovalPolicy:
         """Return inline Codex TOML overrides for supported hook events."""
         if not self.enabled:
             return ()
-        handler = '{type="command",command="fcc-approval-hook",timeout=5}'
+        handler = (
+            '{type="command",command='
+            f"{json.dumps(_approval_hook_command())},timeout=5}}"
+        )
         group = f'{{matcher="Bash",hooks=[{handler}]}}'
         return (
             f"hooks.PreToolUse=[{group}]",
@@ -454,6 +442,13 @@ class ApprovalPolicy:
         if request.command:
             if reason := _dangerous_command_reason(request.command):
                 return ApprovalResult(ApprovalDecision.DENY, reason)
+            if reason := _sensitive_path_reason(request.command):
+                return ApprovalResult(ApprovalDecision.DENY, reason)
+            if _requires_manual_wrapper_review(request.command):
+                return ApprovalResult(
+                    ApprovalDecision.ASK,
+                    "command wrapper or dynamic execution requires manual approval",
+                )
             if _simple_command_tokens(request.command) is None:
                 return ApprovalResult(
                     ApprovalDecision.ASK,
@@ -487,6 +482,11 @@ class ApprovalPolicy:
             return ApprovalResult(
                 ApprovalDecision.ASK,
                 "compound or unparseable shell syntax requires review",
+            )
+        if not _command_paths_are_contained(tokens, request.workspace):
+            return ApprovalResult(
+                ApprovalDecision.ASK,
+                "command path operands are outside the approval workspace",
             )
 
         for prefix in self.denied_command_prefixes:
@@ -729,6 +729,36 @@ def _normalize_prefix(value: object) -> str:
     return " ".join(tokens)
 
 
+def _string_iterable(value: Iterable[str] | None, field_name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes, os.PathLike)):
+        raise ValueError(f"{field_name} must be an iterable of strings")
+    try:
+        values = tuple(value)
+    except TypeError as exc:
+        raise ValueError(f"{field_name} must be an iterable of strings") from exc
+    if not all(isinstance(item, str) for item in values):
+        raise ValueError(f"{field_name} must contain only strings")
+    return values
+
+
+def _path_iterable(
+    value: Iterable[str | os.PathLike[str]] | None, field_name: str
+) -> tuple[str | os.PathLike[str], ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes, os.PathLike)):
+        raise ValueError(f"{field_name} must be an iterable of paths")
+    try:
+        values = tuple(value)
+    except TypeError as exc:
+        raise ValueError(f"{field_name} must be an iterable of paths") from exc
+    if not all(isinstance(item, (str, os.PathLike)) for item in values):
+        raise ValueError(f"{field_name} must contain only paths")
+    return values
+
+
 def _prefix_tokens(prefix: str) -> tuple[str, ...]:
     try:
         return tuple(shlex.split(prefix, posix=True))
@@ -879,9 +909,7 @@ def _git_command_is_dangerous(tokens: tuple[str, ...]) -> bool:
         return True
     if "clean" in lowered:
         return True
-    if "branch" in lowered and any(
-        token == "-d" or token == "-D".lower() for token in tokens
-    ):
+    if "branch" in lowered and any(token.lower() == "-d" for token in tokens):
         return True
     try:
         push_index = lowered.index("push")
@@ -897,31 +925,154 @@ def _git_command_is_dangerous(tokens: tuple[str, ...]) -> bool:
 
 def _safe_tool_input_is_valid(request: ApprovalRequest) -> bool:
     tool_name = request.tool_name.lower()
-    fields = _SAFE_TOOL_FIELDS.get(tool_name)
-    if fields is None:
-        return False
     if (
         request.command is not None
         or "command" in request.tool_input
         or "cmd" in request.tool_input
     ):
         return False
-    if not fields:
+    if tool_name == "todoread":
         return True
-    if not any(
-        isinstance(request.tool_input.get(field), str)
-        and bool(request.tool_input[field].strip())
-        for field in fields
-    ):
-        return False
-    path_value = request.tool_input.get("file_path") or request.tool_input.get("path")
-    return not (
-        isinstance(path_value, str)
-        and re.search(
-            r"(?:^|[/\\])(?:\.env(?:\.|$)|[^/\\]+\.(?:pem|key))",
-            path_value,
-            re.IGNORECASE,
+    if tool_name == "ls":
+        path_value = request.tool_input.get("path")
+        return path_value is None or (
+            isinstance(path_value, str)
+            and _sensitive_path_reason(path_value) is None
+            and _path_is_contained(path_value, request.workspace)
         )
+    if tool_name == "read":
+        path_value = request.tool_input.get("file_path") or request.tool_input.get(
+            "path"
+        )
+        return (
+            isinstance(path_value, str)
+            and bool(path_value.strip())
+            and _sensitive_path_reason(path_value) is None
+            and _path_is_contained(path_value, request.workspace)
+        )
+    if tool_name == "glob":
+        pattern = request.tool_input.get("pattern")
+        path_value = request.tool_input.get("path")
+        return (
+            isinstance(pattern, str)
+            and _relative_pattern_is_safe(pattern)
+            and (
+                path_value is None
+                or (
+                    isinstance(path_value, str)
+                    and _sensitive_path_reason(path_value) is None
+                    and _path_is_contained(path_value, request.workspace)
+                )
+            )
+        )
+    return False
+
+
+def _sensitive_path_reason(command: str) -> str | None:
+    normalized = command.replace("\\", "/").lower()
+    if re.search(
+        r"(?:^|[\s/:])(?:\.env(?:\.[^\s/]*)?|\.credentials\.json|"
+        r"id_(?:rsa|ed25519)|authorized_keys|known_hosts)(?:$|[\s/:])",
+        normalized,
+    ):
+        return "reading a sensitive credential path requires manual approval"
+    if re.search(r"(?:^|/)(?:\.ssh|\.aws|\.gnupg|\.config/gcloud)(?:/|$)", normalized):
+        return "reading a sensitive credential path requires manual approval"
+    if re.search(r"(?:^|[\s/])[^\s/]+\.(?:pem|key|p12|pfx)(?:$|[\s])", normalized):
+        return "reading a sensitive credential path requires manual approval"
+    return None
+
+
+def _requires_manual_wrapper_review(command: str) -> bool:
+    tokens = _shell_tokens(command)
+    if not tokens:
+        return True
+    executable_index = _skip_command_wrappers(tokens, 0)
+    if executable_index is None:
+        return True
+    executable = _executable_name(tokens[executable_index])
+    if executable in {"xargs", "sh", "bash", "zsh", "fish", "pwsh", "powershell"}:
+        return True
+    if executable in {"grep", "rg"}:
+        return True
+    if executable == "find" and any(
+        token in {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
+        for token in tokens[executable_index + 1 :]
+    ):
+        return True
+    if executable in {"git", "git.exe"}:
+        lowered = [token.lower() for token in tokens[executable_index + 1 :]]
+        if "config" in lowered or any(token.startswith("alias.") for token in lowered):
+            return True
+    return False
+
+
+def _command_paths_are_contained(
+    tokens: tuple[str, ...], workspace: str | None
+) -> bool:
+    if not tokens:
+        return False
+    root = _resolve_path(workspace) if workspace else None
+    if root is None:
+        return False
+    for token in tokens[1:]:
+        if token == "--" or token.startswith("-") or "=" in token:
+            continue
+        if _operand_looks_like_path(token, root) and not _path_is_contained(
+            token, str(root)
+        ):
+            return False
+    return True
+
+
+def _operand_looks_like_path(value: str, root: Path) -> bool:
+    normalized = value.replace("\\", "/")
+    if (
+        _contains_dynamic_path_syntax(normalized)
+        or normalized.startswith(("/", "~/", "./", "../"))
+        or normalized in {".", ".."}
+        or "/" in normalized
+    ):
+        return True
+    candidate = root / value
+    return candidate.exists() or candidate.is_symlink()
+
+
+def _path_is_contained(value: str, workspace: str | None) -> bool:
+    if not workspace or not isinstance(value, str) or "\x00" in value:
+        return False
+    if _contains_dynamic_path_syntax(value):
+        return False
+    root = _resolve_path(workspace)
+    if root is None:
+        return False
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(root)
+    except OSError, RuntimeError, ValueError:
+        return False
+    return True
+
+
+def _relative_pattern_is_safe(pattern: str) -> bool:
+    normalized = pattern.replace("\\", "/")
+    if _contains_dynamic_path_syntax(normalized) or normalized.startswith("/"):
+        return False
+    return all(part not in {"..", ""} for part in normalized.split("/"))
+
+
+def _contains_dynamic_path_syntax(value: str) -> bool:
+    normalized = value.replace("\\", "/")
+    return bool(
+        "$" in normalized
+        or re.search(r"%[^%]+%", normalized)
+        or any(marker in normalized for marker in ("*", "?", "[", "]", "{", "}"))
+        or normalized.startswith("~")
+        or re.match(r"^[a-zA-Z]:", normalized)
+        or normalized.startswith("//")
     )
 
 
@@ -949,6 +1100,10 @@ def _extract_command_prefix(prompt: str) -> str | None:
 
 def _parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _approval_hook_command() -> str:
+    return f"{shlex.quote(sys.executable)} -m cli.approval_hook"
 
 
 def _first_env(*keys: str, default: str) -> str:

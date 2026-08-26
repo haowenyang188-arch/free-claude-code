@@ -9,9 +9,14 @@ from typing import Any
 
 from loguru import logger
 
-from .approval import ApprovalPolicy, ApprovalRequest, ApprovalResult
+from .approval import (
+    ApprovalDecision,
+    ApprovalPolicy,
+    ApprovalRequest,
+    ApprovalResult,
+)
 from .process_registry import register_process, unregister_process
-from .runtime_environment import build_cli_environment
+from .runtime_environment import build_cli_environment, resolve_explicit_mcp_config
 from .runtime_registry import RuntimeBackend, RuntimeRegistry
 
 
@@ -31,6 +36,7 @@ class CLISession:
         runtime_registry: RuntimeRegistry | None = None,
         preflight_runtime: bool = False,
         approval_policy: ApprovalPolicy | None = None,
+        mcp_config_path: str | None = None,
     ):
         self.workspace = os.path.normpath(os.path.abspath(workspace_path))
         self.api_url = api_url
@@ -58,6 +64,16 @@ class CLISession:
         )
         self.preflight_runtime = preflight_runtime
         self.approval_policy = approval_policy or ApprovalPolicy()
+        self.mcp_config_path = (
+            resolve_explicit_mcp_config(mcp_config_path)
+            if isolation_mode == "inherit"
+            else None
+        )
+        if self.approval_policy.enabled and isolation_mode == "safe":
+            raise ValueError(
+                "Claude automatic approval hooks require isolation_mode='inherit'; "
+                "safe mode disables all hooks"
+            )
         self.process: asyncio.subprocess.Process | None = None
         self.current_session_id: str | None = None
         self.generation: str | None = None
@@ -161,12 +177,16 @@ class CLISession:
                 ]
                 logger.info("Starting new Claude session")
 
-            if self.isolation_mode == "safe" and not self.approval_policy.enabled:
+            if self.isolation_mode == "safe":
                 cmd.extend(["--safe-mode", "--strict-mcp-config"])
-            elif self.isolation_mode == "safe":
-                # --safe-mode disables hooks. Keep external setting layers
-                # disabled while allowing this explicit inline hook.
-                cmd.extend(["--setting-sources", "", "--strict-mcp-config"])
+            elif self.isolation_mode == "inherit":
+                mcp_config = self.mcp_config_path
+                if mcp_config:
+                    cmd.extend(["--strict-mcp-config", "--mcp-config", mcp_config])
+                if self.approval_policy.enabled:
+                    if not mcp_config:
+                        cmd.append("--strict-mcp-config")
+                    cmd.extend(["--setting-sources", ""])
 
             if self.permission_mode == "bypassPermissions":
                 cmd.append("--dangerously-skip-permissions")
@@ -346,4 +366,16 @@ class CLISession:
 
     def evaluate_approval(self, request: ApprovalRequest) -> ApprovalResult:
         """Evaluate a hook or PTY approval request without executing it."""
+        if request.process_id is not None and (
+            self.process is None or self.process.pid != request.process_id
+        ):
+            return ApprovalResult(
+                ApprovalDecision.ASK,
+                "approval process identity does not match the active session",
+            )
+        if request.generation is not None and request.generation != self.generation:
+            return ApprovalResult(
+                ApprovalDecision.ASK,
+                "approval generation does not match the active session",
+            )
         return self.approval_policy.evaluate(request)

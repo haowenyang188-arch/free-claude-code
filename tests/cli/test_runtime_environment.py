@@ -196,3 +196,17 @@ def test_approval_policy_environment_is_allowlisted_without_credentials():
 
     assert environment["FCC_APPROVAL_ENABLED"] == "true"
     assert "OPENAI_API_KEY" not in environment
+
+
+def test_explicit_mcp_config_requires_an_existing_absolute_file(tmp_path):
+    from cli.runtime_environment import resolve_explicit_mcp_config
+
+    config = tmp_path / "windows-mcp.json"
+    config.write_text('{"mcpServers":{"windows-mcp":{}}}', encoding="utf-8")
+
+    assert resolve_explicit_mcp_config(str(config)) == str(config)
+    assert resolve_explicit_mcp_config(None) is None
+    with pytest.raises(ValueError, match="absolute path"):
+        resolve_explicit_mcp_config("windows-mcp.json")
+    with pytest.raises(ValueError, match="existing file"):
+        resolve_explicit_mcp_config(str(tmp_path / "missing.json"))

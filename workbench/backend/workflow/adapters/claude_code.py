@@ -10,7 +10,10 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 from cli.process_registry import register_process, unregister_process
-from cli.runtime_environment import build_cli_environment
+from cli.runtime_environment import (
+    build_cli_environment,
+    resolve_explicit_mcp_config,
+)
 from cli.runtime_registry import RuntimeBackend, RuntimeRegistry
 from workbench.backend.domain.models import Artifact, ArtifactType, RuntimeKind
 from workbench.backend.workflow.runners import RunnerError, RuntimeAdapter
@@ -34,6 +37,7 @@ class ClaudeCodeAdapter(RuntimeAdapter):
         isolation_mode: str = "safe",
         runtime_registry: RuntimeRegistry | None = None,
         preflight_runtime: bool = False,
+        mcp_config_path: str | None = None,
     ) -> None:
         """Initialize adapter with optional artifact store for loading upstream artifacts."""
         if isolation_mode not in {"safe", "inherit"}:
@@ -45,6 +49,11 @@ class ClaudeCodeAdapter(RuntimeAdapter):
             executables={RuntimeBackend.CLAUDE: claude_bin}
         )
         self._preflight_runtime = preflight_runtime
+        self._mcp_config_path = (
+            resolve_explicit_mcp_config(mcp_config_path)
+            if isolation_mode == "inherit"
+            else None
+        )
 
     def supports(self, runtime_kind: RuntimeKind) -> bool:
         """Return True for CLAUDE_CODE runtime."""
@@ -190,14 +199,12 @@ class ClaudeCodeAdapter(RuntimeAdapter):
         try:
             cmd = [self._claude_bin, "--print"]
             if self._isolation_mode == "safe":
-                cmd.extend(
-                    [
-                        "--safe-mode",
-                        "--strict-mcp-config",
-                        "--permission-mode",
-                        "plan",
-                    ]
-                )
+                cmd.extend(["--safe-mode", "--strict-mcp-config"])
+            elif self._isolation_mode == "inherit":
+                mcp_config = self._mcp_config_path
+                if mcp_config:
+                    cmd.extend(["--strict-mcp-config", "--mcp-config", mcp_config])
+            cmd.extend(["--permission-mode", "plan"])
             cmd.append(prompt_file)
             generation = uuid.uuid4().hex
 

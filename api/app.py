@@ -228,6 +228,7 @@ async def lifespan(app: FastAPI):
                 preflight_runtime=getattr(settings, "cli_runtime_preflight", True),
                 isolation_mode=getattr(settings, "cli_isolation_mode", "safe"),
                 approval_policy=approval_policy,
+                mcp_config_path=getattr(settings, "cli_mcp_config", ""),
             )
 
             # Initialize session store

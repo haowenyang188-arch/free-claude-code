@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from .runtime_registry import RuntimeBackend
@@ -129,6 +130,22 @@ def describe_cli_environment(
     }
 
 
+def resolve_explicit_mcp_config(config_path: str | None) -> str | None:
+    """Validate a user-configured MCP config without scanning the workspace."""
+    if config_path is None or not config_path.strip():
+        return None
+    candidate = Path(config_path).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("CLI_MCP_CONFIG must be an absolute path")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("CLI_MCP_CONFIG must reference an existing file") from exc
+    if not resolved.is_file():
+        raise ValueError("CLI_MCP_CONFIG must reference a file")
+    return str(resolved)
+
+
 def _coerce_backend(value: str | RuntimeBackend) -> RuntimeBackend:
     try:
         return RuntimeBackend(value)
@@ -166,4 +183,8 @@ def _looks_sensitive(key: str) -> bool:
     return any(part in upper for part in _SENSITIVE_PARTS)
 
 
-__all__ = ["build_cli_environment", "describe_cli_environment"]
+__all__ = [
+    "build_cli_environment",
+    "describe_cli_environment",
+    "resolve_explicit_mcp_config",
+]
