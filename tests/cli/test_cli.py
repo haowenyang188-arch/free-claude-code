@@ -224,6 +224,8 @@ class TestCLISession:
             assert args[0] == "claude"
             assert "-p" in args
             assert "Hello" in args
+            assert "--safe-mode" in args
+            assert "--strict-mcp-config" in args
 
             # Verify events
             assert (
@@ -236,6 +238,36 @@ class TestCLISession:
             assert events[3] == {"type": "exit", "code": 0, "stderr": None}
 
             assert session.current_session_id == "sess_1"
+
+    @pytest.mark.asyncio
+    async def test_preflight_failure_does_not_spawn_claude(self, monkeypatch):
+        from cli.runtime_registry import RuntimeBackend, RuntimeRegistry
+        from cli.session import CLISession
+
+        async def runner(_argv, _timeout):
+            return 1, b"", b"hidden diagnostic"
+
+        monkeypatch.setattr("cli.runtime_registry.shutil.which", lambda _: "/bin/claude")
+        session = CLISession(
+            "/tmp",
+            "http://localhost:8082/v1",
+            runtime_registry=RuntimeRegistry(
+                executables={RuntimeBackend.CLAUDE: "claude"},
+                runner=runner,
+            ),
+            preflight_runtime=True,
+        )
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
+            events = [event async for event in session.start_task("Hello")]
+
+        assert events == [
+            {
+                "type": "error",
+                "error": {"message": "Claude CLI preflight failed: version_command_failed"},
+            },
+            {"type": "exit", "code": 127, "stderr": "version_command_failed"},
+        ]
+        spawn.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_start_task_uses_plan_mode_without_bypass_by_default(self):
@@ -285,6 +317,34 @@ class TestCLISession:
         assert "ANTHROPIC_BASE_URL" not in env
         assert "ANTHROPIC_API_URL" not in env
         assert env.get("ANTHROPIC_API_KEY") != "sk-placeholder-key-for-proxy"
+
+    @pytest.mark.asyncio
+    async def test_start_task_proxy_does_not_project_parent_claude_credentials(
+        self, monkeypatch
+    ):
+        from cli.session import CLISession
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "claude-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+        monkeypatch.setenv("HTTP_PROXY", "http://stale-proxy")
+        session = CLISession("/tmp", "http://localhost:8082/v1")
+        process = AsyncMock()
+        process.stdout.read.side_effect = [b""]
+        process.stderr.read.return_value = b""
+        process.wait.return_value = 0
+
+        with patch(
+            "asyncio.create_subprocess_exec", new_callable=AsyncMock
+        ) as mock_exec:
+            mock_exec.return_value = process
+            [event async for event in session.start_task("read the project")]
+
+        env = mock_exec.call_args.kwargs["env"]
+        assert env["ANTHROPIC_API_KEY"] == "sk-placeholder-key-for-proxy"
+        assert env["ANTHROPIC_BASE_URL"] == "http://localhost:8082"
+        assert "OPENAI_API_KEY" not in env
+        assert "HTTP_PROXY" not in env
+        assert "claude-key" not in env.values()
 
     @pytest.mark.asyncio
     async def test_start_task_with_session_resume(self):

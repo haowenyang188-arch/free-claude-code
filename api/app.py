@@ -180,12 +180,15 @@ async def lifespan(app: FastAPI):
                     settings, "agent_permission_mode", "plan"
                 ),
                 claude_auth_mode=getattr(settings, "claude_auth_mode", "proxy"),
+                claude_bin=getattr(settings, "claude_bin", "claude"),
                 codex_bin=getattr(settings, "codex_bin", "codex"),
                 codex_model=getattr(settings, "codex_model", None),
                 codex_sandbox=getattr(settings, "codex_sandbox", "read-only"),
                 codex_approval_required=getattr(
                     settings, "codex_approval_required", True
                 ),
+                preflight_runtime=getattr(settings, "cli_runtime_preflight", True),
+                isolation_mode=getattr(settings, "cli_isolation_mode", "safe"),
             )
 
             # Initialize session store

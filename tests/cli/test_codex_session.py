@@ -20,6 +20,9 @@ class TestCodexSession:
         assert "--sandbox" in command
         assert command[command.index("--sandbox") + 1] == "read-only"
         assert command[-1] == "inspect the project"
+        assert "--ignore-user-config" in command
+        assert "--ignore-rules" in command
+        assert "--strict-config" in command
         assert session.shell is False
 
     def test_build_command_can_resume_or_fork_a_session(self) -> None:
@@ -39,6 +42,17 @@ class TestCodexSession:
         assert forked[3] == "thread-1"
         assert "--sandbox" not in resumed
         assert "--sandbox" not in forked
+
+    def test_inherit_isolation_omits_safe_profile_flags(self) -> None:
+        from cli.codex_session import CodexSession
+
+        command = CodexSession(
+            "/tmp/project", isolation_mode="inherit"
+        ).build_command("inspect")
+
+        assert "--ignore-user-config" not in command
+        assert "--ignore-rules" not in command
+        assert "--strict-config" not in command
 
     @pytest.mark.asyncio
     async def test_streams_thread_message_and_completion_events(self) -> None:
@@ -69,6 +83,63 @@ class TestCodexSession:
         assert spawn.await_args.kwargs.get("shell", False) is False
 
     @pytest.mark.asyncio
+    async def test_preflight_failure_does_not_spawn_codex(self, monkeypatch) -> None:
+        from cli.codex_session import CodexSession
+        from cli.runtime_registry import RuntimeBackend, RuntimeRegistry
+
+        async def runner(_argv, _timeout):
+            return 1, b"", b"hidden diagnostic"
+
+        monkeypatch.setattr("cli.runtime_registry.shutil.which", lambda _: "/bin/codex")
+        session = CodexSession(
+            "/tmp/project",
+            runtime_registry=RuntimeRegistry(
+                executables={RuntimeBackend.CODEX: "codex"},
+                runner=runner,
+            ),
+            preflight_runtime=True,
+        )
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
+            events = [event async for event in session.start_task("inspect")]
+
+        assert events == [
+            {
+                "type": "error",
+                "error": {"message": "Codex CLI preflight failed: version_command_failed"},
+            },
+            {"type": "exit", "code": 127, "stderr": "version_command_failed"},
+        ]
+        spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_codex_child_environment_drops_inherited_provider_and_proxy_keys(
+        self, monkeypatch
+    ) -> None:
+        from cli.codex_session import CodexSession
+
+        monkeypatch.setenv("OPENAI_API_KEY", "parent-secret")
+        monkeypatch.setenv("HTTP_PROXY", "http://stale-proxy")
+        process = MagicMock()
+        process.pid = 123
+        process.stdout.readline = AsyncMock(side_effect=[b""])
+        process.stderr.read = AsyncMock(return_value=b"")
+        process.wait = AsyncMock(return_value=0)
+
+        session = CodexSession("/tmp/project")
+        with (
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn,
+            patch("cli.codex_session.register_process"),
+            patch("cli.codex_session.unregister_process"),
+        ):
+            spawn.return_value = process
+            [event async for event in session.start_task("inspect")]
+
+        child_env = spawn.await_args.kwargs["env"]
+        assert "OPENAI_API_KEY" not in child_env
+        assert "HTTP_PROXY" not in child_env
+        assert child_env["TERM"] == "dumb"
+
+    @pytest.mark.asyncio
     async def test_successful_exit_with_stderr_does_not_emit_error(self) -> None:
         from cli.codex_session import CodexSession
 
@@ -81,8 +152,8 @@ class TestCodexSession:
         session = CodexSession("/tmp/project")
         with (
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn,
-            patch("cli.codex_session.register_pid"),
-            patch("cli.codex_session.unregister_pid"),
+            patch("cli.codex_session.register_process"),
+            patch("cli.codex_session.unregister_process"),
             patch("cli.codex_session.logger.debug") as debug_log,
         ):
             spawn.return_value = process
@@ -110,8 +181,8 @@ class TestCodexSession:
         session = CodexSession("/tmp/project")
         with (
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn,
-            patch("cli.codex_session.register_pid"),
-            patch("cli.codex_session.unregister_pid"),
+            patch("cli.codex_session.register_process"),
+            patch("cli.codex_session.unregister_process"),
         ):
             spawn.return_value = process
             events = [event async for event in session.start_task("inspect")]

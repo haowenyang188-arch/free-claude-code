@@ -178,11 +178,18 @@ class Settings(BaseSettings):
         default="plan", validation_alias="AGENT_PERMISSION_MODE"
     )
     claude_auth_mode: str = Field(default="proxy", validation_alias="CLAUDE_AUTH_MODE")
+    claude_bin: str = Field(default="claude", validation_alias="CLAUDE_BIN")
     codex_bin: str = Field(default="codex", validation_alias="CODEX_BIN")
     codex_model: str | None = Field(default=None, validation_alias="CODEX_MODEL")
     codex_sandbox: str = Field(default="read-only", validation_alias="CODEX_SANDBOX")
     codex_approval_required: bool = Field(
         default=True, validation_alias="CODEX_APPROVAL_REQUIRED"
+    )
+    cli_runtime_preflight: bool = Field(
+        default=True, validation_alias="CLI_RUNTIME_PREFLIGHT"
+    )
+    cli_isolation_mode: str = Field(
+        default="safe", validation_alias="CLI_ISOLATION_MODE"
     )
     claude_workspace: str = "./agent_workspace"
     allowed_dir: str = ""
@@ -252,6 +259,13 @@ class Settings(BaseSettings):
     def validate_claude_auth_mode(cls, v: str) -> str:
         if v not in ("proxy", "local"):
             raise ValueError("CLAUDE_AUTH_MODE must be 'proxy' or 'local'")
+        return v
+
+    @field_validator("cli_isolation_mode")
+    @classmethod
+    def validate_cli_isolation_mode(cls, v: str) -> str:
+        if v not in ("safe", "inherit"):
+            raise ValueError("CLI_ISOLATION_MODE must be 'safe' or 'inherit'")
         return v
 
     @field_validator("codex_sandbox")

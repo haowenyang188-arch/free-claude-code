@@ -12,12 +12,15 @@ import contextlib
 import json
 import os
 import signal
+import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
 
 from loguru import logger
 
-from .process_registry import register_pid, unregister_pid
+from .process_registry import register_process, unregister_process
+from .runtime_environment import build_cli_environment
+from .runtime_registry import RuntimeBackend, RuntimeRegistry
 from .staging import StagedWorkspace
 
 
@@ -34,12 +37,22 @@ class CodexSession:
         sandbox_mode: str = "read-only",
         model: str | None = None,
         approval_mode: bool = False,
+        isolation_mode: str = "safe",
+        runtime_registry: RuntimeRegistry | None = None,
+        preflight_runtime: bool = False,
     ) -> None:
         self.workspace = os.path.normpath(os.path.abspath(workspace_path))
         self.codex_bin = codex_bin
         self.sandbox_mode = sandbox_mode
         self.model = model
         self.approval_mode = approval_mode
+        if isolation_mode not in {"safe", "inherit"}:
+            raise ValueError("isolation_mode must be 'safe' or 'inherit'")
+        self.isolation_mode = isolation_mode
+        self.runtime_registry = runtime_registry or RuntimeRegistry(
+            executables={RuntimeBackend.CODEX: codex_bin}
+        )
+        self.preflight_runtime = preflight_runtime
         if approval_mode and sandbox_mode == "danger-full-access":
             raise ValueError(
                 "Codex staged approval cannot be combined with danger-full-access"
@@ -47,6 +60,7 @@ class CodexSession:
         self._staged_workspace: StagedWorkspace | None = None
         self.process: asyncio.subprocess.Process | None = None
         self.current_session_id: str | None = None
+        self.generation = uuid.uuid4().hex
         self.last_run_id: str | None = None
         self._is_busy = False
         self._cancel_requested = False
@@ -72,6 +86,8 @@ class CodexSession:
             command.extend(["fork" if fork_session else "resume", session_id])
 
         command.append("--json")
+        if self.isolation_mode == "safe":
+            command.extend(["--ignore-user-config", "--ignore-rules", "--strict-config"])
         if self.model:
             command.extend(["--model", self.model])
         command.append("--skip-git-repo-check")
@@ -93,6 +109,17 @@ class CodexSession:
         """Run one Codex turn and yield normalized events."""
         awaiting_approval = False
         async with self._cli_lock:
+            if self.preflight_runtime:
+                probe = await self.runtime_registry.probe(RuntimeBackend.CODEX)
+                if not probe.available:
+                    reason = probe.reason or "runtime_unavailable"
+                    yield {
+                        "type": "error",
+                        "error": {"message": f"Codex CLI preflight failed: {reason}"},
+                    }
+                    yield {"type": "exit", "code": 127, "stderr": reason}
+                    return
+
             command = self.build_command(
                 prompt, session_id=session_id, fork_session=fork_session
             )
@@ -114,9 +141,7 @@ class CodexSession:
             )
             self._is_busy = True
             self._cancel_requested = False
-            env = os.environ.copy()
-            env.setdefault("TERM", "dumb")
-            env.setdefault("PYTHONIOENCODING", "utf-8")
+            env = build_cli_environment(RuntimeBackend.CODEX)
 
             try:
                 self.process = await asyncio.create_subprocess_exec(
@@ -128,7 +153,7 @@ class CodexSession:
                     env=env,
                 )
                 if self.process.pid:
-                    register_pid(self.process.pid)
+                    register_process(self.process.pid, generation=self.generation)
 
                 if not self.process.stdout:
                     self.reject()
@@ -220,7 +245,9 @@ class CodexSession:
                 yield {"type": "exit", "code": 1, "stderr": str(exc)}
             finally:
                 if self.process and self.process.pid:
-                    unregister_pid(self.process.pid)
+                    unregister_process(
+                        self.process.pid, generation=self.generation
+                    )
                 # Clean up staged workspace only if not awaiting approval
                 # If awaiting approval, workspace must survive until approve()/reject()
                 if self._staged_workspace is not None and not awaiting_approval:

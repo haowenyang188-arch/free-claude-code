@@ -3,12 +3,15 @@
 import asyncio
 import json
 import os
+import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
 
 from loguru import logger
 
-from .process_registry import register_pid, unregister_pid
+from .process_registry import register_process, unregister_process
+from .runtime_environment import build_cli_environment
+from .runtime_registry import RuntimeBackend, RuntimeRegistry
 
 
 class CLISession:
@@ -22,6 +25,10 @@ class CLISession:
         plans_directory: str | None = None,
         permission_mode: str = "plan",
         use_proxy: bool = True,
+        claude_bin: str = "claude",
+        isolation_mode: str = "safe",
+        runtime_registry: RuntimeRegistry | None = None,
+        preflight_runtime: bool = False,
     ):
         self.workspace = os.path.normpath(os.path.abspath(workspace_path))
         self.api_url = api_url
@@ -40,8 +47,17 @@ class CLISession:
             )
         self.permission_mode = permission_mode
         self.use_proxy = use_proxy
+        if isolation_mode not in {"safe", "inherit"}:
+            raise ValueError("isolation_mode must be 'safe' or 'inherit'")
+        self.claude_bin = claude_bin
+        self.isolation_mode = isolation_mode
+        self.runtime_registry = runtime_registry or RuntimeRegistry(
+            executables={RuntimeBackend.CLAUDE: claude_bin}
+        )
+        self.preflight_runtime = preflight_runtime
         self.process: asyncio.subprocess.Process | None = None
         self.current_session_id: str | None = None
+        self.generation = uuid.uuid4().hex
         self._is_busy = False
         self._cli_lock = asyncio.Lock()
 
@@ -64,31 +80,43 @@ class CLISession:
             Event dictionaries from the CLI
         """
         async with self._cli_lock:
+            if self.preflight_runtime:
+                probe = await self.runtime_registry.probe(RuntimeBackend.CLAUDE)
+                if not probe.available:
+                    reason = probe.reason or "runtime_unavailable"
+                    yield {
+                        "type": "error",
+                        "error": {"message": f"Claude CLI preflight failed: {reason}"},
+                    }
+                    yield {"type": "exit", "code": 127, "stderr": reason}
+                    return
+
             self._is_busy = True
-            env = os.environ.copy()
-
+            extra_env: dict[str, str] = {}
             if self.use_proxy:
-                if "ANTHROPIC_API_KEY" not in env:
-                    env["ANTHROPIC_API_KEY"] = "sk-placeholder-key-for-proxy"
-
-                env["ANTHROPIC_API_URL"] = self.api_url
                 if self.api_url.endswith("/v1"):
-                    env["ANTHROPIC_BASE_URL"] = self.api_url[:-3]
+                    base_url = self.api_url[:-3]
                 else:
-                    env["ANTHROPIC_BASE_URL"] = self.api_url
-            else:
-                # Do not let a stale proxy URL in the parent shell override
-                # Claude's local OAuth/keychain authentication.
-                env.pop("ANTHROPIC_API_URL", None)
-                env.pop("ANTHROPIC_BASE_URL", None)
-
-            env["TERM"] = "dumb"
-            env["PYTHONIOENCODING"] = "utf-8"
+                    base_url = self.api_url
+                extra_env.update(
+                    {
+                        "ANTHROPIC_API_URL": self.api_url,
+                        "ANTHROPIC_BASE_URL": base_url,
+                    }
+                )
+            env = build_cli_environment(
+                RuntimeBackend.CLAUDE,
+                extra_env=extra_env,
+            )
+            if self.use_proxy:
+                # The proxy route needs an API-key-shaped value, but the
+                # gateway must not inherit unrelated account credentials.
+                env["ANTHROPIC_API_KEY"] = "sk-placeholder-key-for-proxy"
 
             # Build command
             if session_id and not session_id.startswith("pending_"):
                 cmd = [
-                    "claude",
+                    self.claude_bin,
                     "--resume",
                     session_id,
                 ]
@@ -104,7 +132,7 @@ class CLISession:
                 logger.info(f"Resuming Claude session {session_id}")
             else:
                 cmd = [
-                    "claude",
+                    self.claude_bin,
                     "-p",
                     prompt,
                     "--output-format",
@@ -112,6 +140,9 @@ class CLISession:
                     "--verbose",
                 ]
                 logger.info("Starting new Claude session")
+
+            if self.isolation_mode == "safe":
+                cmd.extend(["--safe-mode", "--strict-mcp-config"])
 
             if self.permission_mode == "bypassPermissions":
                 cmd.append("--dangerously-skip-permissions")
@@ -135,7 +166,7 @@ class CLISession:
                     env=env,
                 )
                 if self.process and self.process.pid:
-                    register_pid(self.process.pid)
+                    register_process(self.process.pid, generation=self.generation)
 
                 if not self.process or not self.process.stdout:
                     yield {"type": "exit", "code": 1}
@@ -229,7 +260,9 @@ class CLISession:
             finally:
                 self._is_busy = False
                 if self.process and self.process.pid:
-                    unregister_pid(self.process.pid)
+                    unregister_process(
+                        self.process.pid, generation=self.generation
+                    )
 
     async def _handle_line_gen(
         self, line_str: str, session_id_extracted: bool
@@ -286,7 +319,9 @@ class CLISession:
                     self.process.kill()
                     await self.process.wait()
                 if self.process and self.process.pid:
-                    unregister_pid(self.process.pid)
+                    unregister_process(
+                        self.process.pid, generation=self.generation
+                    )
                 return True
             except Exception as e:
                 logger.error(f"Error stopping process: {e}")

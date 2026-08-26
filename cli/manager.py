@@ -12,6 +12,7 @@ import uuid
 from loguru import logger
 
 from .codex_session import CodexSession
+from .runtime_registry import RuntimeRegistry
 from .session import CLISession
 
 SessionBackend = CLISession | CodexSession
@@ -34,10 +35,14 @@ class CLISessionManager:
         agent_backend: str = "claude",
         agent_permission_mode: str = "plan",
         claude_auth_mode: str = "proxy",
+        claude_bin: str = "claude",
         codex_bin: str = "codex",
         codex_model: str | None = None,
         codex_sandbox: str = "read-only",
         codex_approval_required: bool = True,
+        runtime_registry: RuntimeRegistry | None = None,
+        preflight_runtime: bool = True,
+        isolation_mode: str = "safe",
     ):
         """
         Initialize the session manager.
@@ -59,6 +64,7 @@ class CLISessionManager:
         if claude_auth_mode not in ("proxy", "local"):
             raise ValueError("claude_auth_mode must be 'proxy' or 'local'")
         self.claude_auth_mode = claude_auth_mode
+        self.claude_bin = claude_bin
         self.codex_bin = codex_bin
         self.codex_model = codex_model
         self.codex_sandbox = codex_sandbox
@@ -71,6 +77,14 @@ class CLISessionManager:
             raise ValueError(
                 "codex_approval_required cannot be used with danger-full-access"
             )
+
+        self.runtime_registry = runtime_registry or RuntimeRegistry(
+            executables={"claude": claude_bin, "codex": codex_bin}
+        )
+        self.preflight_runtime = preflight_runtime
+        if isolation_mode not in {"safe", "inherit"}:
+            raise ValueError("isolation_mode must be 'safe' or 'inherit'")
+        self.isolation_mode = isolation_mode
 
         self._sessions: dict[str, SessionBackend] = {}
         self._pending_sessions: dict[str, SessionBackend] = {}
@@ -107,6 +121,9 @@ class CLISessionManager:
                     sandbox_mode=self.codex_sandbox,
                     model=self.codex_model,
                     approval_mode=self.codex_approval_required,
+                    isolation_mode=self.isolation_mode,
+                    runtime_registry=self.runtime_registry,
+                    preflight_runtime=self.preflight_runtime,
                 )
             else:
                 new_session = CLISession(
@@ -116,6 +133,10 @@ class CLISessionManager:
                     plans_directory=self.plans_directory,
                     permission_mode=self.agent_permission_mode,
                     use_proxy=self.claude_auth_mode == "proxy",
+                    claude_bin=self.claude_bin,
+                    isolation_mode=self.isolation_mode,
+                    runtime_registry=self.runtime_registry,
+                    preflight_runtime=self.preflight_runtime,
                 )
             self._pending_sessions[temp_id] = new_session
             logger.info(f"Created new session: {temp_id}")
@@ -177,6 +198,14 @@ class CLISessionManager:
             self._temp_to_real.clear()
             self._real_to_temp.clear()
             logger.info("All sessions stopped")
+
+    async def runtime_status(self, *, force: bool = False) -> dict:
+        """Return a user-safe readiness report for the selected CLI backend."""
+        probe = await self.runtime_registry.probe(self.agent_backend, force=force)
+        return {
+            "backend": self.agent_backend,
+            "runtime": probe.to_mapping(),
+        }
 
     def get_stats(self) -> dict:
         """Get session statistics."""

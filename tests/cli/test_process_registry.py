@@ -1,6 +1,8 @@
 import os
 from unittest.mock import patch
 
+import pytest
+
 
 def test_process_registry_register_pid_zero_noop():
     """register_pid(0) is a no-op (early return)."""
@@ -76,3 +78,46 @@ def test_process_registry_kill_all_best_effort_windows_noop_when_taskkill_missin
 
     monkeypatch.setattr(subprocess, "run", _boom)
     pr.kill_all_best_effort()
+
+
+def test_generation_lease_unregister_requires_exact_generation(monkeypatch):
+    from cli import process_registry as pr
+
+    monkeypatch.setattr(pr, "_leases", {})
+    monkeypatch.setattr(pr, "_process_fingerprint", lambda _pid: "start-1")
+
+    lease = pr.register_process(4321, generation="gen-1")
+
+    assert lease is not None
+    assert pr.unregister_process(lease.pid, generation="other") is False
+    assert 4321 in pr._leases
+    assert pr.unregister_process(lease.pid, generation="gen-1") is True
+    assert 4321 not in pr._leases
+
+
+def test_register_process_rejects_conflicting_owner(monkeypatch):
+    from cli import process_registry as pr
+
+    monkeypatch.setattr(pr, "_leases", {})
+    monkeypatch.setattr(pr, "_process_fingerprint", lambda _pid: "start-1")
+    pr.register_process(4321, generation="gen-1")
+
+    with pytest.raises(pr.ProcessOwnershipError, match="already registered"):
+        pr.register_process(4321, generation="gen-2")
+
+
+def test_kill_all_skips_pid_when_process_fingerprint_changed(monkeypatch):
+    from cli import process_registry as pr
+
+    monkeypatch.setattr(pr, "_pids", set())
+    monkeypatch.setattr(pr, "_leases", {})
+    monkeypatch.setattr(pr, "_process_fingerprint", lambda _pid: "start-1")
+    pr.register_process(4321, generation="gen-1")
+    monkeypatch.setattr(pr, "_process_fingerprint", lambda _pid: "start-2")
+    killed: list[int] = []
+    monkeypatch.setattr(os, "name", "posix", raising=False)
+    monkeypatch.setattr(os, "kill", lambda pid, _sig: killed.append(pid))
+
+    pr.kill_all_best_effort()
+
+    assert killed == []

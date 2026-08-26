@@ -342,6 +342,22 @@ async def harness_status(request: Request, _auth=Depends(require_api_key)):
     }
 
 
+@router.get("/v1/cli/status")
+async def cli_status(request: Request, _auth=Depends(require_api_key)):
+    """Return safe readiness diagnostics for the selected local CLI backend."""
+    manager = getattr(request.app.state, "cli_manager", None)
+    if manager is None:
+        return {
+            "configured": False,
+            "backend": None,
+            "runtime": None,
+            "error": "CLI session manager is not initialized",
+        }
+
+    status = await manager.runtime_status()
+    return {"configured": True, **status, "error": None}
+
+
 @router.api_route("/health", methods=["HEAD", "OPTIONS"])
 async def probe_health():
     """Respond to compatibility probes for the health endpoint."""
