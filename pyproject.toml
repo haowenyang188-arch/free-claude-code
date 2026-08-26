@@ -29,6 +29,7 @@ dependencies = [
 free-claude-code = "cli.entrypoints:serve"
 fcc-init = "cli.entrypoints:init"
 fcc-codex-1m = "cli.codex_1m:cli"
+fcc-approval-hook = "cli.approval_hook:main"
 
 [project.optional-dependencies]
 voice_local = [
