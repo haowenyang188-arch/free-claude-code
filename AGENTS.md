@@ -122,21 +122,21 @@ This project is indexed by GitNexus as **free-claude-code** (46050 symbols, 7816
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
-## Always Do
+## Use When Needed
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
+- For cross-file dependency, execution-chain, or blast-radius work, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- When GitNexus was used for a change, run `detect_changes()` before committing to verify the expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- For unfamiliar architecture or cross-file execution flows, use `query({search_query: "concept"})`; for a known file, symbol, or directory, use native `rg` and a local read first.
 - When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
 - For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
 
 ## Never Do
 
-- NEVER edit a function, class, or method without first running `impact` on it.
+- For ordinary known-location edits, do not start GitNexus. For cross-file or impact-analysis edits, run `impact` before changing the symbol.
 - NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
 - NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
-- NEVER commit changes without running `detect_changes()` to check affected scope.
+- Do not require `detect_changes()` for changes that did not use GitNexus; run it when GitNexus was used.
 
 ## Resources
 
@@ -159,3 +159,5 @@ This project is indexed by GitNexus as **free-claude-code** (46050 symbols, 7816
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+@CODE_INTELLIGENCE_WORKFLOW.md
