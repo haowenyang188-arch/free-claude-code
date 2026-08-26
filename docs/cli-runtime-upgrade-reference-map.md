@@ -21,7 +21,8 @@
 DeepSeek Harness Node runtime 或 WorkBuddy 常驻服务：
 
 - `cli/runtime_registry.py`：对 Claude/Codex 执行有界、缓存、失败隔离的
-  `--version` 探测，向 `/v1/cli/status` 提供不含路径和凭据的 readiness 状态。
+  `--version` 与 safe-profile help 探测，向 `/v1/cli/status` 提供不含路径和凭据的
+  readiness 状态；profile 选项按完整 token 匹配。
 - `cli/runtime_environment.py`：子进程默认只投影 HOME、PATH、locale、临时目录
   和终端编码；provider、MCP、proxy、其他后端凭据不会从父进程继承。Claude proxy
   路由仅注入占位 API key 与本地路由地址。
@@ -33,8 +34,9 @@ DeepSeek Harness Node runtime 或 WorkBuddy 常驻服务：
   Linux start-time fingerprint)`；PID 启动指纹变化时 atexit cleanup 不会误杀复用者。
 - `cli/checkpoint.py` 和 `CLISessionManager.build_checkpoint()/write_checkpoint()`：
   仅 safe isolation 下的 read-only Codex 或 plan-mode Claude 空闲会话可以产生带
-  runtime version、session/generation、workspace/policy/input digest 的原子 manifest。
-  该 API 不自动恢复、不自动重放副作用。
+  runtime version、session/generation、workspace/policy/input digest 的原子 manifest；
+  run/step/input identity、safe profile、pending approval 和 preflight 后的 session
+  变化都会 fail closed。该 API 不自动恢复、不自动重放副作用。
 - Workbench Codex/Claude adapter 和 workflow Claude adapter 已使用相同 safe
   environment/profile、generation lease 或 runtime registry；Workbench JSONL event
   envelope 现持久化 runtime kind、agent profile、session 和 generation。
