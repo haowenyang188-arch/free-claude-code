@@ -29,7 +29,12 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
 
     async def check_availability(self) -> bool:
         """Return bounded, cached local Claude Code readiness."""
-        return (await self.runtime_registry.probe(RuntimeBackend.CLAUDE)).available
+        probe = await self.runtime_registry.probe(RuntimeBackend.CLAUDE)
+        if not probe.available:
+            return False
+        return (
+            await self.runtime_registry.probe_safe_profile(RuntimeBackend.CLAUDE)
+        ).available
 
     async def start_task(
         self, run_id: str, task_description: str, workspace_path: str
@@ -43,6 +48,8 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
         self._terminal_event_emitted = False
 
         try:
+            generation = uuid.uuid4().hex
+            self.generation = generation
             await self.emit_event(
                 EventType.RUN_STARTED,
                 {
@@ -51,8 +58,6 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
                 },
             )
 
-            generation = uuid.uuid4().hex
-            self.generation = generation
             self.process = await asyncio.create_subprocess_exec(
                 self.cli_path,
                 "--print",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import Any
 
 from cli.codex_session import CodexSession
@@ -25,10 +26,16 @@ class CodexAdapter(BaseAgentAdapter):
         )
         self.session: CodexSession | None = None
         self.session_id: str | None = None
+        self.generation: str | None = None
 
     async def check_availability(self) -> bool:
         """Return bounded, cached local Codex CLI readiness."""
-        return (await self.runtime_registry.probe(RuntimeBackend.CODEX)).available
+        probe = await self.runtime_registry.probe(RuntimeBackend.CODEX)
+        if not probe.available:
+            return False
+        return (
+            await self.runtime_registry.probe_safe_profile(RuntimeBackend.CODEX)
+        ).available
 
     async def start_task(
         self, run_id: str, task_description: str, workspace_path: str
@@ -42,6 +49,8 @@ class CodexAdapter(BaseAgentAdapter):
         self._terminal_event_emitted = False
 
         try:
+            generation = uuid.uuid4().hex
+            self.generation = generation
             await self.emit_event(
                 EventType.RUN_STARTED,
                 {
@@ -61,7 +70,11 @@ class CodexAdapter(BaseAgentAdapter):
 
             # 启动输出监听任务
             self.monitor_task = asyncio.create_task(
-                self._run_codex_task(task_description, session_id=self.session_id)
+                self._run_codex_task(
+                    task_description,
+                    session_id=self.session_id,
+                    generation=generation,
+                )
             )
 
             return True
@@ -75,7 +88,12 @@ class CodexAdapter(BaseAgentAdapter):
             self.current_run_id = None
             return False
 
-    async def _run_codex_task(self, prompt: str, session_id: str | None = None):
+    async def _run_codex_task(
+        self,
+        prompt: str,
+        session_id: str | None = None,
+        generation: str | None = None,
+    ):
         """运行 Codex 任务并处理事件流"""
         run_id = self.current_run_id
         if not self.session:
@@ -83,7 +101,7 @@ class CodexAdapter(BaseAgentAdapter):
 
         try:
             async for event in self.session.start_task(
-                prompt=prompt, session_id=session_id
+                prompt=prompt, session_id=session_id, generation=generation
             ):
                 event_type = event.get("type")
 

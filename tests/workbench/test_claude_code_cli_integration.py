@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
+from cli.runtime_registry import RuntimeBackend, RuntimeProbe, RuntimeProfileProbe
 from workbench.backend.domain.models import (
     ContextPackage,
     SubagentAssignment,
@@ -167,6 +168,45 @@ class TestClaudeCodeCLIIntegration:
                 assignment=sample_assignment,
                 context=sample_context,
             )
+
+    async def test_safe_profile_preflight_blocks_subprocess(
+        self, sample_task, sample_assignment, sample_context
+    ):
+        registry = MagicMock()
+        registry.probe = AsyncMock(
+            return_value=RuntimeProbe(
+                backend=RuntimeBackend.CLAUDE,
+                executable="claude",
+                available=True,
+                version="2.1.220",
+                capabilities=(),
+            )
+        )
+        registry.probe_safe_profile = AsyncMock(
+            return_value=RuntimeProfileProbe(
+                backend=RuntimeBackend.CLAUDE,
+                available=False,
+                required_flags=("--safe-mode",),
+                missing_flags=("--safe-mode",),
+                reason="required_flags_missing",
+            )
+        )
+        guarded = ClaudeCodeAdapter(
+            runtime_registry=registry,
+            preflight_runtime=True,
+        )
+
+        with (
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn,
+            pytest.raises(RunnerError, match="safe profile preflight failed"),
+        ):
+            await guarded.execute_step(
+                task=sample_task,
+                assignment=sample_assignment,
+                context=sample_context,
+            )
+
+        spawn.assert_not_awaited()
 
     async def test_invoke_handles_timeout(
         self, adapter, sample_task, sample_assignment, sample_context

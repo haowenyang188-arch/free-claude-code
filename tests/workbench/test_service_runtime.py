@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from starlette.testclient import TestClient
 
+from cli.runtime_registry import RuntimeBackend, RuntimeProbe, RuntimeProfileProbe
 from harness.config import HarnessConfig
 from workbench.backend import main as main_module
 from workbench.backend.agents import claude_adapter as claude_module
@@ -176,6 +178,72 @@ async def test_event_callback_persists_redacted_legacy_compatible_event(
     assert serialized["runtime_kind"] == AgentType.CLAUDE_CODE.value
     assert serialized["agent_profile_id"] == "agent-1"
     assert EventLog(tmp_path / "events.jsonl").replay(run.id)[0].sequence == 1
+
+
+@pytest.mark.asyncio
+async def test_event_provenance_stays_bound_to_the_started_generation(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    run = Run(id="run-1", task_id="task-1", agent_id="agent-1")
+    service.runs[run.id] = run
+    adapter = service.agents["agent-1"]
+    adapter.generation = "generation-1"
+
+    await service._handle_event(
+        Event(
+            id="event-started",
+            run_id=run.id,
+            type=EventType.RUN_STARTED,
+            data={"message": "started"},
+        )
+    )
+    adapter.generation = "generation-2"
+    await service._handle_event(
+        Event(
+            id="event-message",
+            run_id=run.id,
+            type=EventType.AGENT_MESSAGE,
+            data={"message": "still first generation"},
+        )
+    )
+
+    replay = service.replay_events(run.id)
+    assert [event["generation"] for event in replay] == [
+        "generation-1",
+        "generation-1",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "adapter_type,backend",
+    [(CodexAdapter, RuntimeBackend.CODEX), (ClaudeCodeAdapter, RuntimeBackend.CLAUDE)],
+)
+async def test_workbench_adapter_availability_requires_safe_profile(
+    adapter_type, backend
+) -> None:
+    adapter = adapter_type("agent-1")
+    adapter.runtime_registry.probe = AsyncMock(
+        return_value=RuntimeProbe(
+            backend=backend,
+            executable=backend.value,
+            available=True,
+            version="1.0.0",
+            capabilities=(),
+        )
+    )
+    adapter.runtime_registry.probe_safe_profile = AsyncMock(
+        return_value=RuntimeProfileProbe(
+            backend=backend,
+            available=False,
+            required_flags=("--safe",),
+            missing_flags=("--safe",),
+            reason="required_flags_missing",
+        )
+    )
+
+    assert await adapter.check_availability() is False
 
 
 @pytest.mark.asyncio

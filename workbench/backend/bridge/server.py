@@ -3,9 +3,11 @@
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from workbench.backend.bridge import create_bridge_router, BridgeService
-from workbench.backend.workflow.runners import RuntimeNeutralRunner
+
+from workbench.backend.bridge import BridgeService, create_bridge_router
+from workbench.backend.domain.models import RuntimeKind
 from workbench.backend.workflow.adapters.claude_code import ClaudeCodeAdapter
+from workbench.backend.workflow.runners import RuntimeNeutralRunner
 
 
 def create_app() -> FastAPI:
@@ -26,9 +28,9 @@ def create_app() -> FastAPI:
     )
 
     # Initialize components
-    claude_code_adapter = ClaudeCodeAdapter()
+    claude_code_adapter = ClaudeCodeAdapter(preflight_runtime=True)
     runner = RuntimeNeutralRunner(adapters=[claude_code_adapter])
-    runner.register_runtime("claude_code", "claude_code")
+    runner.register_runtime("claude_code", RuntimeKind.CLAUDE_CODE)
 
     bridge_service = BridgeService(runner=runner)
 

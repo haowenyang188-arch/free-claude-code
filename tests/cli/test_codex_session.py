@@ -117,6 +117,33 @@ class TestCodexSession:
         assert session.generation == registered[-1]
 
     @pytest.mark.asyncio
+    async def test_start_task_can_use_caller_owned_generation(self) -> None:
+        from cli.codex_session import CodexSession
+
+        process = MagicMock()
+        process.pid = 123
+        process.stdout.readline = AsyncMock(side_effect=[b""])
+        process.stderr.read = AsyncMock(return_value=b"")
+        process.wait = AsyncMock(return_value=0)
+
+        session = CodexSession("/tmp/project")
+        with (
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn,
+            patch("cli.codex_session.register_process") as register,
+            patch("cli.codex_session.unregister_process"),
+        ):
+            spawn.return_value = process
+            [
+                event
+                async for event in session.start_task(
+                    "inspect", generation="owned-generation"
+                )
+            ]
+
+        assert session.generation == "owned-generation"
+        register.assert_called_once_with(123, generation="owned-generation")
+
+    @pytest.mark.asyncio
     async def test_preflight_failure_does_not_spawn_codex(self, monkeypatch) -> None:
         from cli.codex_session import CodexSession
         from cli.runtime_registry import RuntimeBackend, RuntimeRegistry

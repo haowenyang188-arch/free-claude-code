@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from cli.process_registry import register_process, unregister_process
 from cli.runtime_environment import build_cli_environment
-from cli.runtime_registry import RuntimeBackend
+from cli.runtime_registry import RuntimeBackend, RuntimeRegistry
 from workbench.backend.domain.models import Artifact, ArtifactType, RuntimeKind
 from workbench.backend.workflow.runners import RunnerError, RuntimeAdapter
 
@@ -32,6 +32,8 @@ class ClaudeCodeAdapter(RuntimeAdapter):
         *,
         claude_bin: str = "claude",
         isolation_mode: str = "safe",
+        runtime_registry: RuntimeRegistry | None = None,
+        preflight_runtime: bool = False,
     ) -> None:
         """Initialize adapter with optional artifact store for loading upstream artifacts."""
         if isolation_mode not in {"safe", "inherit"}:
@@ -39,6 +41,10 @@ class ClaudeCodeAdapter(RuntimeAdapter):
         self._artifact_store = artifact_store
         self._claude_bin = claude_bin
         self._isolation_mode = isolation_mode
+        self._runtime_registry = runtime_registry or RuntimeRegistry(
+            executables={RuntimeBackend.CLAUDE: claude_bin}
+        )
+        self._preflight_runtime = preflight_runtime
 
     def supports(self, runtime_kind: RuntimeKind) -> bool:
         """Return True for CLAUDE_CODE runtime."""
@@ -159,6 +165,22 @@ class ClaudeCodeAdapter(RuntimeAdapter):
         Raises:
             RunnerError: If Claude Code execution fails
         """
+        if self._preflight_runtime:
+            probe = await self._runtime_registry.probe(RuntimeBackend.CLAUDE)
+            if not probe.available:
+                raise RunnerError(
+                    f"Claude CLI preflight failed: {probe.reason or 'runtime_unavailable'}"
+                )
+            if self._isolation_mode == "safe":
+                profile = await self._runtime_registry.probe_safe_profile(
+                    RuntimeBackend.CLAUDE
+                )
+                if not profile.available:
+                    raise RunnerError(
+                        "Claude CLI safe profile preflight failed: "
+                        f"{profile.reason or 'safe_profile_unavailable'}"
+                    )
+
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", delete=False, encoding="utf-8"
         ) as f:

@@ -70,6 +70,10 @@ class CodexSession:
     def is_busy(self) -> bool:
         return self._is_busy
 
+    @property
+    def has_pending_approval(self) -> bool:
+        return self._staged_workspace is not None
+
     def build_command(
         self,
         prompt: str,
@@ -107,6 +111,7 @@ class CodexSession:
         prompt: str,
         session_id: str | None = None,
         fork_session: bool = False,
+        generation: str | None = None,
     ) -> AsyncGenerator[dict[str, Any]]:
         """Run one Codex turn and yield normalized events."""
         awaiting_approval = False
@@ -159,7 +164,7 @@ class CodexSession:
             self._is_busy = True
             self._cancel_requested = False
             env = build_cli_environment(RuntimeBackend.CODEX)
-            generation = uuid.uuid4().hex
+            generation = generation or uuid.uuid4().hex
             self.generation = generation
 
             try:

@@ -131,6 +131,7 @@ class WorkbenchService:
         self.runs: dict[str, Run] = {}
         self.events: dict[str, Event] = {}
         self.event_envelopes: dict[str, EventEnvelope] = {}
+        self._run_provenance: dict[str, tuple[str | None, str | None, str | None]] = {}
         self.websocket_connections: list[WebSocket] = []
         self._restore_state()
 
@@ -267,8 +268,12 @@ class WorkbenchService:
         """处理Agent事件"""
         # 从 adapter 获取 session_id
         session_id = self._session_id_for_run(event.run_id)
-        runtime_kind, agent_profile_id, generation = self._provenance_for_run(
-            event.run_id
+        if event.type is EventType.RUN_STARTED:
+            self._run_provenance.setdefault(
+                event.run_id, self._current_provenance_for_run(event.run_id)
+            )
+        runtime_kind, agent_profile_id, generation = self._run_provenance.get(
+            event.run_id, self._current_provenance_for_run(event.run_id)
         )
 
         # 如果事件中包含 session_id，提取并持久化
@@ -355,7 +360,15 @@ class WorkbenchService:
     def _provenance_for_run(
         self, run_id: str
     ) -> tuple[str | None, str | None, str | None]:
-        """Return stable runtime identity without relying on event payload data."""
+        """Return the immutable provenance captured for a run."""
+        return self._run_provenance.get(
+            run_id, self._current_provenance_for_run(run_id)
+        )
+
+    def _current_provenance_for_run(
+        self, run_id: str
+    ) -> tuple[str | None, str | None, str | None]:
+        """Read current adapter identity when a run has no captured provenance."""
         run = self.runs.get(run_id)
         if run is None:
             return None, None, None

@@ -230,6 +230,8 @@ class CLISessionManager:
         resulting manifest before using its session ID in a later turn.
         """
         _require_sha256(input_digest, "input_digest")
+        run_id = _required_text(run_id, "run_id")
+        step_id = _required_text(step_id, "step_id")
         if not self._checkpoint_policy_is_safe():
             raise RuntimeError("checkpointing requires a safe read-only policy")
 
@@ -240,10 +242,15 @@ class CLISessionManager:
             )
             if session is None:
                 raise RuntimeError("checkpoint session is not managed")
-            if session.is_busy:
+            if session.is_busy is not False:
                 raise RuntimeError("cannot checkpoint an active session")
+            if getattr(session, "has_pending_approval", False) is True:
+                raise RuntimeError("cannot checkpoint with pending approval")
             runtime_session_id = getattr(session, "current_session_id", None)
             generation = getattr(session, "generation", None)
+            last_run_id = getattr(session, "last_run_id", None)
+            if not isinstance(last_run_id, str) or last_run_id.strip() != run_id:
+                raise RuntimeError("checkpoint run does not match session")
 
         if not isinstance(runtime_session_id, str) or not runtime_session_id.strip():
             raise RuntimeError("checkpoint session has no runtime session ID")
@@ -254,6 +261,24 @@ class CLISessionManager:
         probe = await self.runtime_registry.probe(backend)
         if not probe.available or not probe.version:
             raise RuntimeError("checkpoint runtime is not ready with a version")
+        profile = await self.runtime_registry.probe_safe_profile(backend)
+        if not profile.available:
+            raise RuntimeError("checkpoint safe profile is unavailable")
+
+        # The runtime probes yield control. Recheck the session identity before
+        # publishing a manifest so a new turn cannot inherit an old lease.
+        async with self._lock:
+            current = self._sessions.get(resolved_id) or self._pending_sessions.get(
+                resolved_id
+            )
+            if (
+                current is not session
+                or current.is_busy is not False
+                or getattr(current, "current_session_id", None) != runtime_session_id
+                or getattr(current, "generation", None) != generation
+                or getattr(current, "last_run_id", None) != last_run_id
+            ):
+                raise RuntimeError("session changed during preflight")
 
         return CheckpointManifest(
             checkpoint_id=str(uuid.uuid4()),
@@ -272,6 +297,13 @@ class CLISessionManager:
                 codex_approval_required=self.codex_approval_required,
                 preflight_runtime=self.preflight_runtime,
                 allowed_dirs=self.allowed_dirs,
+                claude_bin=self.claude_bin,
+                codex_bin=self.codex_bin,
+                codex_model=self.codex_model,
+                api_url=self.api_url,
+                plans_directory=self.plans_directory,
+                runtime_executable=probe.executable,
+                safe_profile_flags=profile.required_flags,
             ),
             step_id=step_id,
             input_digest=input_digest,
@@ -334,6 +366,15 @@ def _require_sha256(value: str, field: str) -> None:
         int(value, 16)
     except ValueError as exc:
         raise ValueError(f"{field} must be a SHA-256 hex digest") from exc
+
+
+def _required_text(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    normalized = value.strip()
+    if any(character in normalized for character in ("\x00", "\r", "\n")):
+        raise ValueError(f"{field} must not contain control characters")
+    return normalized
 
 
 def _sha256(value: str) -> str:
