@@ -20,3 +20,10 @@ llama_cache
 .smoke-results
 tmp/
 node_modules
+
+# Ruflo local secrets and runtime data
+.env.local
+.env.*.local
+.claude-flow/data/
+.claude-flow/logs/
+.claude-flow/sessions/

@@ -71,6 +71,14 @@ extend-exclude = [
     "prompt-optimizer",
     "servers",
     "x-cli",
+    ".cache",
+    ".staging",
+    ".skill-staging",
+    ".final-xhs-staging",
+    ".worktrees",
+    "cleanup-backup-*",
+    "deliverables",
+    ".tmp_*.py",
 ]
 
 [tool.ruff.lint]
@@ -90,6 +98,9 @@ ignore = [
     "E501",  # line too long — enforced by the formatter instead
     "B008",  # FastAPI Depends() in argument defaults is intentional
     "RUF006",  # fire-and-forget tasks intentionally not awaited
+    "RUF001",  # Chinese-facing text intentionally uses localized punctuation
+    "RUF002",  # Chinese-facing docstrings intentionally use localized punctuation
+    "RUF003",  # Chinese-facing comments intentionally use localized punctuation
 ]
 
 [tool.ruff.lint.isort]
@@ -128,8 +139,22 @@ exclude = [
     "prompt-optimizer",
     "servers",
     "x-cli",
+    ".cache",
+    ".staging",
+    ".skill-staging",
+    ".final-xhs-staging",
+    ".worktrees",
+    "cleanup-backup-*",
+    "deliverables",
+    ".tmp_*.py",
 ]
 
 [tool.ty.analysis]
 # Optional voice_local extra: torch, transformers, librosa for local whisper transcription
-allowed-unresolved-imports = ["torch", "transformers", "librosa"]
+allowed-unresolved-imports = [
+    "torch",
+    "transformers",
+    "librosa",
+    "mcp",
+    "mcp.client.stdio",
+]
