@@ -995,6 +995,18 @@ def _requires_manual_wrapper_review(command: str) -> bool:
         return True
     if executable in {"grep", "rg"}:
         return True
+    if executable in {"ls", "dir"} and any(
+        token in {"--recursive"}
+        or token.lower() == "/s"
+        or token.startswith("--dereference")
+        or (
+            token.startswith("-")
+            and not token.startswith("--")
+            and ("R" in token[1:] or "L" in token[1:])
+        )
+        for token in tokens[executable_index + 1 :]
+    ):
+        return True
     if executable == "find" and any(
         token in {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
         for token in tokens[executable_index + 1 :]

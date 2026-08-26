@@ -318,6 +318,27 @@ def test_explicit_search_prefix_still_rejects_dynamic_execution(
     assert policy.evaluate(request).decision is ApprovalDecision.ASK
 
 
+@pytest.mark.parametrize("command", ["ls -RL .", "dir -LR .", "ls --dereference ."])
+def test_low_risk_policy_does_not_follow_links_or_recurse_during_listing(
+    tmp_path: Path, command: str
+) -> None:
+    from cli.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
+
+    request = ApprovalRequest(
+        backend="codex",
+        tool_name="Bash",
+        command=command,
+        workspace=str(tmp_path),
+    )
+
+    assert (
+        ApprovalPolicy.low_risk(enabled=True, allowed_workspaces=[tmp_path])
+        .evaluate(request)
+        .decision
+        is ApprovalDecision.ASK
+    )
+
+
 def test_safe_tool_payload_cannot_smuggle_a_shell_command(tmp_path: Path) -> None:
     from cli.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 
