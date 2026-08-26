@@ -1,5 +1,18 @@
 """CLI integration for Claude Code."""
 
+from .approval import (
+    ApprovalDecision,
+    ApprovalHook,
+    ApprovalOption,
+    ApprovalPolicy,
+    ApprovalPromptKind,
+    ApprovalPromptParser,
+    ApprovalRequest,
+    ApprovalResult,
+    ApprovalRule,
+    ApprovalScope,
+    ParsedApprovalPrompt,
+)
 from .checkpoint import CheckpointError, CheckpointManifest, CheckpointStore
 from .codex_session import CodexSession
 from .manager import CLISessionManager
@@ -13,12 +26,23 @@ from .runtime_registry import (
 from .session import CLISession
 
 __all__ = [
+    "ApprovalDecision",
+    "ApprovalHook",
+    "ApprovalOption",
+    "ApprovalPolicy",
+    "ApprovalPromptKind",
+    "ApprovalPromptParser",
+    "ApprovalRequest",
+    "ApprovalResult",
+    "ApprovalRule",
+    "ApprovalScope",
     "CLISession",
     "CLISessionManager",
     "CheckpointError",
     "CheckpointManifest",
     "CheckpointStore",
     "CodexSession",
+    "ParsedApprovalPrompt",
     "RuntimeBackend",
     "RuntimeProbe",
     "RuntimeProfileProbe",

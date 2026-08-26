@@ -425,6 +425,34 @@ safe defaults. Enabling a write-capable mode is an operator decision and should
 be paired with an external diff/approval workflow until the structured approval
 adapter is enabled.
 
+### Protocol-level low-risk approval hook
+
+`fcc-approval-hook` is an opt-in, single-shot hook for Claude `PreToolUse` and
+Codex `PreToolUse` / `PermissionRequest` events. It auto-approves only the
+built-in read-only tool set and explicitly allowlisted command prefixes. It
+returns no output for unknown, compound, out-of-workspace, or otherwise
+ambiguous requests, so the CLI keeps its normal approval prompt. Destructive
+commands are denied by the local policy.
+
+The hook is disabled by default. Enable it only in a hook configuration that
+also sets an explicit workspace boundary:
+
+```bash
+FCC_APPROVAL_ENABLED=true \
+FCC_APPROVAL_WORKSPACES=/absolute/path/to/repo \
+FCC_APPROVAL_SCOPE=once \
+fcc-approval-hook
+```
+
+Register the executable through the hook mechanism documented by the CLI you
+use. For Claude Code, add it to the `PreToolUse` hook in
+`~/.claude/settings.json`; Codex supports the same executable through its
+`PreToolUse` and `PermissionRequest` hook configuration. Keep the command
+allowlist narrow, and do not enable permanent approvals unless the explicit
+`FCC_APPROVAL_ALLOW_PERMANENT=true` setting and a permanent scope are both
+required by your workflow. The hook never executes the command from the input
+payload and never records the command or credentials in a log.
+
 ### Voice Notes
 
 Send voice messages on Discord or Telegram; they are transcribed and processed as regular prompts.
@@ -489,6 +517,11 @@ Configure via `WHISPER_DEVICE` (`cpu` | `cuda`) and `WHISPER_MODEL`. See the [Co
 | `CODEX_MODEL`              | Optional Codex model override                                                                                                                                       | empty               |
 | `CODEX_SANDBOX`            | Codex sandbox: `read-only`, `workspace-write`, or `danger-full-access`                                                                                              | `read-only`         |
 | `CODEX_APPROVAL_REQUIRED`  | Stage Codex write-capable runs until an operator sends `/approve`                                                                                                    | `true`              |
+| `CLI_AUTO_APPROVAL_ENABLED` | Enable the protocol-level low-risk approval hook (opt-in)                                                                                                             | `false`             |
+| `CLI_AUTO_APPROVAL_SCOPE` | Maximum automatic approval scope: `once`, `session`, or `permanent`                                                                                                  | `once`              |
+| `CLI_AUTO_APPROVAL_COMMANDS` | Comma-separated command prefixes; empty uses the built-in read-only set                                                                                              | empty               |
+| `CLI_AUTO_APPROVAL_WORKSPACES` | Comma-separated absolute workspace roots; empty uses the current manager workspace                                                                                  | empty               |
+| `CLI_AUTO_APPROVAL_ALLOW_PERMANENT` | Allow permanent-scope decisions when explicitly requested                                                                                                           | `false`             |
 | `CLAUDE_WORKSPACE`         | Directory where the agent operates                                                                                                                                 | `./agent_workspace` |
 | `ALLOWED_DIR`              | Allowed directories for the agent                                                                                                                                  | `""`                |
 | `MESSAGING_RATE_LIMIT`     | Messaging messages per window                                                                                                                                      | `1`                 |

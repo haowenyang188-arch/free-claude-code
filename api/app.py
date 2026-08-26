@@ -147,6 +147,11 @@ async def lifespan(app: FastAPI):
         )
 
         if messaging_platform:
+            from cli.approval import (
+                DEFAULT_SAFE_COMMAND_PREFIXES,
+                ApprovalPolicy,
+                ApprovalScope,
+            )
             from cli.manager import CLISessionManager
             from cli.workspace import resolve_workspace_root
             from messaging.handler import ClaudeMessageHandler
@@ -170,6 +175,25 @@ async def lifespan(app: FastAPI):
                 os.path.join(settings.claude_workspace, "plans")
             )
             plans_directory = os.path.relpath(plans_dir_abs, workspace)
+            approval_scope = ApprovalScope(settings.cli_auto_approval_scope)
+            approval_commands = [
+                value.strip()
+                for value in settings.cli_auto_approval_commands.split(",")
+                if value.strip()
+            ]
+            approval_workspaces = [
+                value.strip()
+                for value in settings.cli_auto_approval_workspaces.split(",")
+                if value.strip()
+            ] or [workspace]
+            approval_policy = ApprovalPolicy(
+                enabled=settings.cli_auto_approval_enabled,
+                allowed_command_prefixes=approval_commands
+                or DEFAULT_SAFE_COMMAND_PREFIXES,
+                allowed_workspaces=approval_workspaces,
+                max_auto_scope=approval_scope,
+                allow_permanent=settings.cli_auto_approval_allow_permanent,
+            )
             cli_manager = CLISessionManager(
                 workspace_path=workspace,
                 api_url=api_url,
@@ -189,6 +213,7 @@ async def lifespan(app: FastAPI):
                 ),
                 preflight_runtime=getattr(settings, "cli_runtime_preflight", True),
                 isolation_mode=getattr(settings, "cli_isolation_mode", "safe"),
+                approval_policy=approval_policy,
             )
 
             # Initialize session store

@@ -313,6 +313,8 @@ class ApprovalPolicy:
         )
         commands = _split_env_list(os.environ.get("FCC_APPROVAL_COMMANDS", ""))
         workspaces = _split_env_list(os.environ.get("FCC_APPROVAL_WORKSPACES", ""))
+        if not workspaces:
+            workspaces = [os.getcwd()]
         return cls(
             enabled=enabled,
             allowed_command_prefixes=commands or DEFAULT_SAFE_COMMAND_PREFIXES,

@@ -185,6 +185,22 @@ class Settings(BaseSettings):
     codex_approval_required: bool = Field(
         default=True, validation_alias="CODEX_APPROVAL_REQUIRED"
     )
+    # Protocol-level auto approval is opt-in and limited to low-risk rules.
+    cli_auto_approval_enabled: bool = Field(
+        default=False, validation_alias="CLI_AUTO_APPROVAL_ENABLED"
+    )
+    cli_auto_approval_scope: str = Field(
+        default="once", validation_alias="CLI_AUTO_APPROVAL_SCOPE"
+    )
+    cli_auto_approval_commands: str = Field(
+        default="", validation_alias="CLI_AUTO_APPROVAL_COMMANDS"
+    )
+    cli_auto_approval_workspaces: str = Field(
+        default="", validation_alias="CLI_AUTO_APPROVAL_WORKSPACES"
+    )
+    cli_auto_approval_allow_permanent: bool = Field(
+        default=False, validation_alias="CLI_AUTO_APPROVAL_ALLOW_PERMANENT"
+    )
     cli_runtime_preflight: bool = Field(
         default=True, validation_alias="CLI_RUNTIME_PREFLIGHT"
     )
@@ -275,6 +291,17 @@ class Settings(BaseSettings):
         if v not in allowed:
             raise ValueError(
                 "CODEX_SANDBOX must be one of: "
+                + ", ".join(repr(item) for item in allowed)
+            )
+        return v
+
+    @field_validator("cli_auto_approval_scope")
+    @classmethod
+    def validate_cli_auto_approval_scope(cls, v: str) -> str:
+        allowed = ("once", "session", "permanent")
+        if v not in allowed:
+            raise ValueError(
+                "CLI_AUTO_APPROVAL_SCOPE must be one of: "
                 + ", ".join(repr(item) for item in allowed)
             )
         return v

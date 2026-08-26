@@ -169,6 +169,33 @@ def test_hook_leaves_unknown_pre_tool_use_requests_unanswered(tmp_path: Path) ->
     assert hook.handle_payload(payload) is None
 
 
+def test_environment_policy_defaults_to_current_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cli.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
+
+    monkeypatch.setenv("FCC_APPROVAL_ENABLED", "true")
+    monkeypatch.delenv("FCC_APPROVAL_WORKSPACES", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    policy = ApprovalPolicy.from_environment()
+    request = ApprovalRequest(
+        backend="codex",
+        tool_name="Bash",
+        command="git status",
+        workspace=str(tmp_path),
+    )
+    outside = ApprovalRequest(
+        backend="codex",
+        tool_name="Bash",
+        command="git status",
+        workspace=str(tmp_path.parent),
+    )
+
+    assert policy.evaluate(request).decision is ApprovalDecision.ALLOW
+    assert policy.evaluate(outside).decision is ApprovalDecision.ASK
+
+
 def test_prompt_parser_distinguishes_codex_scopes_and_strips_ansi() -> None:
     from cli.approval import ApprovalDecision, ApprovalPromptParser, ApprovalScope
 

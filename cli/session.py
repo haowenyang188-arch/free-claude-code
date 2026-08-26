@@ -9,6 +9,7 @@ from typing import Any
 
 from loguru import logger
 
+from .approval import ApprovalPolicy, ApprovalRequest, ApprovalResult
 from .process_registry import register_process, unregister_process
 from .runtime_environment import build_cli_environment
 from .runtime_registry import RuntimeBackend, RuntimeRegistry
@@ -29,6 +30,7 @@ class CLISession:
         isolation_mode: str = "safe",
         runtime_registry: RuntimeRegistry | None = None,
         preflight_runtime: bool = False,
+        approval_policy: ApprovalPolicy | None = None,
     ):
         self.workspace = os.path.normpath(os.path.abspath(workspace_path))
         self.api_url = api_url
@@ -55,6 +57,7 @@ class CLISession:
             executables={RuntimeBackend.CLAUDE: claude_bin}
         )
         self.preflight_runtime = preflight_runtime
+        self.approval_policy = approval_policy or ApprovalPolicy()
         self.process: asyncio.subprocess.Process | None = None
         self.current_session_id: str | None = None
         self.generation: str | None = None
@@ -327,4 +330,10 @@ class CLISession:
             "session_id": self.current_session_id,
             "generation": self.generation,
             "is_busy": self.is_busy,
+            "auto_approval_enabled": self.approval_policy.enabled,
+            "auto_approval_scope": self.approval_policy.max_auto_scope.value,
         }
+
+    def evaluate_approval(self, request: ApprovalRequest) -> ApprovalResult:
+        """Evaluate a hook or PTY approval request without executing it."""
+        return self.approval_policy.evaluate(request)

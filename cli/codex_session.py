@@ -18,6 +18,7 @@ from typing import Any
 
 from loguru import logger
 
+from .approval import ApprovalPolicy, ApprovalRequest, ApprovalResult
 from .process_registry import register_process, unregister_process
 from .runtime_environment import build_cli_environment
 from .runtime_registry import RuntimeBackend, RuntimeRegistry
@@ -40,6 +41,7 @@ class CodexSession:
         isolation_mode: str = "safe",
         runtime_registry: RuntimeRegistry | None = None,
         preflight_runtime: bool = False,
+        approval_policy: ApprovalPolicy | None = None,
     ) -> None:
         self.workspace = os.path.normpath(os.path.abspath(workspace_path))
         self.codex_bin = codex_bin
@@ -53,6 +55,7 @@ class CodexSession:
             executables={RuntimeBackend.CODEX: codex_bin}
         )
         self.preflight_runtime = preflight_runtime
+        self.approval_policy = approval_policy or ApprovalPolicy()
         if approval_mode and sandbox_mode == "danger-full-access":
             raise ValueError(
                 "Codex staged approval cannot be combined with danger-full-access"
@@ -445,4 +448,10 @@ class CodexSession:
             "session_id": self.current_session_id,
             "generation": self.generation,
             "is_busy": self.is_busy,
+            "auto_approval_enabled": self.approval_policy.enabled,
+            "auto_approval_scope": self.approval_policy.max_auto_scope.value,
         }
+
+    def evaluate_approval(self, request: ApprovalRequest) -> ApprovalResult:
+        """Evaluate a hook or PTY approval request without executing it."""
+        return self.approval_policy.evaluate(request)

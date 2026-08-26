@@ -14,6 +14,7 @@ from pathlib import Path
 
 from loguru import logger
 
+from .approval import ApprovalPolicy
 from .checkpoint import CheckpointManifest, CheckpointStore
 from .codex_session import CodexSession
 from .runtime_registry import RuntimeBackend, RuntimeRegistry
@@ -47,6 +48,7 @@ class CLISessionManager:
         runtime_registry: RuntimeRegistry | None = None,
         preflight_runtime: bool = True,
         isolation_mode: str = "safe",
+        approval_policy: ApprovalPolicy | None = None,
     ):
         """
         Initialize the session manager.
@@ -89,6 +91,7 @@ class CLISessionManager:
         if isolation_mode not in {"safe", "inherit"}:
             raise ValueError("isolation_mode must be 'safe' or 'inherit'")
         self.isolation_mode = isolation_mode
+        self.approval_policy = approval_policy or ApprovalPolicy()
 
         self._sessions: dict[str, SessionBackend] = {}
         self._pending_sessions: dict[str, SessionBackend] = {}
@@ -128,6 +131,7 @@ class CLISessionManager:
                     isolation_mode=self.isolation_mode,
                     runtime_registry=self.runtime_registry,
                     preflight_runtime=self.preflight_runtime,
+                    approval_policy=self.approval_policy,
                 )
             else:
                 new_session = CLISession(
@@ -141,6 +145,7 @@ class CLISessionManager:
                     isolation_mode=self.isolation_mode,
                     runtime_registry=self.runtime_registry,
                     preflight_runtime=self.preflight_runtime,
+                    approval_policy=self.approval_policy,
                 )
             self._pending_sessions[temp_id] = new_session
             logger.info(f"Created new session: {temp_id}")
