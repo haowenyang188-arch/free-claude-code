@@ -57,7 +57,7 @@ class CLISession:
         self.preflight_runtime = preflight_runtime
         self.process: asyncio.subprocess.Process | None = None
         self.current_session_id: str | None = None
-        self.generation = uuid.uuid4().hex
+        self.generation: str | None = None
         self._is_busy = False
         self._cli_lock = asyncio.Lock()
 
@@ -157,6 +157,8 @@ class CLISession:
                 settings_json = json.dumps({"plansDirectory": self.plans_directory})
                 cmd.extend(["--settings", settings_json])
 
+            generation = uuid.uuid4().hex
+            self.generation = generation
             try:
                 self.process = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -166,7 +168,7 @@ class CLISession:
                     env=env,
                 )
                 if self.process and self.process.pid:
-                    register_process(self.process.pid, generation=self.generation)
+                    register_process(self.process.pid, generation=generation)
 
                 if not self.process or not self.process.stdout:
                     yield {"type": "exit", "code": 1}
@@ -260,9 +262,7 @@ class CLISession:
             finally:
                 self._is_busy = False
                 if self.process and self.process.pid:
-                    unregister_process(
-                        self.process.pid, generation=self.generation
-                    )
+                    unregister_process(self.process.pid, generation=generation)
 
     async def _handle_line_gen(
         self, line_str: str, session_id_extracted: bool
@@ -319,11 +319,20 @@ class CLISession:
                     self.process.kill()
                     await self.process.wait()
                 if self.process and self.process.pid:
-                    unregister_process(
-                        self.process.pid, generation=self.generation
-                    )
+                    generation = self.generation
+                    if generation is not None:
+                        unregister_process(self.process.pid, generation=generation)
                 return True
             except Exception as e:
                 logger.error(f"Error stopping process: {e}")
                 return False
         return False
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return runtime identity without exposing process arguments or env."""
+        return {
+            "backend": "claude",
+            "session_id": self.current_session_id,
+            "generation": self.generation,
+            "is_busy": self.is_busy,
+        }

@@ -240,6 +240,37 @@ class TestCLISession:
             assert session.current_session_id == "sess_1"
 
     @pytest.mark.asyncio
+    async def test_generation_rotates_for_each_started_process(self):
+        from cli.session import CLISession
+
+        def make_process():
+            process = AsyncMock()
+            process.pid = 123
+            process.stdout.read.side_effect = [b""]
+            process.stderr.read.return_value = b""
+            process.wait.return_value = 0
+            return process
+
+        registered: list[str] = []
+
+        def register(_pid, *, generation):
+            registered.append(generation)
+
+        session = CLISession("/tmp", "http://localhost:8082/v1")
+        with (
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn,
+            patch("cli.session.register_process", side_effect=register),
+            patch("cli.session.unregister_process"),
+        ):
+            spawn.side_effect = [make_process(), make_process()]
+            [event async for event in session.start_task("first")]
+            [event async for event in session.start_task("second")]
+
+        assert len(registered) == 2
+        assert registered[0] != registered[1]
+        assert session.generation == registered[-1]
+
+    @pytest.mark.asyncio
     async def test_preflight_failure_does_not_spawn_claude(self, monkeypatch):
         from cli.runtime_registry import RuntimeBackend, RuntimeRegistry
         from cli.session import CLISession
@@ -329,7 +360,7 @@ class TestCLISession:
         monkeypatch.setenv("HTTP_PROXY", "http://stale-proxy")
         session = CLISession("/tmp", "http://localhost:8082/v1")
         process = AsyncMock()
-        process.stdout.read.side_effect = [b""]
+        process.stdout.read.side_effect = [b"", b""]
         process.stderr.read.return_value = b""
         process.wait.return_value = 0
 

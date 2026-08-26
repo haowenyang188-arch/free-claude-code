@@ -60,7 +60,7 @@ class CodexSession:
         self._staged_workspace: StagedWorkspace | None = None
         self.process: asyncio.subprocess.Process | None = None
         self.current_session_id: str | None = None
-        self.generation = uuid.uuid4().hex
+        self.generation: str | None = None
         self.last_run_id: str | None = None
         self._is_busy = False
         self._cancel_requested = False
@@ -142,6 +142,8 @@ class CodexSession:
             self._is_busy = True
             self._cancel_requested = False
             env = build_cli_environment(RuntimeBackend.CODEX)
+            generation = uuid.uuid4().hex
+            self.generation = generation
 
             try:
                 self.process = await asyncio.create_subprocess_exec(
@@ -153,7 +155,7 @@ class CodexSession:
                     env=env,
                 )
                 if self.process.pid:
-                    register_process(self.process.pid, generation=self.generation)
+                    register_process(self.process.pid, generation=generation)
 
                 if not self.process.stdout:
                     self.reject()
@@ -245,9 +247,7 @@ class CodexSession:
                 yield {"type": "exit", "code": 1, "stderr": str(exc)}
             finally:
                 if self.process and self.process.pid:
-                    unregister_process(
-                        self.process.pid, generation=self.generation
-                    )
+                    unregister_process(self.process.pid, generation=generation)
                 # Clean up staged workspace only if not awaiting approval
                 # If awaiting approval, workspace must survive until approve()/reject()
                 if self._staged_workspace is not None and not awaiting_approval:
@@ -450,5 +450,6 @@ class CodexSession:
         return {
             "backend": "codex",
             "session_id": self.current_session_id,
+            "generation": self.generation,
             "is_busy": self.is_busy,
         }
