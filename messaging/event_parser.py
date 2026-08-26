@@ -132,6 +132,46 @@ def parse_cli_event(event: Any) -> list[dict]:
                     }
                 ]
 
+    # Codex JSONL emits file and terminal records outside of an assistant
+    # content envelope.  Normalize them into the transcript's existing tool
+    # vocabulary so Telegram/Discord renderers stay backend-agnostic.
+    if etype == "file_change":
+        item = event.get("item")
+        if not isinstance(item, dict):
+            item = event
+        path = str(item.get("path") or item.get("file_path") or "file")
+        return [
+            {
+                "type": "tool_use",
+                "id": path,
+                "name": "file_change",
+                "input": item,
+            }
+        ]
+
+    if etype == "terminal":
+        output = event.get("output") or event.get("content") or ""
+        return [
+            {
+                "type": "tool_result",
+                "tool_use_id": "terminal",
+                "content": output,
+                "is_error": bool(event.get("exit_code", 0)),
+            }
+        ]
+
+    if etype == "approval_required":
+        return [
+            {
+                "type": "approval_required",
+                "diff": event.get("diff", ""),
+                "changed_paths": event.get("changed_paths", []),
+            }
+        ]
+
+    if etype == "approval_waiting":
+        return [{"type": "approval_waiting", "awaiting_approval": True}]
+
     # 3.5 Handle block stop (to close open streaming segments)
     if etype == "content_block_stop":
         return [{"type": "block_stop", "index": event.get("index", -1)}]

@@ -256,7 +256,12 @@ class TreeQueueManager:
             # 3. Cleanup: Mark ANY other PENDING or IN_PROGRESS nodes as ERROR
             for node in tree.all_nodes():
                 if (
-                    node.state in (MessageState.PENDING, MessageState.IN_PROGRESS)
+                    node.state
+                    in (
+                        MessageState.PENDING,
+                        MessageState.IN_PROGRESS,
+                        MessageState.WAITING_APPROVAL,
+                    )
                     and node.node_id not in cancelled_ids
                 ):
                     tree.set_node_error_sync(node, "Stale task cleaned up")
@@ -327,7 +332,11 @@ class TreeQueueManager:
         count = 0
         for tree in self._repository.all_trees():
             for node in tree.all_nodes():
-                if node.state in (MessageState.PENDING, MessageState.IN_PROGRESS):
+                if node.state in (
+                    MessageState.PENDING,
+                    MessageState.IN_PROGRESS,
+                    MessageState.WAITING_APPROVAL,
+                ):
                     tree.set_node_error_sync(node, "Lost during server restart")
                     count += 1
         if count:

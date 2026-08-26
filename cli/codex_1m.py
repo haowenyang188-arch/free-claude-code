@@ -446,6 +446,12 @@ def _prepare_catalog_content(result: CommandResult) -> bytes:
         model["context_window"],
         DESIRED_CONTEXT_WINDOW,
     )
+    # Responses-Lite providers reject parallel tool calls.  The bundled
+    # catalog omits this capability, which should default to false; make the
+    # compatibility requirement explicit in the managed override.
+    for candidate in payload.get("models", []):
+        if isinstance(candidate, dict) and candidate.get("slug") == MODEL_SLUG:
+            candidate["supports_parallel_tool_calls"] = False
     return (json.dumps(payload, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
 
 

@@ -61,6 +61,7 @@ class TelegramPlatform(MessagingPlatform):
         self,
         bot_token: str | None = None,
         allowed_user_id: str | None = None,
+        agent_backend: str = "claude",
     ):
         if not TELEGRAM_AVAILABLE:
             raise ImportError(
@@ -69,6 +70,7 @@ class TelegramPlatform(MessagingPlatform):
 
         self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
         self.allowed_user_id = allowed_user_id or os.getenv("ALLOWED_TELEGRAM_USER_ID")
+        self.agent_backend = agent_backend
 
         if not self.bot_token:
             # We don't raise here to allow instantiation for testing/conditional logic,
@@ -179,7 +181,7 @@ class TelegramPlatform(MessagingPlatform):
             target = self.allowed_user_id
             if target:
                 startup_text = (
-                    f"🚀 *{escape_md_v2('Claude Code Proxy is online!')}* "
+                    f"🚀 *{escape_md_v2(f'{self.agent_backend.title()} CLI gateway is online!')}* "
                     f"{escape_md_v2('(Bot API)')}"
                 )
                 await self.send_message(

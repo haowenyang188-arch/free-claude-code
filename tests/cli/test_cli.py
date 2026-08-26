@@ -238,6 +238,55 @@ class TestCLISession:
             assert session.current_session_id == "sess_1"
 
     @pytest.mark.asyncio
+    async def test_start_task_uses_plan_mode_without_bypass_by_default(self):
+        """Remote messaging must not silently grant Claude write access."""
+        from cli.session import CLISession
+
+        session = CLISession("/tmp", "http://localhost:8082/v1")
+        mock_process = AsyncMock()
+        mock_process.stdout.read.side_effect = [b""]
+        mock_process.stderr.read.return_value = b""
+        mock_process.wait.return_value = 0
+
+        with patch(
+            "asyncio.create_subprocess_exec", new_callable=AsyncMock
+        ) as mock_exec:
+            mock_exec.return_value = mock_process
+            async for _ in session.start_task("read the project"):
+                pass
+
+        args = mock_exec.call_args.args
+        assert "--permission-mode" in args
+        assert args[args.index("--permission-mode") + 1] == "plan"
+        assert "--dangerously-skip-permissions" not in args
+
+    @pytest.mark.asyncio
+    async def test_start_task_local_auth_does_not_inject_proxy_credentials(
+        self, monkeypatch
+    ):
+        from cli.session import CLISession
+
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://stale-proxy")
+        monkeypatch.setenv("ANTHROPIC_API_URL", "http://stale-proxy/v1")
+        session = CLISession("/tmp", "http://localhost:8082/v1", use_proxy=False)
+        mock_process = AsyncMock()
+        mock_process.stdout.read.side_effect = [b""]
+        mock_process.stderr.read.return_value = b""
+        mock_process.wait.return_value = 0
+
+        with patch(
+            "asyncio.create_subprocess_exec", new_callable=AsyncMock
+        ) as mock_exec:
+            mock_exec.return_value = mock_process
+            async for _ in session.start_task("read the project"):
+                pass
+
+        env = mock_exec.call_args.kwargs["env"]
+        assert "ANTHROPIC_BASE_URL" not in env
+        assert "ANTHROPIC_API_URL" not in env
+        assert env.get("ANTHROPIC_API_KEY") != "sk-placeholder-key-for-proxy"
+
+    @pytest.mark.asyncio
     async def test_start_task_with_session_resume(self):
         """Test resuming an existing session."""
         from cli.session import CLISession

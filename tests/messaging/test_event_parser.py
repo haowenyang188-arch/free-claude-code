@@ -31,6 +31,52 @@ def test_parse_cli_event_assistant_tools():
     assert results[0]["input"] == {"path": "."}
 
 
+def test_parse_cli_event_normalizes_codex_file_and_terminal_records():
+    file_results = parse_cli_event(
+        {"type": "file_change", "item": {"path": "src/app.py", "kind": "modified"}}
+    )
+    terminal_results = parse_cli_event(
+        {"type": "terminal", "output": "pytest passed", "exit_code": 0}
+    )
+
+    assert file_results == [
+        {
+            "type": "tool_use",
+            "id": "src/app.py",
+            "name": "file_change",
+            "input": {"path": "src/app.py", "kind": "modified"},
+        }
+    ]
+    assert terminal_results == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "terminal",
+            "content": "pytest passed",
+            "is_error": False,
+        }
+    ]
+
+
+def test_parse_cli_event_exposes_write_approval_events():
+    required = parse_cli_event(
+        {
+            "type": "approval_required",
+            "diff": "--- a/file\n+++ b/file\n",
+            "changed_paths": ["file"],
+        }
+    )
+    waiting = parse_cli_event({"type": "approval_waiting", "awaiting_approval": True})
+
+    assert required == [
+        {
+            "type": "approval_required",
+            "diff": "--- a/file\n+++ b/file\n",
+            "changed_paths": ["file"],
+        }
+    ]
+    assert waiting == [{"type": "approval_waiting", "awaiting_approval": True}]
+
+
 def test_parse_cli_event_assistant_subagent():
     event = {
         "type": "assistant",

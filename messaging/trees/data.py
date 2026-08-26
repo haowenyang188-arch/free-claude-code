@@ -59,6 +59,7 @@ class MessageState(Enum):
 
     PENDING = "pending"  # Queued, waiting to be processed
     IN_PROGRESS = "in_progress"  # Currently being processed by Claude
+    WAITING_APPROVAL = "waiting_approval"  # Write diff needs operator approval
     COMPLETED = "completed"  # Processing finished successfully
     ERROR = "error"  # Processing failed
 

@@ -79,6 +79,8 @@ async def handle_stats_command(
         "📊 "
         + ctx.bold("Stats")
         + "\n"
+        + ctx.escape_text(f"• Backend: {stats.get('backend', 'claude')}")
+        + "\n"
         + ctx.escape_text(f"• Active CLI: {stats['active_sessions']}")
         + "\n"
         + ctx.escape_text(f"• Message Trees: {tree_count}"),

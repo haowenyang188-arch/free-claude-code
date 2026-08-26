@@ -24,6 +24,7 @@ from cli.codex_1m import (
     CommandResult,
     ConfigurationBlocked,
     ConfigurationOwnershipError,
+    _prepare_catalog_content,
     _runtime_path,
     configure_target,
     inspect_target,
@@ -41,6 +42,7 @@ def _catalog(max_context_window: int = 272_000) -> dict[str, Any]:
                 "context_window": max_context_window,
                 "max_context_window": max_context_window,
                 "effective_context_window_percent": 95,
+                "supports_parallel_tool_calls": True,
             },
             {
                 "slug": "gpt-5.6-terra",
@@ -175,6 +177,7 @@ def test_configure_installs_default_config_and_managed_catalog(
     terra = next(item for item in catalog["models"] if item["slug"] == "gpt-5.6-terra")
     assert model["context_window"] == DESIRED_CONTEXT_WINDOW
     assert model["max_context_window"] == DESIRED_CONTEXT_WINDOW
+    assert model["supports_parallel_tool_calls"] is False
     assert terra == _catalog()["models"][1]
     assert (target.home / CATALOG_OWNER_RELATIVE_PATH).read_text(
         "utf-8"
@@ -195,6 +198,28 @@ def test_configure_is_idempotent_for_managed_files(tmp_path: Path) -> None:
     assert (target.home / "config.toml").read_bytes() == first_config
     assert (target.home / CATALOG_RELATIVE_PATH).read_bytes() == first_catalog
     assert status.ready is True
+
+
+def test_prepare_catalog_disables_parallel_calls_on_duplicate_target_models() -> None:
+    payload = _catalog()
+    payload["models"].append(
+        {
+            "slug": MODEL_SLUG,
+            "display_name": "GPT-5.6-Sol duplicate",
+            "context_window": 272_000,
+            "max_context_window": 272_000,
+            "supports_parallel_tool_calls": True,
+        }
+    )
+
+    content = _prepare_catalog_content(CommandResult(0, json.dumps(payload), ""))
+    catalog = json.loads(content)
+
+    assert [
+        item["supports_parallel_tool_calls"]
+        for item in catalog["models"]
+        if item["slug"] == MODEL_SLUG
+    ] == [False, False]
 
 
 def test_configure_refuses_unmanaged_default_keys(tmp_path: Path) -> None:

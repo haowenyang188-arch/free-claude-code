@@ -35,6 +35,7 @@ def create_messaging_platform(
         return TelegramPlatform(
             bot_token=bot_token,
             allowed_user_id=kwargs.get("allowed_user_id"),
+            agent_backend=kwargs.get("agent_backend", "claude"),
         )
 
     if platform_type == "discord":

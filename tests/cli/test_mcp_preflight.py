@@ -4,9 +4,10 @@ import json
 import socket
 import threading
 import time
+from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 
@@ -118,12 +119,12 @@ class _McpHandler(BaseHTTPRequestHandler):
         if body_bytes:
             self.wfile.write(body_bytes)
 
-    def log_message(self, *_args: object) -> None:
+    def log_message(self, format: str, *args: Any) -> None:
         return
 
 
 @pytest.fixture
-def mcp_server() -> tuple[ThreadingHTTPServer, str]:
+def mcp_server() -> Iterator[tuple[ThreadingHTTPServer, str]]:
     _McpHandler.requests = []
     _McpHandler.mode = "ok"
     _McpHandler.protocol_version = "HTTP/1.0"

@@ -174,6 +174,103 @@ async def test_handle_message_new_conversation(
 
 
 @pytest.mark.asyncio
+async def test_approve_reply_applies_pending_codex_staged_changes(
+    handler, mock_platform, mock_cli_manager, incoming_message_factory
+):
+    root = incoming_message_factory(text="edit", message_id="root_msg")
+    tree = await handler.tree_queue.create_tree(
+        node_id="root_msg", incoming=root, status_message_id="status_root"
+    )
+    handler.tree_queue.register_node("status_root", tree.root_id)
+
+    class PendingSession:
+        current_session_id = "thread-1"
+
+        async def approve(self):
+            return {"changed_paths": ["src/app.py"]}
+
+        def reject(self):
+            raise AssertionError("reject must not be called")
+
+    session = PendingSession()
+    handler._pending_approvals["root_msg"] = (root, session)
+    incoming = incoming_message_factory(
+        text="/approve", message_id="approve_msg", reply_to_message_id="status_root"
+    )
+
+    await handler.handle_message(incoming)
+
+    assert tree.get_node("root_msg").state == MessageState.COMPLETED
+    assert "root_msg" not in handler._pending_approvals
+    mock_cli_manager = handler.cli_manager
+    mock_cli_manager.remove_session.assert_awaited_once_with("thread-1")
+
+
+@pytest.mark.asyncio
+async def test_reject_without_pending_approval_is_safe(
+    handler, mock_platform, incoming_message_factory
+):
+    incoming = incoming_message_factory(text="/reject")
+
+    await handler.handle_message(incoming)
+
+    mock_platform.queue_send_message.assert_called_once()
+    assert "No pending approval" in mock_platform.queue_send_message.call_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_reply_is_blocked_while_parent_waits_for_approval(
+    handler, mock_platform, incoming_message_factory
+):
+    root = incoming_message_factory(text="edit", message_id="root_msg")
+    tree = await handler.tree_queue.create_tree(
+        node_id="root_msg", incoming=root, status_message_id="status_root"
+    )
+    handler.tree_queue.register_node("status_root", tree.root_id)
+    await tree.update_state("root_msg", MessageState.WAITING_APPROVAL)
+
+    incoming = incoming_message_factory(
+        text="continue", message_id="child_msg", reply_to_message_id="root_msg"
+    )
+    await handler.handle_message(incoming)
+
+    assert tree.get_node("child_msg") is None
+    assert "Approval pending" in mock_platform.queue_send_message.call_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_approval_reply_from_another_user_is_denied(
+    handler, mock_platform, incoming_message_factory
+):
+    root = incoming_message_factory(text="edit", message_id="root_msg", user_id="owner")
+    tree = await handler.tree_queue.create_tree(
+        node_id="root_msg", incoming=root, status_message_id="status_root"
+    )
+    handler.tree_queue.register_node("status_root", tree.root_id)
+
+    class PendingSession:
+        current_session_id = "thread-1"
+
+        async def approve(self):
+            raise AssertionError("approval must not be invoked")
+
+        def reject(self):
+            raise AssertionError("rejection must not be invoked")
+
+    handler._pending_approvals["root_msg"] = (root, PendingSession())
+    incoming = incoming_message_factory(
+        text="/approve",
+        user_id="other-user",
+        message_id="approve_msg",
+        reply_to_message_id="status_root",
+    )
+
+    await handler.handle_message(incoming)
+
+    assert "Approval denied" in mock_platform.queue_send_message.call_args.args[1]
+
+
+@pytest.mark.asyncio
 async def test_handle_message_queued(handler, mock_platform, incoming_message_factory):
     incoming = incoming_message_factory(text="hello", message_id="msg_1")
     mock_platform.queue_send_message.return_value = "status_123"
