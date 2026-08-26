@@ -175,24 +175,38 @@ async def lifespan(app: FastAPI):
                 os.path.join(settings.claude_workspace, "plans")
             )
             plans_directory = os.path.relpath(plans_dir_abs, workspace)
-            approval_scope = ApprovalScope(settings.cli_auto_approval_scope)
+            approval_scope = ApprovalScope(
+                getattr(settings, "cli_auto_approval_scope", "once")
+            )
+            approval_commands_value = getattr(
+                settings, "cli_auto_approval_commands", ""
+            )
+            if not isinstance(approval_commands_value, str):
+                approval_commands_value = ""
             approval_commands = [
                 value.strip()
-                for value in settings.cli_auto_approval_commands.split(",")
+                for value in approval_commands_value.split(",")
                 if value.strip()
             ]
+            approval_workspaces_value = getattr(
+                settings, "cli_auto_approval_workspaces", ""
+            )
+            if not isinstance(approval_workspaces_value, str):
+                approval_workspaces_value = ""
             approval_workspaces = [
                 value.strip()
-                for value in settings.cli_auto_approval_workspaces.split(",")
+                for value in approval_workspaces_value.split(",")
                 if value.strip()
             ] or [workspace]
             approval_policy = ApprovalPolicy(
-                enabled=settings.cli_auto_approval_enabled,
+                enabled=getattr(settings, "cli_auto_approval_enabled", False),
                 allowed_command_prefixes=approval_commands
                 or DEFAULT_SAFE_COMMAND_PREFIXES,
                 allowed_workspaces=approval_workspaces,
                 max_auto_scope=approval_scope,
-                allow_permanent=settings.cli_auto_approval_allow_permanent,
+                allow_permanent=getattr(
+                    settings, "cli_auto_approval_allow_permanent", False
+                ),
             )
             cli_manager = CLISessionManager(
                 workspace_path=workspace,
