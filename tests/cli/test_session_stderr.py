@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 
 @pytest.mark.asyncio
-async def test_successful_stderr_is_not_written_to_debug_logs() -> None:
+async def test_successful_stderr_is_discarded_and_not_exposed() -> None:
     from cli.session import CLISession
 
     session = CLISession("/tmp", "http://localhost:8082/v1")
@@ -25,8 +26,13 @@ async def test_successful_stderr_is_not_written_to_debug_logs() -> None:
     assert events[-1] == {
         "type": "exit",
         "code": 0,
-        "stderr": "provider detail that must stay private",
+        "stderr": None,
     }
+    spawn.assert_awaited_once()
+    call = spawn.await_args
+    assert call is not None
+    assert call.kwargs["stderr"] is asyncio.subprocess.DEVNULL
+    process.stderr.read.assert_not_awaited()
     logged = " ".join(
         " ".join(str(value) for value in call.args) for call in debug_log.call_args_list
     )
@@ -34,7 +40,7 @@ async def test_successful_stderr_is_not_written_to_debug_logs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_stderr_is_not_written_to_error_logs() -> None:
+async def test_failed_stderr_is_replaced_with_stable_error() -> None:
     from cli.session import CLISession
 
     session = CLISession("/tmp", "http://localhost:8082/v1")
@@ -52,9 +58,41 @@ async def test_failed_stderr_is_not_written_to_error_logs() -> None:
 
     assert events[0] == {
         "type": "error",
-        "error": {"message": "provider secret detail"},
+        "error": {"message": "Claude CLI exited with code 1"},
     }
+    assert events[1] == {"type": "exit", "code": 1, "stderr": None}
+    call = spawn.await_args
+    assert call is not None
+    assert call.kwargs["stderr"] is asyncio.subprocess.DEVNULL
+    process.stderr.read.assert_not_awaited()
     logged = " ".join(
         " ".join(str(value) for value in call.args) for call in error_log.call_args_list
     )
     assert "provider secret detail" not in logged
+
+
+@pytest.mark.asyncio
+async def test_large_stderr_does_not_block_session(tmp_path) -> None:
+    from cli.session import CLISession
+
+    script = tmp_path / "fake-claude"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "sys.stderr.write('x' * (1024 * 1024))\n"
+        "sys.stderr.flush()\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    session = CLISession(
+        str(tmp_path),
+        "http://localhost:8082/v1",
+        claude_bin=str(script),
+        use_proxy=False,
+    )
+
+    async def collect_events() -> list[dict]:
+        return [event async for event in session.start_task("probe")]
+
+    events = await asyncio.wait_for(collect_events(), timeout=2)
+    assert events[-1] == {"type": "exit", "code": 0, "stderr": None}

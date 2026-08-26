@@ -7,12 +7,16 @@ simultaneously in separate CLI processes.
 """
 
 import asyncio
+import hashlib
+import json
 import uuid
+from pathlib import Path
 
 from loguru import logger
 
+from .checkpoint import CheckpointManifest, CheckpointStore
 from .codex_session import CodexSession
-from .runtime_registry import RuntimeRegistry
+from .runtime_registry import RuntimeBackend, RuntimeRegistry
 from .session import CLISession
 
 SessionBackend = CLISession | CodexSession
@@ -202,10 +206,104 @@ class CLISessionManager:
     async def runtime_status(self, *, force: bool = False) -> dict:
         """Return a user-safe readiness report for the selected CLI backend."""
         probe = await self.runtime_registry.probe(self.agent_backend, force=force)
+        safe_profile = await self.runtime_registry.probe_safe_profile(
+            self.agent_backend, force=force
+        )
         return {
             "backend": self.agent_backend,
             "runtime": probe.to_mapping(),
+            "isolation_mode": self.isolation_mode,
+            "safe_profile": safe_profile.to_mapping(),
         }
+
+    async def build_checkpoint(
+        self,
+        session_id: str,
+        *,
+        run_id: str,
+        step_id: str,
+        input_digest: str,
+    ) -> CheckpointManifest:
+        """Build a fail-closed checkpoint for one completed safe CLI turn.
+
+        This does not resume anything.  Consumers must explicitly validate the
+        resulting manifest before using its session ID in a later turn.
+        """
+        _require_sha256(input_digest, "input_digest")
+        if not self._checkpoint_policy_is_safe():
+            raise RuntimeError("checkpointing requires a safe read-only policy")
+
+        async with self._lock:
+            resolved_id = self._temp_to_real.get(session_id, session_id)
+            session = self._sessions.get(resolved_id) or self._pending_sessions.get(
+                resolved_id
+            )
+            if session is None:
+                raise RuntimeError("checkpoint session is not managed")
+            if session.is_busy:
+                raise RuntimeError("cannot checkpoint an active session")
+            runtime_session_id = getattr(session, "current_session_id", None)
+            generation = getattr(session, "generation", None)
+
+        if not isinstance(runtime_session_id, str) or not runtime_session_id.strip():
+            raise RuntimeError("checkpoint session has no runtime session ID")
+        if not isinstance(generation, str) or not generation.strip():
+            raise RuntimeError("checkpoint session has no runtime generation")
+
+        backend = RuntimeBackend(self.agent_backend)
+        probe = await self.runtime_registry.probe(backend)
+        if not probe.available or not probe.version:
+            raise RuntimeError("checkpoint runtime is not ready with a version")
+
+        return CheckpointManifest(
+            checkpoint_id=str(uuid.uuid4()),
+            run_id=run_id,
+            backend=backend,
+            runtime_version=probe.version,
+            session_id=runtime_session_id,
+            generation=generation,
+            workspace_digest=_workspace_digest(self.workspace),
+            policy_digest=_policy_digest(
+                backend=self.agent_backend,
+                isolation_mode=self.isolation_mode,
+                agent_permission_mode=self.agent_permission_mode,
+                claude_auth_mode=self.claude_auth_mode,
+                codex_sandbox=self.codex_sandbox,
+                codex_approval_required=self.codex_approval_required,
+                preflight_runtime=self.preflight_runtime,
+                allowed_dirs=self.allowed_dirs,
+            ),
+            step_id=step_id,
+            input_digest=input_digest,
+        )
+
+    async def write_checkpoint(
+        self,
+        store: CheckpointStore,
+        session_id: str,
+        *,
+        run_id: str,
+        step_id: str,
+        input_digest: str,
+    ) -> CheckpointManifest:
+        """Persist an explicitly requested safe checkpoint atomically."""
+        if not isinstance(store, CheckpointStore):
+            raise TypeError("store must be a CheckpointStore")
+        manifest = await self.build_checkpoint(
+            session_id,
+            run_id=run_id,
+            step_id=step_id,
+            input_digest=input_digest,
+        )
+        await asyncio.to_thread(store.save, manifest)
+        return manifest
+
+    def _checkpoint_policy_is_safe(self) -> bool:
+        if self.isolation_mode != "safe":
+            return False
+        if self.agent_backend == RuntimeBackend.CODEX:
+            return self.codex_sandbox == "read-only"
+        return self.agent_permission_mode == "plan"
 
     def get_stats(self) -> dict:
         """Get session statistics."""
@@ -215,3 +313,28 @@ class CLISessionManager:
             "pending_sessions": len(self._pending_sessions),
             "busy_count": sum(1 for s in self._sessions.values() if s.is_busy),
         }
+
+
+def _workspace_digest(workspace: str) -> str:
+    normalized = str(Path(workspace).expanduser().resolve(strict=False))
+    return _sha256(normalized)
+
+
+def _policy_digest(**policy: object) -> str:
+    encoded = json.dumps(
+        policy, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    return _sha256(encoded)
+
+
+def _require_sha256(value: str, field: str) -> None:
+    if not isinstance(value, str) or len(value) != 64:
+        raise ValueError(f"{field} must be a SHA-256 hex digest")
+    try:
+        int(value, 16)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a SHA-256 hex digest") from exc
+
+
+def _sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()

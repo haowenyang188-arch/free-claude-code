@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import subprocess
-from pathlib import Path
+import os
+import tempfile
+import uuid
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
+from cli.process_registry import register_process, unregister_process
+from cli.runtime_environment import build_cli_environment
+from cli.runtime_registry import RuntimeBackend
 from workbench.backend.domain.models import Artifact, ArtifactType, RuntimeKind
-from workbench.backend.workflow.runners import RuntimeAdapter, RunnerError
+from workbench.backend.workflow.runners import RunnerError, RuntimeAdapter
 
 if TYPE_CHECKING:
     from workbench.backend.domain.models import (
@@ -22,9 +26,19 @@ if TYPE_CHECKING:
 class ClaudeCodeAdapter(RuntimeAdapter):
     """Executes tasks by invoking Claude Code CLI."""
 
-    def __init__(self, artifact_store: Any = None) -> None:
+    def __init__(
+        self,
+        artifact_store: Any = None,
+        *,
+        claude_bin: str = "claude",
+        isolation_mode: str = "safe",
+    ) -> None:
         """Initialize adapter with optional artifact store for loading upstream artifacts."""
+        if isolation_mode not in {"safe", "inherit"}:
+            raise ValueError("isolation_mode must be 'safe' or 'inherit'")
         self._artifact_store = artifact_store
+        self._claude_bin = claude_bin
+        self._isolation_mode = isolation_mode
 
     def supports(self, runtime_kind: RuntimeKind) -> bool:
         """Return True for CLAUDE_CODE runtime."""
@@ -145,45 +159,63 @@ class ClaudeCodeAdapter(RuntimeAdapter):
         Raises:
             RunnerError: If Claude Code execution fails
         """
-        import tempfile
-
-        # Write prompt to temporary file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as f:
             f.write(prompt)
             prompt_file = f.name
 
         try:
-            # Build command: claude <prompt_file> --print (non-interactive mode)
-            cmd = ['claude', '--print', prompt_file]
+            cmd = [self._claude_bin, "--print"]
+            if self._isolation_mode == "safe":
+                cmd.extend(
+                    [
+                        "--safe-mode",
+                        "--strict-mcp-config",
+                        "--permission-mode",
+                        "plan",
+                    ]
+                )
+            cmd.append(prompt_file)
+            generation = uuid.uuid4().hex
 
-            # Execute Claude Code CLI with optional cwd
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,  # Set working directory via subprocess, not CLI flag
+                # Provider diagnostics may contain credentials or account
+                # details and are not part of the workflow artifact contract.
+                # Discard them at the process boundary so they cannot leak or
+                # accumulate in an unbounded pipe.
+                stderr=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.DEVNULL,
+                cwd=cwd,
+                env=build_cli_environment(RuntimeBackend.CLAUDE),
             )
+            pid = getattr(process, "pid", None)
+            if isinstance(pid, int) and pid > 0:
+                register_process(pid, generation=generation)
 
-            # Wait for completion with timeout (5 minutes)
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=300.0
+                stdout, _stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=300.0
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError as exc:
                 process.kill()
                 await process.wait()
-                raise RunnerError("Claude Code execution timeout after 5 minutes")
-
-            # Check exit code
-            if process.returncode != 0:
-                error_msg = stderr.decode('utf-8') if stderr else "Unknown error"
                 raise RunnerError(
-                    f"Claude Code exited with code {process.returncode}: {error_msg}"
-                )
+                    "Claude Code execution timeout after 5 minutes"
+                ) from exc
+            finally:
+                if isinstance(pid, int) and pid > 0:
+                    unregister_process(pid, generation=generation)
 
-            # Parse response
-            response = stdout.decode('utf-8').strip()
+            if process.returncode != 0:
+                # Stderr can include provider and credential diagnostics.  The
+                # detailed data stays local to the CLI process; the workflow
+                # boundary exposes only a stable failure class.
+                raise RunnerError(f"Claude Code exited with code {process.returncode}")
+
+            response = stdout.decode("utf-8").strip()
 
             if not response:
                 raise RunnerError("Claude Code returned empty response")
@@ -191,9 +223,5 @@ class ClaudeCodeAdapter(RuntimeAdapter):
             return response
 
         finally:
-            # Clean up temporary prompt file
-            import os
-            try:
+            with suppress(OSError):
                 os.unlink(prompt_file)
-            except Exception:
-                pass  # Best effort cleanup

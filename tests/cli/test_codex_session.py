@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -46,9 +47,9 @@ class TestCodexSession:
     def test_inherit_isolation_omits_safe_profile_flags(self) -> None:
         from cli.codex_session import CodexSession
 
-        command = CodexSession(
-            "/tmp/project", isolation_mode="inherit"
-        ).build_command("inspect")
+        command = CodexSession("/tmp/project", isolation_mode="inherit").build_command(
+            "inspect"
+        )
 
         assert "--ignore-user-config" not in command
         assert "--ignore-rules" not in command
@@ -79,8 +80,10 @@ class TestCodexSession:
         assert events[-1] == {"type": "exit", "code": 0, "stderr": None}
         assert session.current_session_id == "thread-1"
         spawn.assert_awaited_once()
-        assert spawn.await_args.args[0:3] == ("codex", "exec", "--json")
-        assert spawn.await_args.kwargs.get("shell", False) is False
+        call = spawn.await_args
+        assert call is not None
+        assert call.args[0:3] == ("codex", "exec", "--json")
+        assert call.kwargs.get("shell", False) is False
 
     @pytest.mark.asyncio
     async def test_generation_rotates_for_each_started_process(self) -> None:
@@ -136,7 +139,9 @@ class TestCodexSession:
         assert events == [
             {
                 "type": "error",
-                "error": {"message": "Codex CLI preflight failed: version_command_failed"},
+                "error": {
+                    "message": "Codex CLI preflight failed: version_command_failed"
+                },
             },
             {"type": "exit", "code": 127, "stderr": "version_command_failed"},
         ]
@@ -165,13 +170,15 @@ class TestCodexSession:
             spawn.return_value = process
             [event async for event in session.start_task("inspect")]
 
-        child_env = spawn.await_args.kwargs["env"]
+        call = spawn.await_args
+        assert call is not None
+        child_env = call.kwargs["env"]
         assert "OPENAI_API_KEY" not in child_env
         assert "HTTP_PROXY" not in child_env
         assert child_env["TERM"] == "dumb"
 
     @pytest.mark.asyncio
-    async def test_successful_exit_with_stderr_does_not_emit_error(self) -> None:
+    async def test_successful_exit_discards_stderr(self) -> None:
         from cli.codex_session import CodexSession
 
         process = MagicMock()
@@ -194,13 +201,20 @@ class TestCodexSession:
         assert events[-1] == {
             "type": "exit",
             "code": 0,
-            "stderr": "warning: informational",
+            "stderr": None,
         }
-        logged = " ".join(str(value) for value in debug_log.call_args.args)
+        call = spawn.await_args
+        assert call is not None
+        assert call.kwargs["stderr"] is asyncio.subprocess.DEVNULL
+        process.stderr.read.assert_not_awaited()
+        logged = " ".join(
+            " ".join(str(value) for value in call.args)
+            for call in debug_log.call_args_list
+        )
         assert "warning: informational" not in logged
 
     @pytest.mark.asyncio
-    async def test_failed_exit_with_non_benign_stderr_emits_one_error(self) -> None:
+    async def test_failed_exit_hides_provider_stderr(self) -> None:
         from cli.codex_session import CodexSession
 
         process = MagicMock()
@@ -219,8 +233,35 @@ class TestCodexSession:
             events = [event async for event in session.start_task("inspect")]
 
         errors = [event for event in events if event["type"] == "error"]
-        assert errors == [{"type": "error", "error": {"message": "fatal: failed"}}]
-        assert events[-1] == {"type": "exit", "code": 1, "stderr": "fatal: failed"}
+        assert errors == [
+            {"type": "error", "error": {"message": "Codex CLI exited with code 1"}}
+        ]
+        assert events[-1] == {"type": "exit", "code": 1, "stderr": None}
+        call = spawn.await_args
+        assert call is not None
+        assert call.kwargs["stderr"] is asyncio.subprocess.DEVNULL
+        process.stderr.read.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_large_stderr_does_not_block_session(self, tmp_path) -> None:
+        from cli.codex_session import CodexSession
+
+        script = tmp_path / "fake-codex"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stderr.write('x' * (1024 * 1024))\n"
+            "sys.stderr.flush()\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        session = CodexSession(str(tmp_path), codex_bin=str(script))
+
+        async def collect_events() -> list[dict]:
+            return [event async for event in session.start_task("probe")]
+
+        events = await asyncio.wait_for(collect_events(), timeout=2)
+        assert events[-1] == {"type": "exit", "code": 0, "stderr": None}
 
     @pytest.mark.asyncio
     async def test_cancel_terminates_running_process(self) -> None:

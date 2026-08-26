@@ -162,7 +162,10 @@ class CodexAdapter(BaseAgentAdapter):
                         else:
                             await self.emit_event(
                                 EventType.RUN_FAILED,
-                                {"error": stderr or f"Process exited with code {exit_code}"},
+                                {
+                                    "error": stderr
+                                    or f"Process exited with code {exit_code}"
+                                },
                                 run_id=run_id,
                             )
                     # Keep draining the one-shot JSONL generator so its
@@ -280,3 +283,11 @@ class CodexAdapter(BaseAgentAdapter):
             "workspace": self.workspace_path,
             "is_busy": self.session.is_busy if self.session else False,
         }
+
+    async def cleanup(self) -> None:
+        """Close the shared session before resetting adapter lifecycle state."""
+        if self.session is not None:
+            await self.session.stop()
+            self.session.reject()
+            self.session = None
+        await super().cleanup()

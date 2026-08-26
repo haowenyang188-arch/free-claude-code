@@ -87,7 +87,9 @@ class CodexSession:
 
         command.append("--json")
         if self.isolation_mode == "safe":
-            command.extend(["--ignore-user-config", "--ignore-rules", "--strict-config"])
+            command.extend(
+                ["--ignore-user-config", "--ignore-rules", "--strict-config"]
+            )
         if self.model:
             command.extend(["--model", self.model])
         command.append("--skip-git-repo-check")
@@ -119,6 +121,21 @@ class CodexSession:
                     }
                     yield {"type": "exit", "code": 127, "stderr": reason}
                     return
+                if self.isolation_mode == "safe":
+                    profile = await self.runtime_registry.probe_safe_profile(
+                        RuntimeBackend.CODEX
+                    )
+                    if not profile.available:
+                        reason = profile.reason or "safe_profile_unavailable"
+                        yield {
+                            "type": "error",
+                            "error": {
+                                "message": "Codex CLI safe profile preflight failed: "
+                                f"{reason}"
+                            },
+                        }
+                        yield {"type": "exit", "code": 127, "stderr": reason}
+                        return
 
             command = self.build_command(
                 prompt, session_id=session_id, fork_session=fork_session
@@ -150,7 +167,7 @@ class CodexSession:
                     *command,
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
                     cwd=execution_workspace,
                     env=env,
                 )
@@ -167,45 +184,16 @@ class CodexSession:
                         self.current_session_id = event.get("session_id")
                     yield event
 
-                stderr_text = ""
-                if self.process.stderr:
-                    stderr_bytes = await self.process.stderr.read()
-                    stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-
                 return_code = await self.process.wait()
-                logger.info(
-                    f"Codex CLI exited with code {return_code}, stderr_present={bool(stderr_text)}"
-                )
-
-                if stderr_text:
-                    # Filter out benign Codex CLI informational messages
-                    is_benign = any(
-                        msg in stderr_text
-                        for msg in [
-                            "Reading additional input from stdin",
-                            "Waiting for input",
-                        ]
-                    )
-                    if is_benign:
-                        logger.debug(
-                            "Codex CLI informational message: {} bytes",
-                            len(stderr_bytes),
-                        )
-                    elif return_code != 0:
-                        # Do not put command arguments or credentials in logs.
-                        logger.warning(
-                            "Codex CLI returned stderr ({} bytes)", len(stderr_bytes)
-                        )
-                        yield {"type": "error", "error": {"message": stderr_text}}
-                    else:
-                        logger.debug(
-                            "Codex CLI stderr captured on successful exit ({} bytes)",
-                            len(stderr_bytes),
-                        )
-                elif return_code != 0:
-                    logger.warning(
-                        f"CODEX_SESSION: Process exited with code {return_code} but no stderr captured"
-                    )
+                logger.info("Codex CLI exited with code {}", return_code)
+                if return_code != 0:
+                    logger.warning("Codex CLI failed with exit code {}", return_code)
+                    yield {
+                        "type": "error",
+                        "error": {
+                            "message": f"Codex CLI exited with code {return_code}"
+                        },
+                    }
 
                 if self._staged_workspace is not None:
                     changes = self._staged_workspace.changes()
@@ -229,7 +217,7 @@ class CodexSession:
                 yield {
                     "type": "exit",
                     "code": return_code,
-                    "stderr": stderr_text or None,
+                    "stderr": None,
                 }
             except asyncio.CancelledError:
                 await asyncio.shield(self.stop())

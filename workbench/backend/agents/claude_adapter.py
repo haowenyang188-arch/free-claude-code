@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import Any
+
+from cli.process_registry import register_process, unregister_process
+from cli.runtime_environment import build_cli_environment
+from cli.runtime_registry import RuntimeBackend, RuntimeRegistry
 
 if __package__:
     from ..models import AgentStatus, AgentType, EventType
@@ -17,20 +22,14 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
         super().__init__(agent_id, AgentType.CLAUDE_CODE)
         self.cli_path = "claude"
         self.workspace_path: str = ""
+        self.generation: str | None = None
+        self.runtime_registry = RuntimeRegistry(
+            executables={RuntimeBackend.CLAUDE: self.cli_path}
+        )
 
     async def check_availability(self) -> bool:
-        """检查Claude Code CLI是否可用"""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                self.cli_path,
-                "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            return proc.returncode == 0 and b"Claude Code" in stdout
-        except Exception:
-            return False
+        """Return bounded, cached local Claude Code readiness."""
+        return (await self.runtime_registry.probe(RuntimeBackend.CLAUDE)).available
 
     async def start_task(
         self, run_id: str, task_description: str, workspace_path: str
@@ -52,19 +51,26 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
                 },
             )
 
-            # 启动Claude Code进程
-            # 注意: 实际命令需要根据Claude Code CLI的实际接口调整
+            generation = uuid.uuid4().hex
+            self.generation = generation
             self.process = await asyncio.create_subprocess_exec(
                 self.cli_path,
                 "--print",
                 "--output-format",
                 "text",
+                "--safe-mode",
+                "--strict-mcp-config",
+                "--permission-mode",
+                "plan",
                 task_description,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+                stderr=asyncio.subprocess.DEVNULL,
                 stdin=asyncio.subprocess.DEVNULL,
                 cwd=workspace_path,
+                env=build_cli_environment(RuntimeBackend.CLAUDE),
             )
+            if self.process.pid:
+                register_process(self.process.pid, generation=generation)
 
             # 启动输出监听任务
             self.monitor_task = asyncio.create_task(self._monitor_output())
@@ -84,6 +90,7 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
         """监听Claude Code输出"""
         process = self.process
         run_id = self.current_run_id
+        generation = self.generation
         if not process or not process.stdout:
             return
 
@@ -101,7 +108,8 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
 
                     await self.emit_event(EventType.AGENT_MESSAGE, {"message": text})
 
-            # 进程结束
+            # Provider stderr is deliberately discarded: this adapter exposes
+            # a stable exit code, not raw authentication diagnostics.
             returncode = await process.wait()
             if not self._terminal_event_emitted:
                 if self._cancel_requested:
@@ -134,6 +142,9 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
             self.status = AgentStatus.ERROR
             self.current_run_id = None
             self.process = None
+        finally:
+            if process and process.pid and generation is not None:
+                unregister_process(process.pid, generation=generation)
 
     async def _check_completion_claim(self, text: str) -> bool:
         """检测是否为完成声明"""
@@ -207,6 +218,7 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
             try:
                 process = self.process
                 run_id = self.current_run_id
+                generation = self.generation
                 self._cancel_requested = True
                 process.terminate()
                 await asyncio.wait_for(process.wait(), timeout=5.0)
@@ -219,6 +231,8 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
                     )
                 self.current_run_id = None
                 self.process = None
+                if process.pid and generation is not None:
+                    unregister_process(process.pid, generation=generation)
                 return True
             except TimeoutError:
                 process.kill()
@@ -232,6 +246,8 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
                 self.status = AgentStatus.ONLINE
                 self.current_run_id = None
                 self.process = None
+                if process.pid and generation is not None:
+                    unregister_process(process.pid, generation=generation)
                 return True
             except Exception:
                 return False
@@ -244,7 +260,16 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
             "type": self.agent_type.value,
             "status": self.status.value,
             "current_run_id": self.current_run_id,
+            "generation": self.generation,
             "workspace": self.workspace_path,
             "process_running": self.process is not None
             and self.process.returncode is None,
         }
+
+    async def cleanup(self) -> None:
+        """Release the exact process lease after base cleanup stops the child."""
+        process = self.process
+        generation = self.generation
+        await super().cleanup()
+        if process and process.pid and generation is not None:
+            unregister_process(process.pid, generation=generation)

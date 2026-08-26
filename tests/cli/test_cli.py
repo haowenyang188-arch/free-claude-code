@@ -278,7 +278,9 @@ class TestCLISession:
         async def runner(_argv, _timeout):
             return 1, b"", b"hidden diagnostic"
 
-        monkeypatch.setattr("cli.runtime_registry.shutil.which", lambda _: "/bin/claude")
+        monkeypatch.setattr(
+            "cli.runtime_registry.shutil.which", lambda _: "/bin/claude"
+        )
         session = CLISession(
             "/tmp",
             "http://localhost:8082/v1",
@@ -294,10 +296,45 @@ class TestCLISession:
         assert events == [
             {
                 "type": "error",
-                "error": {"message": "Claude CLI preflight failed: version_command_failed"},
+                "error": {
+                    "message": "Claude CLI preflight failed: version_command_failed"
+                },
             },
             {"type": "exit", "code": 127, "stderr": "version_command_failed"},
         ]
+        spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_safe_profile_preflight_does_not_spawn_claude_when_flag_missing(
+        self, monkeypatch
+    ):
+        from cli.runtime_registry import RuntimeBackend, RuntimeRegistry
+        from cli.session import CLISession
+
+        async def runner(argv, _timeout):
+            if argv[-1] == "--version":
+                return 0, b"claude 2.1.220", b""
+            return 0, b"--safe-mode", b""
+
+        monkeypatch.setattr(
+            "cli.runtime_registry.shutil.which", lambda _: "/bin/claude"
+        )
+        session = CLISession(
+            "/tmp",
+            "http://localhost:8082/v1",
+            runtime_registry=RuntimeRegistry(
+                executables={RuntimeBackend.CLAUDE: "claude"}, runner=runner
+            ),
+            preflight_runtime=True,
+        )
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
+            events = [event async for event in session.start_task("Hello")]
+
+        assert events[-1] == {
+            "type": "exit",
+            "code": 127,
+            "stderr": "required_flags_missing",
+        }
         spawn.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -432,8 +469,8 @@ class TestCLISession:
             assert "--fork-session" in args
 
     @pytest.mark.asyncio
-    async def test_start_task_process_failure_with_stderr(self):
-        """Test process exit with error code and stderr output."""
+    async def test_start_task_process_failure_hides_stderr(self):
+        """Test process failure exposes only a stable exit category."""
         from cli.session import CLISession
 
         session = CLISession("/tmp", "http://localhost:8082/v1")
@@ -450,14 +487,15 @@ class TestCLISession:
 
             events = [e async for e in session.start_task("Hello")]
 
-            # Should have error event from stderr, then exit event
+            # Provider stderr must not cross the session boundary.
             assert len(events) == 2
             assert events[0]["type"] == "error"
-            assert events[0]["error"]["message"] == "Fatal error"
+            assert events[0]["error"]["message"] == "Claude CLI exited with code 1"
 
             assert events[1]["type"] == "exit"
             assert events[1]["code"] == 1
-            assert events[1]["stderr"] == "Fatal error"
+            assert events[1]["stderr"] is None
+            mock_process.stderr.read.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_stop_session(self):

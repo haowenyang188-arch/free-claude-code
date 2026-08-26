@@ -8,7 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, cast
 
 import uvicorn
 from fastapi import (
@@ -73,6 +73,10 @@ else:  # Support ``python workbench/backend/main.py`` as a local entry point.
         WorkspacePolicy,
         WorkspacePolicyError,
     )
+
+
+class _SessionAwareAdapter(Protocol):
+    session_id: str | None
 
 
 class WorkbenchService:
@@ -263,13 +267,17 @@ class WorkbenchService:
         """处理Agent事件"""
         # 从 adapter 获取 session_id
         session_id = self._session_id_for_run(event.run_id)
+        runtime_kind, agent_profile_id, generation = self._provenance_for_run(
+            event.run_id
+        )
 
         # 如果事件中包含 session_id，提取并持久化
         if event.run_id in self.runs:
             run = self.runs[event.run_id]
             adapter = self.agents.get(run.agent_id)
-            if adapter and hasattr(adapter, 'session_id') and adapter.session_id:
-                session_id = adapter.session_id
+            adapter_session_id = getattr(adapter, "session_id", None)
+            if isinstance(adapter_session_id, str) and adapter_session_id:
+                session_id = adapter_session_id
                 run.metadata["session_id"] = session_id
 
         envelope = await asyncio.to_thread(
@@ -279,6 +287,9 @@ class WorkbenchService:
             payload=event.data,
             backend=self._backend_for_event(event),
             session_id=session_id,
+            runtime_kind=runtime_kind,
+            agent_profile_id=agent_profile_id,
+            generation=generation,
         )
         event.data = dict(envelope.payload)
         message = event.data.get("message")
@@ -341,6 +352,26 @@ class WorkbenchService:
         session_id = run.metadata.get("session_id") if run else None
         return session_id if isinstance(session_id, str) and session_id else None
 
+    def _provenance_for_run(
+        self, run_id: str
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return stable runtime identity without relying on event payload data."""
+        run = self.runs.get(run_id)
+        if run is None:
+            return None, None, None
+        adapter = self.agents.get(run.agent_id)
+        if adapter is None:
+            return None, run.agent_id, None
+        generation = getattr(adapter, "generation", None)
+        if not isinstance(generation, str) or not generation:
+            session = getattr(adapter, "session", None)
+            generation = getattr(session, "generation", None)
+        return (
+            adapter.agent_type.value,
+            adapter.agent_id,
+            generation if isinstance(generation, str) and generation else None,
+        )
+
     def _serialize_event(self, event: Event) -> dict[str, Any]:
         result = event.model_dump(mode="json")
         envelope = self.event_envelopes.get(event.id)
@@ -350,6 +381,9 @@ class WorkbenchService:
                     "sequence": envelope.sequence,
                     "backend": envelope.backend,
                     "session_id": envelope.session_id,
+                    "runtime_kind": envelope.runtime_kind,
+                    "agent_profile_id": envelope.agent_profile_id,
+                    "generation": envelope.generation,
                 }
             )
         return result
@@ -368,6 +402,9 @@ class WorkbenchService:
             "sequence": envelope.sequence,
             "backend": envelope.backend,
             "session_id": envelope.session_id,
+            "runtime_kind": envelope.runtime_kind,
+            "agent_profile_id": envelope.agent_profile_id,
+            "generation": envelope.generation,
         }
 
     def replay_events(self, run_id: str, *, after: int = 0) -> list[dict[str, Any]]:
@@ -506,10 +543,14 @@ class WorkbenchService:
         adapter = self.agents[run.agent_id]
 
         # 恢复持久化的 session_id
-        if hasattr(adapter, 'session_id') and not adapter.session_id:
-            stored_session_id = run.metadata.get("session_id")
-            if stored_session_id and isinstance(stored_session_id, str):
-                adapter.session_id = stored_session_id
+        adapter_session_id = getattr(adapter, "session_id", None)
+        stored_session_id = run.metadata.get("session_id")
+        if (
+            adapter_session_id is None
+            and isinstance(stored_session_id, str)
+            and stored_session_id
+        ):
+            cast(_SessionAwareAdapter, adapter).session_id = stored_session_id
 
         last_run_id = getattr(adapter, "last_run_id", None)
         if adapter.current_run_id not in (None, request.run_id) or (

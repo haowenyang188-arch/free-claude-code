@@ -90,6 +90,21 @@ class CLISession:
                     }
                     yield {"type": "exit", "code": 127, "stderr": reason}
                     return
+                if self.isolation_mode == "safe":
+                    profile = await self.runtime_registry.probe_safe_profile(
+                        RuntimeBackend.CLAUDE
+                    )
+                    if not profile.available:
+                        reason = profile.reason or "safe_profile_unavailable"
+                        yield {
+                            "type": "error",
+                            "error": {
+                                "message": "Claude CLI safe profile preflight failed: "
+                                f"{reason}"
+                            },
+                        }
+                        yield {"type": "exit", "code": 127, "stderr": reason}
+                        return
 
             self._is_busy = True
             extra_env: dict[str, str] = {}
@@ -163,7 +178,7 @@ class CLISession:
                 self.process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
                     cwd=self.workspace,
                     env=env,
                 )
@@ -220,44 +235,21 @@ class CLISession:
                     finally:
                         raise
 
-                stderr_text = None
-                if self.process.stderr:
-                    stderr_output = await self.process.stderr.read()
-                    if stderr_output:
-                        stderr_text = stderr_output.decode(
-                            "utf-8", errors="replace"
-                        ).strip()
-
                 return_code = await self.process.wait()
-                logger.info(
-                    f"Claude CLI exited with code {return_code}, stderr_present={bool(stderr_text)}"
-                )
-
-                # Only emit stderr as error if exit code is non-zero
-                # This avoids false errors from warnings/info messages
-                if stderr_text and return_code != 0:
-                    logger.error(
-                        "Claude CLI exited with code {} and stderr ({} bytes)",
-                        return_code,
-                        len(stderr_output),
-                    )
-                    logger.info("CLI_SESSION: Yielding error event from stderr")
-                    yield {"type": "error", "error": {"message": stderr_text}}
-                elif stderr_text:
-                    # Keep successful stderr out of logs; it can contain provider details.
-                    logger.debug(
-                        "Claude CLI stderr captured on successful exit ({} bytes)",
-                        len(stderr_output),
-                    )
-                elif return_code != 0:
-                    logger.warning(
-                        f"CLI_SESSION: Process exited with code {return_code} but no stderr captured"
-                    )
+                logger.info("Claude CLI exited with code {}", return_code)
+                if return_code != 0:
+                    logger.warning("Claude CLI failed with exit code {}", return_code)
+                    yield {
+                        "type": "error",
+                        "error": {
+                            "message": f"Claude CLI exited with code {return_code}"
+                        },
+                    }
 
                 yield {
                     "type": "exit",
                     "code": return_code,
-                    "stderr": stderr_text,
+                    "stderr": None,
                 }
             finally:
                 self._is_busy = False

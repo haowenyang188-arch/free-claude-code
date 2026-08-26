@@ -59,6 +59,7 @@ class EventEnvelope:
     agent_profile_id: str | None = None
     step_id: str | None = None
     artifact_ids: list[str] | None = None
+    generation: str | None = None
 
     def to_mapping(self) -> dict[str, Any]:
         """Return a JSON-compatible mapping for APIs and persistence."""
@@ -75,6 +76,7 @@ class EventEnvelope:
             "agent_profile_id": self.agent_profile_id,
             "step_id": self.step_id,
             "artifact_ids": self.artifact_ids,
+            "generation": self.generation,
         }
 
     @classmethod
@@ -113,7 +115,13 @@ class EventEnvelope:
             if artifact_ids is not None:
                 if not isinstance(artifact_ids, list):
                     raise TypeError("artifact_ids must be a list")
-                artifact_ids = [_required_text(aid, "artifact_id") for aid in artifact_ids]
+                artifact_ids = [
+                    _required_text(aid, "artifact_id") for aid in artifact_ids
+                ]
+
+            generation = value.get("generation")
+            if generation is not None:
+                generation = _required_text(generation, "generation")
         except (KeyError, TypeError, ValueError) as exc:
             raise EventLogError("invalid event envelope") from exc
 
@@ -133,6 +141,7 @@ class EventEnvelope:
             agent_profile_id=agent_profile_id,
             step_id=step_id,
             artifact_ids=artifact_ids,
+            generation=generation,
         )
 
 
@@ -158,6 +167,7 @@ class EventLog:
         agent_profile_id: str | None = None,
         step_id: str | None = None,
         artifact_ids: list[str] | None = None,
+        generation: str | None = None,
     ) -> EventEnvelope:
         """Append one event and return its assigned sequence."""
         run_id = _required_text(run_id, "run_id")
@@ -175,6 +185,8 @@ class EventLog:
             if not isinstance(artifact_ids, list):
                 raise TypeError("artifact_ids must be a list")
             artifact_ids = [_required_text(aid, "artifact_id") for aid in artifact_ids]
+        if generation is not None:
+            generation = _required_text(generation, "generation")
         if payload is not None and not isinstance(payload, Mapping):
             raise TypeError("payload must be a mapping")
 
@@ -193,6 +205,7 @@ class EventLog:
                 agent_profile_id=agent_profile_id,
                 step_id=step_id,
                 artifact_ids=artifact_ids,
+                generation=generation,
             )
             self.path.parent.mkdir(parents=True, exist_ok=True)
             try:

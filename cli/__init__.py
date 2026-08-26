@@ -4,7 +4,12 @@ from .checkpoint import CheckpointError, CheckpointManifest, CheckpointStore
 from .codex_session import CodexSession
 from .manager import CLISessionManager
 from .runtime_environment import build_cli_environment, describe_cli_environment
-from .runtime_registry import RuntimeBackend, RuntimeProbe, RuntimeRegistry
+from .runtime_registry import (
+    RuntimeBackend,
+    RuntimeProbe,
+    RuntimeProfileProbe,
+    RuntimeRegistry,
+)
 from .session import CLISession
 
 __all__ = [
@@ -16,6 +21,7 @@ __all__ = [
     "CodexSession",
     "RuntimeBackend",
     "RuntimeProbe",
+    "RuntimeProfileProbe",
     "RuntimeRegistry",
     "build_cli_environment",
     "describe_cli_environment",

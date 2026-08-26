@@ -99,8 +99,11 @@ async def test_manager_exposes_cached_runtime_status(monkeypatch):
     from cli.runtime_registry import RuntimeBackend, RuntimeRegistry
 
     async def runner(argv, _timeout):
-        assert argv == ("codex", "--version")
-        return 0, b"codex 0.149.1", b""
+        if argv == ("codex", "--version"):
+            return 0, b"codex 0.149.1", b""
+        if argv == ("codex", "exec", "--help"):
+            return 0, b"--ignore-user-config --ignore-rules --strict-config", b""
+        raise AssertionError(f"unexpected probe argv: {argv!r}")
 
     monkeypatch.setattr("cli.runtime_registry.shutil.which", lambda _: "/bin/codex")
     manager = CLISessionManager(
@@ -118,6 +121,8 @@ async def test_manager_exposes_cached_runtime_status(monkeypatch):
     assert status["backend"] == "codex"
     assert status["runtime"]["available"] is True
     assert status["runtime"]["version"] == "0.149.1"
+    assert status["safe_profile"]["available"] is True
+    assert status["safe_profile"]["missing_flags"] == []
 
 
 @pytest.mark.asyncio

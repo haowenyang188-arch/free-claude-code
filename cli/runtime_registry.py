@@ -19,9 +19,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
-CommandRunner = Callable[
-    [Sequence[str], float], Awaitable[tuple[int, bytes, bytes]]
-]
+CommandRunner = Callable[[Sequence[str], float], Awaitable[tuple[int, bytes, bytes]]]
 
 _VERSION_RE = re.compile(r"\b\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?\b")
 
@@ -56,6 +54,26 @@ class RuntimeProbe:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeProfileProbe:
+    """Whether the installed runtime supports this project's safe profile."""
+
+    backend: RuntimeBackend
+    available: bool
+    required_flags: tuple[str, ...]
+    missing_flags: tuple[str, ...]
+    reason: str | None = None
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "backend": self.backend.value,
+            "available": self.available,
+            "required_flags": list(self.required_flags),
+            "missing_flags": list(self.missing_flags),
+            "reason": self.reason,
+        }
+
+
 _CAPABILITIES: Mapping[RuntimeBackend, tuple[str, ...]] = {
     RuntimeBackend.CLAUDE: (
         "stream_json",
@@ -71,6 +89,10 @@ _CAPABILITIES: Mapping[RuntimeBackend, tuple[str, ...]] = {
         "sandbox",
         "staged_approval",
     ),
+}
+_SAFE_PROFILE_FLAGS: Mapping[RuntimeBackend, tuple[str, ...]] = {
+    RuntimeBackend.CLAUDE: ("--safe-mode", "--strict-mcp-config"),
+    RuntimeBackend.CODEX: ("--ignore-user-config", "--ignore-rules", "--strict-config"),
 }
 
 
@@ -114,7 +136,11 @@ class RuntimeRegistry:
         self.cache_ttl_seconds = float(cache_ttl_seconds)
         self._runner = runner or _run_command
         self._cache: dict[RuntimeBackend, tuple[float, RuntimeProbe]] = {}
+        self._profile_cache: dict[
+            RuntimeBackend, tuple[float, RuntimeProfileProbe]
+        ] = {}
         self._locks = {backend: asyncio.Lock() for backend in RuntimeBackend}
+        self._profile_locks = {backend: asyncio.Lock() for backend in RuntimeBackend}
 
     async def probe(
         self,
@@ -155,9 +181,96 @@ class RuntimeRegistry:
         )
         return {result.backend.value: result for result in results}
 
+    async def probe_safe_profile(
+        self,
+        backend: str | RuntimeBackend,
+        *,
+        force: bool = False,
+    ) -> RuntimeProfileProbe:
+        """Check help output for every flag required by safe isolation."""
+        runtime = _coerce_backend(backend)
+        runtime_probe = await self.probe(runtime, force=force)
+        required_flags = _SAFE_PROFILE_FLAGS[runtime]
+        if not runtime_probe.available:
+            return RuntimeProfileProbe(
+                backend=runtime,
+                available=False,
+                required_flags=required_flags,
+                missing_flags=(),
+                reason=runtime_probe.reason or "runtime_unavailable",
+            )
+
+        now = monotonic()
+        cached = self._profile_cache.get(runtime)
+        if not force and cached is not None:
+            cached_at, result = cached
+            if now - cached_at <= self.cache_ttl_seconds:
+                return result
+
+        async with self._profile_locks[runtime]:
+            now = monotonic()
+            cached = self._profile_cache.get(runtime)
+            if not force and cached is not None:
+                cached_at, result = cached
+                if now - cached_at <= self.cache_ttl_seconds:
+                    return result
+
+            result = await self._probe_safe_profile_uncached(runtime)
+            self._profile_cache[runtime] = (monotonic(), result)
+            return result
+
     def clear_cache(self) -> None:
         """Forget cached probe results so the next request rechecks the host."""
         self._cache.clear()
+        self._profile_cache.clear()
+
+    async def _probe_safe_profile_uncached(
+        self, backend: RuntimeBackend
+    ) -> RuntimeProfileProbe:
+        executable = self._executables[backend]
+        required_flags = _SAFE_PROFILE_FLAGS[backend]
+        argv = (
+            (executable, "--help")
+            if backend is RuntimeBackend.CLAUDE
+            else (executable, "exec", "--help")
+        )
+        try:
+            return_code, stdout, _stderr = await asyncio.wait_for(
+                self._runner(argv, self.timeout_seconds), timeout=self.timeout_seconds
+            )
+        except TimeoutError:
+            return RuntimeProfileProbe(
+                backend=backend,
+                available=False,
+                required_flags=required_flags,
+                missing_flags=(),
+                reason="profile_probe_timeout",
+            )
+        except Exception:
+            return RuntimeProfileProbe(
+                backend=backend,
+                available=False,
+                required_flags=required_flags,
+                missing_flags=(),
+                reason="profile_probe_failed",
+            )
+        if return_code != 0:
+            return RuntimeProfileProbe(
+                backend=backend,
+                available=False,
+                required_flags=required_flags,
+                missing_flags=(),
+                reason="help_command_failed",
+            )
+        text = stdout.decode("utf-8", errors="replace")
+        missing = tuple(flag for flag in required_flags if flag not in text)
+        return RuntimeProfileProbe(
+            backend=backend,
+            available=not missing,
+            required_flags=required_flags,
+            missing_flags=missing,
+            reason=None if not missing else "required_flags_missing",
+        )
 
     async def _probe_uncached(
         self,
@@ -258,4 +371,9 @@ async def _run_command(
     return process.returncode or 0, stdout, stderr
 
 
-__all__ = ["RuntimeBackend", "RuntimeProbe", "RuntimeRegistry"]
+__all__ = [
+    "RuntimeBackend",
+    "RuntimeProbe",
+    "RuntimeProfileProbe",
+    "RuntimeRegistry",
+]

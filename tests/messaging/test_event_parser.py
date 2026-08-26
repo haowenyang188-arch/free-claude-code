@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from messaging.event_parser import parse_cli_event
 
 
@@ -180,10 +182,12 @@ def test_parse_cli_event_exit_success():
 
 def test_parse_cli_event_exit_failure():
     event = {"type": "exit", "code": 1, "stderr": "fatal error"}
-    results = parse_cli_event(event)
+    with patch("messaging.event_parser.logger.warning") as warning:
+        results = parse_cli_event(event)
     assert len(results) == 2
-    assert results[0] == {"type": "error", "message": "fatal error"}
+    assert results[0] == {"type": "error", "message": "Process exited with code 1"}
     assert results[1] == {"type": "complete", "status": "failed"}
+    assert "fatal error" not in " ".join(str(value) for value in warning.call_args.args)
 
 
 def test_parse_cli_event_invalid_input():

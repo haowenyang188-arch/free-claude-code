@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from workbench.backend.runtime.events import EventEnvelope, EventLog, EventLogError
+from workbench.backend.runtime.events import EventEnvelope, EventLog
 
 
 def test_event_envelope_includes_runtime_kind() -> None:
@@ -74,6 +74,21 @@ def test_event_envelope_includes_artifact_ids() -> None:
     assert event.artifact_ids == ["artifact-1", "artifact-2"]
 
 
+def test_event_envelope_includes_runtime_generation() -> None:
+    event = EventEnvelope(
+        id="evt-1",
+        run_id="run-1",
+        sequence=1,
+        event_type="task.started",
+        timestamp=datetime.now(UTC),
+        backend="codex",
+        payload={},
+        generation="generation-1",
+    )
+
+    assert event.generation == "generation-1"
+
+
 def test_event_envelope_optional_fields_default_to_none() -> None:
     """New fields should be optional and default to None."""
     event = EventEnvelope(
@@ -115,6 +130,7 @@ def test_event_envelope_to_mapping_includes_new_fields() -> None:
     assert mapping["agent_profile_id"] == "agent-001"
     assert mapping["step_id"] == "step-run-5"
     assert mapping["artifact_ids"] == ["artifact-1"]
+    assert mapping["generation"] is None
 
 
 def test_event_envelope_from_mapping_reconstructs_new_fields() -> None:
@@ -132,6 +148,7 @@ def test_event_envelope_from_mapping_reconstructs_new_fields() -> None:
         "agent_profile_id": "agent-002",
         "step_id": "step-run-10",
         "artifact_ids": ["artifact-2", "artifact-3"],
+        "generation": "generation-2",
     }
 
     event = EventEnvelope.from_mapping(mapping)
@@ -140,6 +157,7 @@ def test_event_envelope_from_mapping_reconstructs_new_fields() -> None:
     assert event.agent_profile_id == "agent-002"
     assert event.step_id == "step-run-10"
     assert event.artifact_ids == ["artifact-2", "artifact-3"]
+    assert event.generation == "generation-2"
 
 
 def test_event_envelope_from_mapping_handles_missing_new_fields() -> None:
@@ -160,6 +178,7 @@ def test_event_envelope_from_mapping_handles_missing_new_fields() -> None:
     assert event.agent_profile_id is None
     assert event.step_id is None
     assert event.artifact_ids is None
+    assert event.generation is None
 
 
 def test_event_log_persists_and_replays_extended_fields(tmp_path) -> None:
@@ -178,12 +197,14 @@ def test_event_log_persists_and_replays_extended_fields(tmp_path) -> None:
         agent_profile_id="agent-001",
         step_id="step-run-1",
         artifact_ids=["artifact-upstream-1"],
+        generation="generation-1",
     )
 
     assert event1.runtime_kind == "claude_code"
     assert event1.agent_profile_id == "agent-001"
     assert event1.step_id == "step-run-1"
     assert event1.artifact_ids == ["artifact-upstream-1"]
+    assert event1.generation == "generation-1"
 
     # Reload from disk
     log2 = EventLog(log_path)
@@ -194,6 +215,7 @@ def test_event_log_persists_and_replays_extended_fields(tmp_path) -> None:
     assert replayed[0].agent_profile_id == "agent-001"
     assert replayed[0].step_id == "step-run-1"
     assert replayed[0].artifact_ids == ["artifact-upstream-1"]
+    assert replayed[0].generation == "generation-1"
 
 
 def test_event_log_append_accepts_optional_extended_fields(tmp_path) -> None:

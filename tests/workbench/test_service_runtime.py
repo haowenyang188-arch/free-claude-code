@@ -173,6 +173,8 @@ async def test_event_callback_persists_redacted_legacy_compatible_event(
     assert serialized["type"] == EventType.AGENT_MESSAGE.value
     assert serialized["data"]["api_token"] == "[redacted]"
     assert serialized["sequence"] == 1
+    assert serialized["runtime_kind"] == AgentType.CLAUDE_CODE.value
+    assert serialized["agent_profile_id"] == "agent-1"
     assert EventLog(tmp_path / "events.jsonl").replay(run.id)[0].sequence == 1
 
 
@@ -342,6 +344,29 @@ async def test_claude_adapter_emits_terminal_event_before_clearing_run_id() -> N
 
 
 @pytest.mark.asyncio
+async def test_codex_adapter_cleanup_closes_shared_session() -> None:
+    adapter = CodexAdapter("agent-1")
+
+    class _Session:
+        async def stop(self) -> bool:
+            stopped.append(True)
+            return True
+
+        def reject(self) -> None:
+            rejected.append(True)
+
+    stopped: list[bool] = []
+    rejected: list[bool] = []
+    adapter.session = _Session()
+
+    await adapter.cleanup()
+
+    assert stopped == [True]
+    assert rejected == [True]
+    assert adapter.session is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("adapter_type", "module"),
     [
@@ -387,6 +412,13 @@ async def test_adapters_use_supported_noninteractive_cli_argv(
             "--output-format",
             "text",
         )
+        assert "--safe-mode" in captured["args"]
+        assert "--strict-mcp-config" in captured["args"]
+        assert (
+            captured["args"][captured["args"].index("--permission-mode") + 1] == "plan"
+        )
+        assert captured["kwargs"]["env"]["TERM"] == "dumb"
+        assert captured["kwargs"]["stderr"] is module.asyncio.subprocess.DEVNULL
     assert captured["args"][-1] == "do the task"
     assert captured["kwargs"]["cwd"] == str(tmp_path)
     assert captured["kwargs"]["stdin"] is module.asyncio.subprocess.DEVNULL

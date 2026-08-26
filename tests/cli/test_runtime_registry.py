@@ -58,7 +58,9 @@ async def test_probe_timeout_is_redacted(monkeypatch) -> None:
         await asyncio.sleep(0.05)
         return 0, b"claude 2.1.220", b"secret-token"
 
-    monkeypatch.setattr("cli.runtime_registry.shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(
+        "cli.runtime_registry.shutil.which", lambda _: "/usr/bin/claude"
+    )
     registry = RuntimeRegistry(timeout_seconds=0.001, runner=runner)
 
     result = await registry.probe("claude")
@@ -83,6 +85,51 @@ async def test_probe_all_isolates_backend_failures(monkeypatch) -> None:
     assert results["claude"].available is False
     assert results["claude"].reason == "probe_failed"
     assert results["codex"].available is True
+
+
+@pytest.mark.asyncio
+async def test_safe_profile_probe_checks_required_cli_flags(monkeypatch) -> None:
+    from cli.runtime_registry import RuntimeRegistry
+
+    calls: list[tuple[str, ...]] = []
+
+    async def runner(argv, _timeout):
+        calls.append(tuple(argv))
+        if argv[-1] == "--version":
+            return 0, b"codex 0.149.1", b""
+        return (
+            0,
+            b"--ignore-user-config --ignore-rules --strict-config --json",
+            b"",
+        )
+
+    monkeypatch.setattr("cli.runtime_registry.shutil.which", lambda _: "/bin/codex")
+    registry = RuntimeRegistry(executables={"codex": "codex"}, runner=runner)
+
+    profile = await registry.probe_safe_profile("codex")
+
+    assert profile.available is True
+    assert profile.missing_flags == ()
+    assert calls == [("codex", "--version"), ("codex", "exec", "--help")]
+
+
+@pytest.mark.asyncio
+async def test_safe_profile_probe_fails_closed_for_missing_flags(monkeypatch) -> None:
+    from cli.runtime_registry import RuntimeRegistry
+
+    async def runner(argv, _timeout):
+        if argv[-1] == "--version":
+            return 0, b"claude 2.1.220", b""
+        return 0, b"--safe-mode", b""
+
+    monkeypatch.setattr("cli.runtime_registry.shutil.which", lambda _: "/bin/claude")
+    registry = RuntimeRegistry(executables={"claude": "claude"}, runner=runner)
+
+    profile = await registry.probe_safe_profile("claude")
+
+    assert profile.available is False
+    assert profile.reason == "required_flags_missing"
+    assert profile.missing_flags == ("--strict-mcp-config",)
 
 
 def test_registry_rejects_unknown_backends_and_bad_limits() -> None:
