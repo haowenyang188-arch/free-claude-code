@@ -46,22 +46,60 @@ def test_manifest_rejects_side_effecting_checkpoint() -> None:
 def test_manifest_compatibility_requires_exact_execution_identity() -> None:
     manifest = _manifest()
 
-    assert manifest.is_compatible(
-        backend="codex",
-        runtime_version="0.149.1",
-        session_id="thread-1",
-        generation="gen-1",
-        workspace_digest="workspace-sha",
-        policy_digest="policy-sha",
-    ) is True
-    assert manifest.is_compatible(
-        backend="codex",
-        runtime_version="0.149.2",
-        session_id="thread-1",
-        generation="gen-1",
-        workspace_digest="workspace-sha",
-        policy_digest="policy-sha",
-    ) is False
+    assert (
+        manifest.is_compatible(
+            backend="codex",
+            runtime_version="0.149.1",
+            session_id="thread-1",
+            generation="gen-1",
+            workspace_digest="workspace-sha",
+            policy_digest="policy-sha",
+            run_id="run-1",
+            step_id="step-1",
+            input_digest="input-sha",
+        )
+        is True
+    )
+    assert (
+        manifest.is_compatible(
+            backend="codex",
+            runtime_version="0.149.2",
+            session_id="thread-1",
+            generation="gen-1",
+            workspace_digest="workspace-sha",
+            policy_digest="policy-sha",
+            run_id="run-1",
+            step_id="step-1",
+            input_digest="input-sha",
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("run_id", "other-run"),
+        ("step_id", "other-step"),
+        ("input_digest", "other-input"),
+    ],
+)
+def test_manifest_compatibility_rejects_step_identity_mismatch(field, value) -> None:
+    manifest = _manifest()
+    identity = {
+        "backend": "codex",
+        "runtime_version": "0.149.1",
+        "session_id": "thread-1",
+        "generation": "gen-1",
+        "workspace_digest": "workspace-sha",
+        "policy_digest": "policy-sha",
+        "run_id": "run-1",
+        "step_id": "step-1",
+        "input_digest": "input-sha",
+    }
+    identity[field] = value
+
+    assert manifest.is_compatible(**identity) is False
 
 
 def test_store_writes_atomically_and_loads_manifest(tmp_path) -> None:

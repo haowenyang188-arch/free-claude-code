@@ -90,7 +90,10 @@ class CheckpointManifest:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> CheckpointManifest:
         """Validate and reconstruct a checkpoint manifest."""
-        if not isinstance(value, Mapping) or value.get("schema_version") != SCHEMA_VERSION:
+        if (
+            not isinstance(value, Mapping)
+            or value.get("schema_version") != SCHEMA_VERSION
+        ):
             raise CheckpointError("invalid checkpoint schema")
         expected = set(cls._field_names()) | {"schema_version"}
         if set(value) != expected:
@@ -127,6 +130,9 @@ class CheckpointManifest:
         generation: str,
         workspace_digest: str,
         policy_digest: str,
+        run_id: str,
+        step_id: str,
+        input_digest: str,
     ) -> bool:
         """Return whether the current execution identity can resume this step."""
         try:
@@ -140,6 +146,9 @@ class CheckpointManifest:
             and self.generation == generation
             and self.workspace_digest == workspace_digest
             and self.policy_digest == policy_digest
+            and self.run_id == run_id
+            and self.step_id == step_id
+            and self.input_digest == input_digest
             and not self.side_effects_allowed
         )
 

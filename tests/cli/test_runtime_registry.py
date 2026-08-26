@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -130,6 +131,68 @@ async def test_safe_profile_probe_fails_closed_for_missing_flags(monkeypatch) ->
     assert profile.available is False
     assert profile.reason == "required_flags_missing"
     assert profile.missing_flags == ("--strict-mcp-config",)
+
+
+@pytest.mark.asyncio
+async def test_safe_profile_probe_requires_exact_option_tokens(monkeypatch) -> None:
+    async def runner(argv, _timeout):
+        if argv[-1] == "--version":
+            return 0, b"claude 2.1.220", b""
+        return 0, b"--safe-mode-extended --strict-mcp-configure", b""
+
+    monkeypatch.setattr(
+        "cli.runtime_registry.shutil.which", lambda _: "/usr/bin/claude"
+    )
+    registry = RuntimeRegistry(
+        executables={RuntimeBackend.CLAUDE: "claude"}, runner=runner
+    )
+
+    profile = await registry.probe_safe_profile(RuntimeBackend.CLAUDE)
+
+    assert profile.available is False
+    assert profile.reason == "required_flags_missing"
+    assert profile.missing_flags == ("--safe-mode", "--strict-mcp-config")
+
+
+@pytest.mark.asyncio
+async def test_default_version_and_help_probes_use_clean_environment(
+    monkeypatch,
+) -> None:
+    spawned: list[tuple[tuple[str, ...], dict]] = []
+
+    async def fake_spawn(*argv, **kwargs):
+        spawned.append((tuple(argv), kwargs))
+        output = (
+            b"codex 0.149.1"
+            if argv[-1] == "--version"
+            else b"--ignore-user-config --ignore-rules --strict-config"
+        )
+        process = MagicMock(returncode=0)
+        process.communicate = AsyncMock(return_value=(output, b""))
+        return process
+
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example")
+    monkeypatch.setenv("MCP_SERVER_URL", "https://mcp.example")
+    monkeypatch.setattr("cli.runtime_registry.shutil.which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr(
+        "cli.runtime_registry.asyncio.create_subprocess_exec", fake_spawn
+    )
+
+    registry = RuntimeRegistry(executables={RuntimeBackend.CODEX: "codex"})
+    profile = await registry.probe_safe_profile(RuntimeBackend.CODEX)
+
+    assert profile.available is True
+    assert [argv for argv, _kwargs in spawned] == [
+        ("codex", "--version"),
+        ("codex", "exec", "--help"),
+    ]
+    for _argv, kwargs in spawned:
+        environment = kwargs["env"]
+        assert environment["TERM"] == "dumb"
+        assert "OPENAI_API_KEY" not in environment
+        assert "HTTP_PROXY" not in environment
+        assert "MCP_SERVER_URL" not in environment
 
 
 def test_registry_rejects_unknown_backends_and_bad_limits() -> None:

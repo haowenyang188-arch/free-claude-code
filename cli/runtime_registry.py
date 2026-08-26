@@ -135,6 +135,7 @@ class RuntimeRegistry:
         self.timeout_seconds = float(timeout_seconds)
         self.cache_ttl_seconds = float(cache_ttl_seconds)
         self._runner = runner or _run_command
+        self._uses_default_runner = runner is None
         self._cache: dict[RuntimeBackend, tuple[float, RuntimeProbe]] = {}
         self._profile_cache: dict[
             RuntimeBackend, tuple[float, RuntimeProfileProbe]
@@ -235,9 +236,7 @@ class RuntimeRegistry:
             else (executable, "exec", "--help")
         )
         try:
-            return_code, stdout, _stderr = await asyncio.wait_for(
-                self._runner(argv, self.timeout_seconds), timeout=self.timeout_seconds
-            )
+            return_code, stdout, _stderr = await self._run_probe(backend, argv)
         except TimeoutError:
             return RuntimeProfileProbe(
                 backend=backend,
@@ -263,7 +262,9 @@ class RuntimeRegistry:
                 reason="help_command_failed",
             )
         text = stdout.decode("utf-8", errors="replace")
-        missing = tuple(flag for flag in required_flags if flag not in text)
+        missing = tuple(
+            flag for flag in required_flags if not _has_option_token(text, flag)
+        )
         return RuntimeProfileProbe(
             backend=backend,
             available=not missing,
@@ -289,9 +290,8 @@ class RuntimeRegistry:
             )
 
         try:
-            return_code, stdout, _stderr = await asyncio.wait_for(
-                self._runner((executable, "--version"), self.timeout_seconds),
-                timeout=self.timeout_seconds,
+            return_code, stdout, _stderr = await self._run_probe(
+                backend, (executable, "--version")
             )
         except TimeoutError:
             return RuntimeProbe(
@@ -334,6 +334,26 @@ class RuntimeRegistry:
             reason=None if version is not None else "version_unreported",
         )
 
+    async def _run_probe(
+        self,
+        backend: RuntimeBackend,
+        argv: Sequence[str],
+    ) -> tuple[int, bytes, bytes]:
+        """Run a probe while keeping the two-argument custom runner contract."""
+        if self._uses_default_runner:
+            return await asyncio.wait_for(
+                _run_command(
+                    argv,
+                    self.timeout_seconds,
+                    backend=backend,
+                ),
+                timeout=self.timeout_seconds,
+            )
+        return await asyncio.wait_for(
+            self._runner(argv, self.timeout_seconds),
+            timeout=self.timeout_seconds,
+        )
+
 
 def _coerce_backend(value: str | RuntimeBackend) -> RuntimeBackend:
     try:
@@ -349,16 +369,28 @@ def _extract_version(output: bytes) -> str | None:
     return match.group(0) if match else None
 
 
+def _has_option_token(text: str, option: str) -> bool:
+    """Return whether ``option`` appears as a complete long-option token."""
+    pattern = rf"(?<![A-Za-z0-9_-]){re.escape(option)}(?![A-Za-z0-9_-])"
+    return re.search(pattern, text) is not None
+
+
 async def _run_command(
     argv: Sequence[str],
     timeout_seconds: float,
+    *,
+    backend: RuntimeBackend = RuntimeBackend.CLAUDE,
 ) -> tuple[int, bytes, bytes]:
-    """Run a version probe without invoking a shell."""
+    """Run a probe without invoking a shell or inheriting provider state."""
+    # Import lazily to avoid the runtime_environment -> runtime_registry cycle.
+    from .runtime_environment import build_cli_environment
+
     process = await asyncio.create_subprocess_exec(
         *argv,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=build_cli_environment(backend),
     )
     try:
         stdout, stderr = await asyncio.wait_for(

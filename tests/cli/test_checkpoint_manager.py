@@ -26,6 +26,7 @@ async def test_manager_builds_checkpoint_for_safe_idle_session(monkeypatch) -> N
     session.current_session_id = "thread-1"
     session.generation = "generation-1"
     session.is_busy = False
+    session.last_run_id = "run-1"
     manager._sessions["thread-1"] = session
 
     manifest = await manager.build_checkpoint(
@@ -103,6 +104,7 @@ async def test_manager_writes_checkpoint_atomically(monkeypatch, tmp_path) -> No
     session.current_session_id = "session-1"
     session.generation = "generation-1"
     session.is_busy = False
+    session.last_run_id = "run-1"
     manager._sessions["session-1"] = session
     store = CheckpointStore(tmp_path / "checkpoint.json")
 
