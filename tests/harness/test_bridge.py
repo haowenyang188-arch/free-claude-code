@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -78,7 +79,8 @@ class _ConcurrentFakeProcess:
         self._next_message += 1
         message_number = self._next_message
         message_id = f"message-{message_number}"
-        session_id = params["sessionId"]
+        params_mapping = cast(dict[str, object], params)
+        session_id = params_mapping["sessionId"]
         assert isinstance(session_id, str)
         self.active_prompts += 1
         self.max_active_prompts = max(self.max_active_prompts, self.active_prompts)
@@ -149,7 +151,7 @@ class _FakeBridge(DeepSeekHarnessBridge):
         self.fake_process = process
 
     async def start(self, *, cwd: str | Path | None = None) -> None:
-        self._process = self.fake_process
+        cast(Any, self)._process = self.fake_process
         self._initialized = True
 
 
@@ -407,6 +409,8 @@ def test_manager_diagnostics_reports_bundled_runtime_state() -> None:
     assert status["ready"] is False
     assert status["state"] in {"configured", "dependency_missing"}
     if status["state"] == "dependency_missing":
-        assert "runtime" in status["error"]
+        error = status["error"]
+        assert isinstance(error, str)
+        assert "runtime" in error
     else:
         assert status["error"] is None

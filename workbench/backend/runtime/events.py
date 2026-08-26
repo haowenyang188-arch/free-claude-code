@@ -55,6 +55,10 @@ class EventEnvelope:
     backend: str
     payload: dict[str, Any]
     session_id: str | None = None
+    runtime_kind: str | None = None
+    agent_profile_id: str | None = None
+    step_id: str | None = None
+    artifact_ids: list[str] | None = None
 
     def to_mapping(self) -> dict[str, Any]:
         """Return a JSON-compatible mapping for APIs and persistence."""
@@ -67,6 +71,10 @@ class EventEnvelope:
             "backend": self.backend,
             "payload": _redact(self.payload),
             "session_id": self.session_id,
+            "runtime_kind": self.runtime_kind,
+            "agent_profile_id": self.agent_profile_id,
+            "step_id": self.step_id,
+            "artifact_ids": self.artifact_ids,
         }
 
     @classmethod
@@ -87,6 +95,25 @@ class EventEnvelope:
             session_id = value.get("session_id")
             if session_id is not None:
                 session_id = _required_text(session_id, "session_id")
+
+            # Extended fields (optional, for backward compatibility)
+            runtime_kind = value.get("runtime_kind")
+            if runtime_kind is not None:
+                runtime_kind = _required_text(runtime_kind, "runtime_kind")
+
+            agent_profile_id = value.get("agent_profile_id")
+            if agent_profile_id is not None:
+                agent_profile_id = _required_text(agent_profile_id, "agent_profile_id")
+
+            step_id = value.get("step_id")
+            if step_id is not None:
+                step_id = _required_text(step_id, "step_id")
+
+            artifact_ids = value.get("artifact_ids")
+            if artifact_ids is not None:
+                if not isinstance(artifact_ids, list):
+                    raise TypeError("artifact_ids must be a list")
+                artifact_ids = [_required_text(aid, "artifact_id") for aid in artifact_ids]
         except (KeyError, TypeError, ValueError) as exc:
             raise EventLogError("invalid event envelope") from exc
 
@@ -102,6 +129,10 @@ class EventEnvelope:
             backend=backend,
             payload=dict(_redact(payload)),
             session_id=session_id,
+            runtime_kind=runtime_kind,
+            agent_profile_id=agent_profile_id,
+            step_id=step_id,
+            artifact_ids=artifact_ids,
         )
 
 
@@ -123,6 +154,10 @@ class EventLog:
         payload: Mapping[str, Any] | None,
         backend: str,
         session_id: str | None = None,
+        runtime_kind: str | None = None,
+        agent_profile_id: str | None = None,
+        step_id: str | None = None,
+        artifact_ids: list[str] | None = None,
     ) -> EventEnvelope:
         """Append one event and return its assigned sequence."""
         run_id = _required_text(run_id, "run_id")
@@ -130,6 +165,16 @@ class EventLog:
         backend = _required_text(backend, "backend")
         if session_id is not None:
             session_id = _required_text(session_id, "session_id")
+        if runtime_kind is not None:
+            runtime_kind = _required_text(runtime_kind, "runtime_kind")
+        if agent_profile_id is not None:
+            agent_profile_id = _required_text(agent_profile_id, "agent_profile_id")
+        if step_id is not None:
+            step_id = _required_text(step_id, "step_id")
+        if artifact_ids is not None:
+            if not isinstance(artifact_ids, list):
+                raise TypeError("artifact_ids must be a list")
+            artifact_ids = [_required_text(aid, "artifact_id") for aid in artifact_ids]
         if payload is not None and not isinstance(payload, Mapping):
             raise TypeError("payload must be a mapping")
 
@@ -144,6 +189,10 @@ class EventLog:
                 backend=backend,
                 payload=dict(_redact(payload or {})),
                 session_id=session_id,
+                runtime_kind=runtime_kind,
+                agent_profile_id=agent_profile_id,
+                step_id=step_id,
+                artifact_ids=artifact_ids,
             )
             self.path.parent.mkdir(parents=True, exist_ok=True)
             try:

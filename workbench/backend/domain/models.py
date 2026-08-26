@@ -63,6 +63,7 @@ class StepStatus(StrEnum):
     WAITING_REVIEW = "waiting_review"
     COMPLETED = "completed"
     REJECTED = "rejected"
+    REWORK = "rework"
     BLOCKED = "blocked"
     FAILED = "failed"
     PAUSED = "paused"
@@ -189,10 +190,19 @@ class RoleBinding(BaseModel):
     session_id: str | None = None
 
 
+class AcceptanceCriteria(BaseModel):
+    id: str
+    description: str
+    required: bool = True
+
+
 class StepDefinition(BaseModel):
     id: str
     name: str
     role_id: str
+    required_capabilities: list[str] = Field(default_factory=list)
+    allowed_tools: list[str] = Field(default_factory=list)
+    context_scope: list[str] = Field(default_factory=list)
     output_type: ArtifactType = ArtifactType.TEXT
     depends_on: list[str] = Field(default_factory=list)
     execution_mode: ExecutionMode = ExecutionMode.SEQUENTIAL
@@ -201,6 +211,7 @@ class StepDefinition(BaseModel):
     retry_limit: int = 0
     handoff_to: str | None = None
     instructions: str = ""
+    acceptance_criteria: list[AcceptanceCriteria] = Field(default_factory=list)
 
 
 class StageDefinition(BaseModel):
@@ -252,12 +263,6 @@ class StepRun(BaseModel):
     output_artifact_ids: list[str] = Field(default_factory=list)
 
 
-class AcceptanceCriteria(BaseModel):
-    id: str
-    description: str
-    required: bool = True
-
-
 class Task(BaseModel):
     id: str
     step_run_id: str
@@ -291,6 +296,9 @@ class ContextPackage(BaseModel):
     artifact_ids: list[str] = Field(default_factory=list)
     decisions: list[str] = Field(default_factory=list)
     expected_output_schema: dict[str, Any] = Field(default_factory=dict)
+    allowed_tools: list[str] = Field(default_factory=list)
+    workspace_scope: str | None = None
+    acceptance_criteria: list[AcceptanceCriteria] = Field(default_factory=list)
     base_version: int = 1
 
 
@@ -302,6 +310,11 @@ class Artifact(BaseModel):
     content: str | None = None
     sha256: str | None = None
     summary: str | None = None
+    schema_version: int = 1
+    producer_step_run_id: str | None = None
+    supersedes_id: str | None = None
+    allowed_consumers: list[str] = Field(default_factory=list)
+    payload_format: str = "text"
     created_at: datetime = Field(default_factory=_now)
     accepted: bool = False
 

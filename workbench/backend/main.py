@@ -261,13 +261,24 @@ class WorkbenchService:
 
     async def _handle_event(self, event: Event):
         """处理Agent事件"""
+        # 从 adapter 获取 session_id
+        session_id = self._session_id_for_run(event.run_id)
+
+        # 如果事件中包含 session_id，提取并持久化
+        if event.run_id in self.runs:
+            run = self.runs[event.run_id]
+            adapter = self.agents.get(run.agent_id)
+            if adapter and hasattr(adapter, 'session_id') and adapter.session_id:
+                session_id = adapter.session_id
+                run.metadata["session_id"] = session_id
+
         envelope = await asyncio.to_thread(
             self.event_log.append,
             run_id=event.run_id,
             event_type=event.type.value,
             payload=event.data,
             backend=self._backend_for_event(event),
-            session_id=self._session_id_for_run(event.run_id),
+            session_id=session_id,
         )
         event.data = dict(envelope.payload)
         message = event.data.get("message")
@@ -493,6 +504,13 @@ class WorkbenchService:
             raise HTTPException(status_code=404, detail="Agent not found")
 
         adapter = self.agents[run.agent_id]
+
+        # 恢复持久化的 session_id
+        if hasattr(adapter, 'session_id') and not adapter.session_id:
+            stored_session_id = run.metadata.get("session_id")
+            if stored_session_id and isinstance(stored_session_id, str):
+                adapter.session_id = stored_session_id
+
         last_run_id = getattr(adapter, "last_run_id", None)
         if adapter.current_run_id not in (None, request.run_id) or (
             last_run_id is not None and last_run_id != request.run_id
