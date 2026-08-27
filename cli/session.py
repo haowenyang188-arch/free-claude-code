@@ -10,7 +10,6 @@ from typing import Any
 from loguru import logger
 
 from .approval import (
-    ApprovalDecision,
     ApprovalPolicy,
     ApprovalRequest,
     ApprovalResult,
@@ -365,17 +364,5 @@ class CLISession:
         }
 
     def evaluate_approval(self, request: ApprovalRequest) -> ApprovalResult:
-        """Evaluate a hook or PTY approval request without executing it."""
-        if request.process_id is not None and (
-            self.process is None or self.process.pid != request.process_id
-        ):
-            return ApprovalResult(
-                ApprovalDecision.ASK,
-                "approval process identity does not match the active session",
-            )
-        if request.generation is not None and request.generation != self.generation:
-            return ApprovalResult(
-                ApprovalDecision.ASK,
-                "approval generation does not match the active session",
-            )
+        """Classify a request without binding approval to a future process."""
         return self.approval_policy.evaluate(request)

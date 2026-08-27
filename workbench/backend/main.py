@@ -41,8 +41,16 @@ if __package__:
         Task,
         TaskStatus,
     )
+    from .runtime.approval import (
+        ApprovalIntegrityError,
+        ApprovalManager,
+        ApprovalRecord,
+        CommandIntent,
+        CommandSyntaxError,
+    )
     from .runtime.auth import WorkbenchAuth
     from .runtime.events import EventEnvelope, EventLog
+    from .runtime.jobs import ApprovalExecutor, JobRecord, JobRuntime, JobRuntimeError
     from .runtime.state import StateStore, StateStoreError
     from .runtime.workspace import WorkspacePolicy, WorkspacePolicyError
 else:  # Support ``python workbench/backend/main.py`` as a local entry point.
@@ -66,8 +74,21 @@ else:  # Support ``python workbench/backend/main.py`` as a local entry point.
         Task,
         TaskStatus,
     )
+    from workbench.backend.runtime.approval import (
+        ApprovalIntegrityError,
+        ApprovalManager,
+        ApprovalRecord,
+        CommandIntent,
+        CommandSyntaxError,
+    )
     from workbench.backend.runtime.auth import WorkbenchAuth
     from workbench.backend.runtime.events import EventEnvelope, EventLog
+    from workbench.backend.runtime.jobs import (
+        ApprovalExecutor,
+        JobRecord,
+        JobRuntime,
+        JobRuntimeError,
+    )
     from workbench.backend.runtime.state import StateStore, StateStoreError
     from workbench.backend.runtime.workspace import (
         WorkspacePolicy,
@@ -126,6 +147,11 @@ class WorkbenchService:
                 ),
             )
         )
+        # Approval and job ownership are process-local. Grants do not survive
+        # a restart, and PIDs are registered only after an approved spawn.
+        self.approvals = ApprovalManager()
+        self.jobs = JobRuntime()
+        self.executor = ApprovalExecutor(self.approvals, self.jobs)
         self.agents: dict[str, BaseAgentAdapter] = {}
         self.tasks: dict[str, Task] = {}
         self.runs: dict[str, Run] = {}
@@ -323,6 +349,8 @@ class WorkbenchService:
             elif event.type is EventType.RUN_CANCELLED:
                 run.status = RunStatus.CANCELLED
                 run.completed_at = datetime.now()
+            elif event.type is EventType.USER_INPUT_REQUIRED:
+                run.status = RunStatus.WAITING_HUMAN
 
             # 更新Task状态
             task_id = run.task_id
@@ -337,6 +365,8 @@ class WorkbenchService:
                     task.status = TaskStatus.PAUSED
                 elif run.status == RunStatus.CANCELLED:
                     task.status = TaskStatus.CANCELLED
+                elif run.status == RunStatus.WAITING_HUMAN:
+                    task.status = TaskStatus.WAITING_HUMAN
                 task.updated_at = datetime.now()
 
         await self._persist_state()
@@ -611,8 +641,81 @@ class WorkbenchService:
 
     async def cleanup(self):
         """清理服务"""
+        await self.jobs.close()
         for adapter in self.agents.values():
             await adapter.cleanup()
+
+    def _approval_intent(
+        self,
+        payload: ApprovalCommandRequest,
+        *,
+        session_id: str | None = None,
+        call_id: str | None = None,
+    ) -> CommandIntent:
+        resolved_session_id = session_id or payload.session_id
+        resolved_call_id = call_id or payload.call_id
+        if (session_id is not None and payload.session_id != session_id) or (
+            call_id is not None and payload.call_id != call_id
+        ):
+            raise ApprovalIntegrityError("approval_integrity_mismatch")
+        try:
+            workspace = self.workspace_policy.resolve(payload.cwd)
+        except WorkspacePolicyError as exc:
+            raise ValueError("cwd must stay inside the Workbench workspace") from exc
+        return CommandIntent.create(
+            session_id=resolved_session_id,
+            call_id=resolved_call_id,
+            command=payload.command,
+            argv=payload.argv,
+            cwd=workspace,
+            requested_permission=payload.requested_permission,
+        )
+
+    async def request_approval(self, payload: ApprovalCommandRequest) -> ApprovalRecord:
+        intent = self._approval_intent(payload)
+        return await self.approvals.request(
+            intent, approval_timeout_seconds=payload.approval_timeout_seconds
+        )
+
+    async def get_approval(self, session_id: str, call_id: str) -> ApprovalRecord:
+        return await self.approvals.get(session_id=session_id, call_id=call_id)
+
+    async def decide_approval(
+        self,
+        session_id: str,
+        call_id: str,
+        command_hash: str,
+        decision: str,
+    ) -> ApprovalRecord:
+        if decision == "approve":
+            return await self.approvals.approve(
+                session_id=session_id, call_id=call_id, command_hash=command_hash
+            )
+        if decision == "reject":
+            return await self.approvals.reject(
+                session_id=session_id, call_id=call_id, command_hash=command_hash
+            )
+        if decision == "cancel":
+            return await self.approvals.cancel(
+                session_id=session_id, call_id=call_id, command_hash=command_hash
+            )
+        raise ValueError("unknown approval decision")
+
+    async def execute_approval(
+        self,
+        session_id: str,
+        call_id: str,
+        payload: ApprovalExecuteRequest,
+    ) -> JobRecord:
+        intent = self._approval_intent(payload, session_id=session_id, call_id=call_id)
+        return await self.executor.execute(
+            intent,
+            background=payload.background,
+            port=payload.port,
+            health_url=payload.health_url,
+            job_wait_timeout_seconds=payload.job_wait_timeout_seconds,
+            process_timeout_seconds=payload.process_timeout_seconds,
+        )
 
 
 # 全局服务实例
@@ -622,6 +725,111 @@ auth = WorkbenchAuth(os.environ.get("WORKBENCH_AUTH_TOKEN"))
 
 class LoginRequest(BaseModel):
     token: str = Field(min_length=1, max_length=512)
+
+
+class ApprovalCommandRequest(BaseModel):
+    """Validated command identity submitted to the Workbench approval API."""
+
+    session_id: str = Field(min_length=1, max_length=256)
+    call_id: str = Field(min_length=1, max_length=256)
+    command: str | None = Field(default=None, max_length=8192)
+    argv: list[str] | None = Field(default=None, min_length=1, max_length=256)
+    cwd: str = Field(min_length=1, max_length=4096)
+    requested_permission: str = Field(min_length=1, max_length=256)
+    approval_timeout_seconds: float = Field(default=300.0, ge=0.0, le=3600.0)
+
+
+class ApprovalDecisionRequest(BaseModel):
+    command_hash: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$"
+    )
+
+
+class ApprovalExecuteRequest(ApprovalCommandRequest):
+    """Execution parameters; command identity must match the approved record."""
+
+    background: bool = False
+    port: int | None = Field(default=None, ge=1, le=65535)
+    health_url: str | None = Field(default=None, max_length=2048)
+    job_wait_timeout_seconds: float = Field(default=5.0, ge=0.0, le=3600.0)
+    process_timeout_seconds: float | None = Field(default=None, gt=0.0, le=86400.0)
+
+
+def _approval_payload(record: ApprovalRecord) -> dict[str, Any]:
+    """Serialize an approval without process identity or secret command output."""
+    return {
+        "session_id": record.session_id,
+        "call_id": record.call_id,
+        "normalized_command": record.normalized_command,
+        "argv": list(record.argv),
+        "cwd": str(record.cwd),
+        "requested_permission": record.requested_permission,
+        "command_hash": record.command_hash,
+        "risk": record.risk.value,
+        "status": record.status.value,
+        "created_at": record.created_at.isoformat(),
+        "expires_at": record.expires_at.isoformat(),
+        "approved_at": record.approved_at.isoformat() if record.approved_at else None,
+        "consumed_at": record.consumed_at.isoformat() if record.consumed_at else None,
+        "reason": record.reason,
+    }
+
+
+def _job_payload(record: JobRecord) -> dict[str, Any]:
+    return {
+        "job_id": record.job_id,
+        "call_id": record.call_id,
+        "command_hash": record.command_hash,
+        "pid": record.pid,
+        "status": record.status.value,
+        "background": record.background,
+        "port": record.port,
+        "health_url": record.health_url,
+        "started_at": record.started_at.isoformat(),
+        "ready": record.ready,
+        "exit_code": record.exit_code,
+    }
+
+
+def _approval_http_exception(
+    exc: Exception, *, default_status: int = 409
+) -> HTTPException:
+    code = str(exc).strip() or "approval_unavailable"
+    if isinstance(exc, (CommandSyntaxError, ValueError)):
+        code = "invalid_command"
+        default_status = 400
+    elif code in {
+        "approval_integrity_mismatch",
+        "approval_timeout",
+        "approval_unavailable",
+    }:
+        default_status = 409
+    elif code == "process_failed":
+        default_status = 500
+    return HTTPException(
+        status_code=default_status,
+        detail={"code": code, "message": code},
+    )
+
+
+def _approval_error_response(
+    exc: Exception, *, default_status: int = 409
+) -> JSONResponse:
+    error = _approval_http_exception(exc, default_status=default_status)
+    detail = (
+        error.detail
+        if isinstance(error.detail, dict)
+        else {"message": str(error.detail)}
+    )
+    return JSONResponse(
+        status_code=error.status_code,
+        content={
+            "error": {
+                "code": detail.get("code", "approval_unavailable"),
+                "message": detail.get("message", "approval_unavailable"),
+            }
+        },
+    )
 
 
 def _remote_host(request: Request) -> str | None:
@@ -727,6 +935,85 @@ async def auth_login(request: Request, response: Response, payload: LoginRequest
 async def auth_logout(response: Response):
     response.delete_cookie(auth.cookie_name, path="/")
     return {"authenticated": False}
+
+
+@app.post("/api/approvals")
+async def request_approval(payload: ApprovalCommandRequest):
+    """Create one concrete approval request or classify it automatically."""
+    try:
+        record = await service.request_approval(payload)
+    except (ApprovalIntegrityError, CommandSyntaxError, ValueError) as exc:
+        return _approval_error_response(exc, default_status=400)
+    return _approval_payload(record)
+
+
+@app.get("/api/approvals/{session_id}/{call_id}")
+async def get_approval(session_id: str, call_id: str):
+    try:
+        record = await service.get_approval(session_id, call_id)
+    except ApprovalIntegrityError as exc:
+        return _approval_error_response(exc)
+    return _approval_payload(record)
+
+
+@app.post("/api/approvals/{session_id}/{call_id}/execute")
+async def execute_approval(
+    session_id: str, call_id: str, payload: ApprovalExecuteRequest
+):
+    try:
+        job = await service.execute_approval(session_id, call_id, payload)
+    except (
+        ApprovalIntegrityError,
+        CommandSyntaxError,
+        JobRuntimeError,
+        ValueError,
+    ) as exc:
+        return _approval_error_response(exc)
+    return _job_payload(job)
+
+
+@app.post("/api/approvals/{session_id}/{call_id}/{decision}")
+async def decide_approval(
+    session_id: str, call_id: str, decision: str, payload: ApprovalDecisionRequest
+):
+    if decision not in {"approve", "reject", "cancel"}:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {"code": "invalid_decision", "message": "invalid_decision"}
+            },
+        )
+    try:
+        record = await service.decide_approval(
+            session_id, call_id, payload.command_hash, decision
+        )
+    except (ApprovalIntegrityError, ValueError) as exc:
+        return _approval_error_response(exc)
+    return _approval_payload(record)
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str):
+    try:
+        job = await service.jobs.get(job_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"code": "job_unavailable", "message": "job_unavailable"}},
+        ) from exc
+    return _job_payload(job)
+
+
+@app.post("/api/jobs/{job_id}/stop")
+async def stop_job(job_id: str):
+    try:
+        job = await service.jobs.stop(job_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"code": "job_unavailable", "message": "job_unavailable"}},
+        ) from exc
+    return _job_payload(job)
 
 
 @app.get("/api/agents")

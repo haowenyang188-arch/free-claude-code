@@ -181,6 +181,37 @@ async def test_event_callback_persists_redacted_legacy_compatible_event(
 
 
 @pytest.mark.asyncio
+async def test_user_input_required_marks_run_and_task_waiting_human(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    run = Run(id="run-waiting", task_id="task-waiting", agent_id="agent-1")
+    task = Task(
+        id="task-waiting",
+        title="demo",
+        description="run it",
+        agent_id="agent-1",
+        agent_type=AgentType.CLAUDE_CODE,
+        workspace_path=str(tmp_path / "workspace"),
+        status=TaskStatus.RUNNING,
+    )
+    service.runs[run.id] = run
+    service.tasks[task.id] = task
+
+    await service._handle_event(
+        Event(
+            id="event-waiting",
+            run_id=run.id,
+            type=EventType.USER_INPUT_REQUIRED,
+            data={"awaiting_approval": True},
+        )
+    )
+
+    assert service.runs[run.id].status is RunStatus.WAITING_HUMAN
+    assert service.tasks[task.id].status is TaskStatus.WAITING_HUMAN
+
+
+@pytest.mark.asyncio
 async def test_event_provenance_stays_bound_to_the_started_generation(
     tmp_path: Path,
 ) -> None:

@@ -199,6 +199,18 @@ DEFAULT_SAFE_COMMAND_PREFIXES = (
     "pwd",
     "ls",
     "dir",
+    "cat",
+    "head",
+    "tail",
+    "sed -n",
+    "grep",
+    "rg",
+    "find",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git branch --show-current",
 )
 
 DEFAULT_SAFE_TOOLS = frozenset({"Glob", "LS", "TodoRead"})
@@ -211,10 +223,22 @@ _DANGEROUS_RE = re.compile(
     r"(?:^|[;&|]\s*|\$\(\s*|`\s*)"
     r"(?:"
     r"sudo\b|rm\b|rmdir\b|del\b|erase\b|format\b|"
-    r"git\s+(?:reset\s+--hard|clean\b|push\s+--force(?:\s|$)|branch\s+-D\b)|"
+    r"git\s+(?:reset\b|clean\b|checkout\s+(?:--|\.)|restore\b|"
+    r"push\s+--force(?:\s|$)|branch\s+-D\b|stash\s+(?:drop|clear)\b)|"
     r"(?:dd|mkfs)\b|"
     r"(?:shutdown|reboot)\b|"
-    r"(?:powershell|pwsh)\s+.*(?:-enc(?:odedcommand)?\b|-command\b)|"
+    r"(?:powershell|pwsh)\s+.*(?:-enc(?:odedcommand)?\b|"
+    r"(?:remove|set|new|stop|start|restart)-item(?:property)?\b|"
+    r"(?:set|new|remove|stop|start|restart)-service\b|"
+    r"(?:invoke-webrequest|iwr|invoke-expression|iex|downloadstring)\b)|"
+    r"(?:remove|set|new|stop|start|restart)[-_](?:item|itemproperty|service|acl|"
+    r"localuser|localgroup)\b|"
+    r"(?:set[-_]executionpolicy|wsl\s+--unregister|vssadmin\s+delete\s+shadows|"
+    r"wmic\s+shadowcopy\s+delete|wevtutil\s+cl\b|auditpol\s+/clear\b|"
+    r"format-volume\b|clear-disk\b|remove-partition\b|initialize-disk\b|"
+    r"reset-physicaldisk\b|bcdedit\s+/delete\b)|"
+    r"(?:cmd(?:\.exe)?\s+/(?:c|k))?\s*(?:reg|sc(?:\.exe)?|netsh)\s+|"
+    r"(?:curl|wget)\b[^;&|]*(?:[|]|\b(?:sh|bash|pwsh|powershell)\b)|"
     r"(?:python|python3|node|ruby)\s+-c\b|"
     r"npm\s+publish\b|"
     r"docker\s+system\s+prune\b"
@@ -405,6 +429,14 @@ class ApprovalPolicy:
 
     def evaluate(self, request: ApprovalRequest) -> ApprovalResult:
         """Evaluate a request; anything uncertain remains an interactive ask."""
+        # Safety classification must run before allowlist checks.  The hook is
+        # deny-only, so an explicit destructive command must never become
+        # silent merely because its cwd or backend metadata is malformed.
+        if request.command:
+            if reason := _dangerous_command_reason(request.command):
+                return ApprovalResult(ApprovalDecision.DENY, reason)
+            if reason := _sensitive_path_reason(request.command):
+                return ApprovalResult(ApprovalDecision.DENY, reason)
         if not self.enabled:
             return ApprovalResult(
                 ApprovalDecision.ASK, "automatic approval is disabled"
@@ -428,10 +460,6 @@ class ApprovalPolicy:
             )
 
         if request.command:
-            if reason := _dangerous_command_reason(request.command):
-                return ApprovalResult(ApprovalDecision.DENY, reason)
-            if reason := _sensitive_path_reason(request.command):
-                return ApprovalResult(ApprovalDecision.DENY, reason)
             if _requires_manual_wrapper_review(request.command):
                 return ApprovalResult(
                     ApprovalDecision.ASK,
@@ -471,7 +499,17 @@ class ApprovalPolicy:
                 ApprovalDecision.ASK,
                 "compound or unparseable shell syntax requires review",
             )
-        if not _command_paths_are_contained(tokens, request.workspace):
+        builtin_read_only = _builtin_read_only_command_is_safe(
+            tokens, request.workspace
+        )
+        if builtin_read_only is False:
+            return ApprovalResult(
+                ApprovalDecision.ASK,
+                "command does not match a verified read-only form",
+            )
+        if builtin_read_only is None and not _command_paths_are_contained(
+            tokens, request.workspace
+        ):
             return ApprovalResult(
                 ApprovalDecision.ASK,
                 "command path operands are outside the approval workspace",
@@ -651,7 +689,10 @@ class ApprovalHook:
             return None
 
         result = self.policy.evaluate(request)
-        if result.decision is ApprovalDecision.ASK:
+        # The safety hook is deny-only. Low-risk requests remain silent so the
+        # native sandbox and the Workbench one-shot approval flow stay the
+        # authority for execution permissions.
+        if result.decision is not ApprovalDecision.DENY:
             return None
 
         event_name = payload.get("hook_event_name") or payload.get("hookEventName")
@@ -820,6 +861,15 @@ def _contains_dangerous_command(tokens: tuple[str, ...]) -> bool:
         executable = _executable_name(tokens[executable_index])
         if executable in _DANGEROUS_EXECUTABLES:
             return True
+        if executable in {
+            "powershell",
+            "powershell.exe",
+            "pwsh",
+            "pwsh.exe",
+            "cmd",
+            "cmd.exe",
+        } and _windows_command_is_dangerous(tokens[executable_index:]):
+            return True
         if executable in {"git", "git.exe"} and _git_command_is_dangerous(
             tokens[executable_index:]
         ):
@@ -857,6 +907,21 @@ _DANGEROUS_EXECUTABLES = frozenset(
         "mkfs",
         "shutdown",
         "reboot",
+        "reg",
+        "sc",
+        "netsh",
+        "systemctl",
+        "service",
+        "mount",
+        "umount",
+        "chmod",
+        "chown",
+        "iptables",
+        "ufw",
+        "diskpart",
+        "parted",
+        "fdisk",
+        "taskkill",
     }
 )
 
@@ -893,9 +958,11 @@ def _executable_name(value: str) -> str:
 
 def _git_command_is_dangerous(tokens: tuple[str, ...]) -> bool:
     lowered = [token.lower() for token in tokens]
-    if "reset" in lowered and "--hard" in lowered:
+    if "reset" in lowered:
         return True
     if "clean" in lowered:
+        return True
+    if "checkout" in lowered and any(token in {"--", ".", ".."} for token in lowered):
         return True
     if "branch" in lowered and any(token.lower() == "-d" for token in tokens):
         return True
@@ -909,6 +976,28 @@ def _git_command_is_dangerous(tokens: tuple[str, ...]) -> bool:
         ):
             return True
     return False
+
+
+def _windows_command_is_dangerous(tokens: tuple[str, ...]) -> bool:
+    """Detect mutating Windows/PowerShell verbs without blocking read-only probes."""
+    text = " ".join(tokens).lower()
+    if re.search(
+        r"\b(?:remove|set|new|stop|start|restart)-(?:item|itemproperty|service|acl|localuser|localgroup)\b",
+        text,
+    ):
+        return True
+    if re.search(r"\b(?:del|erase|rd|rmdir)\b\s+(?:/s|/q|/s\s+/q)", text):
+        return True
+    if re.search(
+        r"\b(?:reg|sc|netsh|diskpart)\b\s+(?:delete|add|create|config|stop|start|change|set)",
+        text,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:invoke-webrequest|iwr|invoke-expression|iex|downloadstring)\b", text
+        )
+    )
 
 
 def _safe_tool_input_is_valid(request: ApprovalRequest) -> bool:
@@ -960,7 +1049,7 @@ def _sensitive_path_reason(command: str) -> str | None:
     normalized = command.replace("\\", "/").lower()
     if re.search(
         r"(?:^|[\s/:])(?:\.env(?:\.[^\s/]*)?|\.credentials\.json|"
-        r"id_(?:rsa|ed25519)|authorized_keys|known_hosts)(?:$|[\s/:])",
+        r"auth\.json|id_(?:rsa|ed25519)|authorized_keys|known_hosts)(?:$|[\s/:])",
         normalized,
     ):
         return "reading a sensitive credential path requires manual approval"
@@ -980,8 +1069,6 @@ def _requires_manual_wrapper_review(command: str) -> bool:
         return True
     executable = _executable_name(tokens[executable_index])
     if executable in {"xargs", "sh", "bash", "zsh", "fish", "pwsh", "powershell"}:
-        return True
-    if executable in {"grep", "rg"}:
         return True
     if executable in {"ls", "dir"} and any(
         token in {"--recursive"}
@@ -1005,6 +1092,226 @@ def _requires_manual_wrapper_review(command: str) -> bool:
         if "config" in lowered or any(token.startswith("alias.") for token in lowered):
             return True
     return False
+
+
+def _builtin_read_only_command_is_safe(
+    tokens: tuple[str, ...], workspace: str | None
+) -> bool | None:
+    """Recognize the narrow read-only forms exposed by the built-in policy."""
+    if not tokens or "/" in tokens[0] or "\\" in tokens[0]:
+        return None
+    executable = tokens[0].lower()
+    if executable == "pwd":
+        return len(tokens) == 1
+    if executable in {"ls", "dir"}:
+        return _listing_is_safe(tokens[1:], workspace, executable)
+    if executable in {"cat", "head", "tail"}:
+        return _file_read_is_safe(tokens[1:], workspace)
+    if executable == "sed":
+        return _sed_read_is_safe(tokens[1:], workspace)
+    if executable == "grep":
+        return _grep_is_safe(tokens[1:], workspace)
+    if executable == "rg":
+        return _rg_is_safe(tokens[1:], workspace)
+    if executable == "find":
+        return _find_is_safe(tokens[1:], workspace)
+    if executable in {"git", "git.exe"}:
+        return _git_query_is_safe(tokens[1:])
+    return None
+
+
+def _listing_is_safe(
+    arguments: tuple[str, ...], workspace: str | None, executable: str
+) -> bool:
+    paths: list[str] = []
+    options_ended = False
+    for argument in arguments:
+        if argument == "--":
+            options_ended = True
+            continue
+        if not options_ended and argument.startswith("-"):
+            if executable == "dir":
+                return False
+            if not _safe_listing_option(argument):
+                return False
+            continue
+        paths.append(argument)
+    return _paths_are_contained(paths, workspace)
+
+
+def _safe_listing_option(option: str) -> bool:
+    if option.startswith("--"):
+        return option in {"--all", "--almost-all", "--human-readable", "--classify"}
+    return len(option) > 1 and all(flag in {"a", "l", "h", "t"} for flag in option[1:])
+
+
+def _file_read_is_safe(arguments: tuple[str, ...], workspace: str | None) -> bool:
+    paths: list[str] = []
+    options_ended = False
+    for argument in arguments:
+        if argument == "--":
+            options_ended = True
+            continue
+        if not options_ended and argument.startswith("-"):
+            return False
+        paths.append(argument)
+    return bool(paths) and _paths_are_contained(paths, workspace)
+
+
+def _sed_read_is_safe(arguments: tuple[str, ...], workspace: str | None) -> bool:
+    if len(arguments) < 3 or arguments[0] != "-n":
+        return False
+    if re.fullmatch(r"(?:\d+(?:,\d+)?|\$)?p", arguments[1]) is None:
+        return False
+    return _file_read_is_safe(arguments[2:], workspace)
+
+
+def _grep_is_safe(arguments: tuple[str, ...], workspace: str | None) -> bool:
+    pattern, paths = _search_pattern_and_paths(arguments, _SAFE_GREP_OPTIONS)
+    return (
+        pattern is not None and bool(paths) and _paths_are_contained(paths, workspace)
+    )
+
+
+def _rg_is_safe(arguments: tuple[str, ...], workspace: str | None) -> bool:
+    pattern, paths = _search_pattern_and_paths(arguments, _SAFE_RG_OPTIONS)
+    if pattern == "__files__":
+        return _paths_are_contained(paths, workspace)
+    return pattern is not None and _paths_are_contained(paths, workspace)
+
+
+def _search_pattern_and_paths(
+    arguments: tuple[str, ...], safe_options: frozenset[str]
+) -> tuple[str | None, list[str]]:
+    index = 0
+    files_mode = False
+    options_ended = False
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            options_ended = True
+            index += 1
+            break
+        if not options_ended and argument.startswith("-"):
+            if argument == "--files" and "--files" in safe_options:
+                files_mode = True
+                index += 1
+                continue
+            if not _safe_search_option(argument, safe_options):
+                return None, []
+            index += 1
+            continue
+        break
+    if files_mode:
+        return "__files__", list(arguments[index:])
+    if index >= len(arguments):
+        return None, []
+    return arguments[index], list(arguments[index + 1 :])
+
+
+def _safe_search_option(option: str, safe_options: frozenset[str]) -> bool:
+    if option.startswith("--"):
+        return option in safe_options
+    return (
+        len(option) > 1
+        and not option.startswith("--")
+        and all(f"-{flag}" in safe_options for flag in option[1:])
+    )
+
+
+def _find_is_safe(arguments: tuple[str, ...], workspace: str | None) -> bool:
+    if len(arguments) < 3 or not _path_is_contained(arguments[0], workspace):
+        return False
+    index = 1
+    found_name = False
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in {"-maxdepth", "-mindepth"}:
+            if index + 1 >= len(arguments) or not arguments[index + 1].isdigit():
+                return False
+            index += 2
+            continue
+        if argument == "-name":
+            if index + 1 >= len(arguments) or not _find_pattern_is_safe(
+                arguments[index + 1]
+            ):
+                return False
+            found_name = True
+            index += 2
+            continue
+        if argument == "-type":
+            if index + 1 >= len(arguments) or arguments[index + 1] not in {"f", "d"}:
+                return False
+            index += 2
+            continue
+        return False
+    return found_name
+
+
+def _find_pattern_is_safe(pattern: str) -> bool:
+    return bool(pattern) and not any(
+        marker in pattern for marker in ("/", "\\", "$", "{", "}")
+    )
+
+
+def _git_query_is_safe(arguments: tuple[str, ...]) -> bool:
+    if not arguments or arguments[0].startswith("-"):
+        return False
+    command, *rest = arguments
+    if command == "status":
+        return all(value in {"--short", "--porcelain", "--branch"} for value in rest)
+    if command == "diff":
+        return all(value in {"--cached", "--staged"} for value in rest)
+    if command == "log":
+        return not rest or rest == ["--oneline"]
+    if command == "show":
+        return len(rest) <= 1 and (not rest or not rest[0].startswith("-"))
+    return command == "branch" and rest == ["--show-current"]
+
+
+def _paths_are_contained(paths: list[str], workspace: str | None) -> bool:
+    return all(_path_is_contained(path, workspace) for path in paths)
+
+
+_SAFE_GREP_OPTIONS = frozenset(
+    {
+        "-r",
+        "-n",
+        "-i",
+        "-F",
+        "-E",
+        "-w",
+        "-x",
+        "--recursive",
+        "--line-number",
+        "--ignore-case",
+        "--fixed-strings",
+        "--extended-regexp",
+        "--word-regexp",
+    }
+)
+_SAFE_RG_OPTIONS = frozenset(
+    {
+        "-n",
+        "-i",
+        "-F",
+        "-S",
+        "-s",
+        "-w",
+        "-x",
+        "-l",
+        "--files",
+        "--line-number",
+        "--ignore-case",
+        "--fixed-strings",
+        "--smart-case",
+        "--case-sensitive",
+        "--word-regexp",
+        "--files-with-matches",
+        "--hidden",
+        "--no-ignore",
+    }
+)
 
 
 def _command_paths_are_contained(

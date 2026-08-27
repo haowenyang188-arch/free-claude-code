@@ -191,10 +191,14 @@ def test_approval_policy_environment_is_allowlisted_without_credentials():
             "FCC_APPROVAL_COMMANDS_JSON": '["git status"]',
             "FCC_APPROVAL_WORKSPACES_JSON": '["/tmp/project"]',
             "FCC_APPROVAL_ALLOW_PERMANENT": "false",
+            "FCC_APPROVAL_HEALTH_FILE": "/tmp/approval-health.jsonl",
+            "FCC_APPROVAL_GENERATION": "generation-1",
         },
     )
 
     assert environment["FCC_APPROVAL_ENABLED"] == "true"
+    assert environment["FCC_APPROVAL_HEALTH_FILE"] == "/tmp/approval-health.jsonl"
+    assert environment["FCC_APPROVAL_GENERATION"] == "generation-1"
     assert "OPENAI_API_KEY" not in environment
 
 

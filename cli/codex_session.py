@@ -12,13 +12,15 @@ import contextlib
 import json
 import os
 import signal
+import tempfile
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
-from .approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalResult
+from .approval import ApprovalPolicy, ApprovalRequest, ApprovalResult
 from .process_registry import register_process, unregister_process
 from .runtime_environment import build_cli_environment
 from .runtime_registry import RuntimeBackend, RuntimeRegistry
@@ -68,6 +70,13 @@ class CodexSession:
         self._is_busy = False
         self._cancel_requested = False
         self._cli_lock = asyncio.Lock()
+        self._approval_health = {
+            "hook_installed": self.approval_policy.enabled,
+            "hook_trust": "unverified" if self.approval_policy.enabled else "disabled",
+            "hook_active": False,
+            "last_hook_decision": None,
+            "execpolicy_runtime_result": "not_probed",
+        }
 
     @property
     def is_busy(self) -> bool:
@@ -94,8 +103,19 @@ class CodexSession:
 
         command.append("--json")
         if self.isolation_mode == "safe":
+            command.extend(["--ignore-user-config", "--strict-config"])
+            if not self.approval_policy.enabled:
+                command.append("--ignore-rules")
+        if self.approval_policy.enabled:
             command.extend(
-                ["--ignore-user-config", "--ignore-rules", "--strict-config"]
+                [
+                    "--config",
+                    'approval_policy="on-request"',
+                    "--config",
+                    'approvals_reviewer="user"',
+                    "--config",
+                    "allow_login_shell=false",
+                ]
             )
         if self.model:
             command.extend(["--model", self.model])
@@ -166,16 +186,27 @@ class CodexSession:
                 if self._staged_workspace is not None
                 else self.workspace
             )
-            self._is_busy = True
-            self._cancel_requested = False
-            env = build_cli_environment(
-                RuntimeBackend.CODEX,
-                extra_env=self.approval_policy.to_hook_environment()
-                if self.approval_policy.enabled
-                else None,
-            )
             generation = generation or uuid.uuid4().hex
             self.generation = generation
+            self._is_busy = True
+            self._cancel_requested = False
+            health_path: str | None = None
+            extra_env = self.approval_policy.to_hook_environment()
+            if self.approval_policy.enabled:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    prefix="fcc-approval-",
+                    suffix=".jsonl",
+                    delete=False,
+                ) as stream:
+                    health_path = stream.name
+                extra_env["FCC_APPROVAL_HEALTH_FILE"] = health_path
+                extra_env["FCC_APPROVAL_GENERATION"] = generation
+            env = build_cli_environment(
+                RuntimeBackend.CODEX,
+                extra_env=extra_env or None,
+            )
 
             try:
                 self.process = await asyncio.create_subprocess_exec(
@@ -249,6 +280,8 @@ class CodexSession:
                 yield {"type": "error", "error": {"message": str(exc)}}
                 yield {"type": "exit", "code": 1, "stderr": str(exc)}
             finally:
+                if health_path is not None:
+                    self._observe_hook_health_file(health_path)
                 if self.process and self.process.pid:
                     unregister_process(self.process.pid, generation=generation)
                 # Clean up staged workspace only if not awaiting approval
@@ -450,6 +483,16 @@ class CodexSession:
         return False
 
     def get_stats(self) -> dict[str, Any]:
+        approval_health = dict(self._approval_health)
+        approval_health["status"] = (
+            "ACTIVE"
+            if approval_health["hook_active"]
+            else (
+                "HOOK_REGISTERED_BUT_NOT_ACTIVE"
+                if approval_health["hook_installed"]
+                else "DISABLED"
+            )
+        )
         return {
             "backend": "codex",
             "session_id": self.current_session_id,
@@ -457,20 +500,42 @@ class CodexSession:
             "is_busy": self.is_busy,
             "auto_approval_enabled": self.approval_policy.enabled,
             "auto_approval_scope": self.approval_policy.max_auto_scope.value,
+            "approval_health": approval_health,
         }
 
     def evaluate_approval(self, request: ApprovalRequest) -> ApprovalResult:
-        """Evaluate a hook or PTY approval request without executing it."""
-        if request.process_id is not None and (
-            self.process is None or self.process.pid != request.process_id
-        ):
-            return ApprovalResult(
-                ApprovalDecision.ASK,
-                "approval process identity does not match the active session",
-            )
-        if request.generation is not None and request.generation != self.generation:
-            return ApprovalResult(
-                ApprovalDecision.ASK,
-                "approval generation does not match the active session",
-            )
+        """Classify a hook request without binding authorization to a PID."""
         return self.approval_policy.evaluate(request)
+
+    def observe_hook_activity(self, event: Mapping[str, Any]) -> None:
+        """Update health only for an activity record from this exact run generation."""
+        if not self.approval_policy.enabled:
+            return
+        if event.get("backend") != "codex":
+            return
+        if event.get("generation") != self.generation:
+            return
+        if event.get("event") not in {"PreToolUse", "PermissionRequest"}:
+            return
+        decision = event.get("decision")
+        if decision not in {"silent", "deny"}:
+            return
+        self._approval_health.update(
+            {
+                "hook_trust": "trusted",
+                "hook_active": True,
+                "last_hook_decision": decision,
+            }
+        )
+
+    def _observe_hook_health_file(self, health_path: str) -> None:
+        try:
+            for line in Path(health_path).read_text(encoding="utf-8").splitlines():
+                payload = json.loads(line)
+                if isinstance(payload, Mapping):
+                    self.observe_hook_activity(payload)
+        except OSError, ValueError, TypeError:
+            return
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(health_path)

@@ -64,9 +64,30 @@ class TestCodexSession:
             "inspect"
         )
 
-        assert command.count("--config") == 2
+        assert command.count("--config") == 5
         assert any("hooks.PreToolUse" in value for value in command)
         assert any("hooks.PermissionRequest" in value for value in command)
+
+    def test_enabled_approval_keeps_native_execpolicy_and_explicit_safe_defaults(
+        self, tmp_path
+    ) -> None:
+        from cli.approval import ApprovalPolicy
+        from cli.codex_session import CodexSession
+
+        policy = ApprovalPolicy.low_risk(enabled=True, allowed_workspaces=[tmp_path])
+        command = CodexSession(str(tmp_path), approval_policy=policy).build_command(
+            "inspect"
+        )
+
+        assert "--ignore-user-config" in command
+        assert "--ignore-rules" not in command
+        assert "--strict-config" in command
+        assert 'approval_policy="on-request"' in command
+        assert 'approvals_reviewer="user"' in command
+        assert "allow_login_shell=false" in command
+        assert "--approve-for-me" not in command
+        assert "--dangerously-bypass-hook-trust" not in command
+        assert "--dangerously-bypass-approvals-and-sandbox" not in command
 
     @pytest.mark.asyncio
     async def test_enabled_policy_projects_hook_environment(self, tmp_path) -> None:
