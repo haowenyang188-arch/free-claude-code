@@ -89,6 +89,81 @@ def _init_messages(*, turn_status: str = "completed") -> list[dict[str, Any]]:
 
 
 @pytest.mark.asyncio
+async def test_notification_projection_keeps_codex_identity_without_payload_copy(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.agents.codex_app_server import CodexAppServerSession
+
+    session = CodexAppServerSession(tmp_path)
+    assistant = await session._notification_event(
+        {
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "delta": "ready",
+                "prompt": "must not become identity",
+            },
+        }
+    )
+    tool = await session._notification_event(
+        {
+            "method": "item/commandExecution/outputDelta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-command-1",
+                "approvalId": "approval-1",
+                "delta": "done",
+                "command": "echo done",
+            },
+        }
+    )
+
+    assert assistant is not None
+    assert assistant["thread_id"] == "thread-1"
+    assert assistant["turn_id"] == "turn-1"
+    assert assistant["item_id"] == "item-1"
+    assert "prompt" not in assistant
+    assert tool is not None
+    assert tool["thread_id"] == "thread-1"
+    assert tool["turn_id"] == "turn-1"
+    assert tool["item_id"] == "item-command-1"
+    assert tool["approval_id"] == "approval-1"
+    assert "command" not in tool
+
+
+@pytest.mark.asyncio
+async def test_notification_projection_drops_invalid_codex_identity_values(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.agents.codex_app_server import CodexAppServerSession
+
+    session = CodexAppServerSession(tmp_path)
+    event = await session._notification_event(
+        {
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "bad\x00thread",
+                "turnId": " ",
+                "itemId": 123,
+                "approvalId": "x" * 513,
+                "delta": "ready",
+            },
+        }
+    )
+
+    assert event is not None
+    assert not {
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "approval_id",
+    }.intersection(event)
+
+
+@pytest.mark.asyncio
 async def test_app_server_session_uses_native_sandbox_and_normalizes_events(
     tmp_path: Path,
 ) -> None:
@@ -100,10 +175,17 @@ async def test_app_server_session_uses_native_sandbox_and_normalizes_events(
         session = CodexAppServerSession(tmp_path, sandbox_mode="read-only")
         events = [event async for event in session.start_task("inspect")]
 
-    assert events[0] == {"type": "session_info", "session_id": "thread-1"}
-    assert events[1]["type"] == "assistant"
-    assert events[1]["message"]["content"][0]["text"] == "ready"
-    assert events[-1] == {"type": "exit", "code": 0, "stderr": None}
+    assert events[0]["type"] == "assistant"
+    assert events[0]["message"]["content"][0]["text"] == "ready"
+    assert events[0]["thread_id"] == "thread-1"
+    assert events[0]["turn_id"] == "turn-1"
+    assert events[0]["item_id"] == "item-1"
+    assert events[1] == {"type": "session_info", "session_id": "thread-1"}
+    assert events[2]["type"] == "exit"
+    assert events[2]["thread_id"] == "thread-1"
+    assert events[2]["turn_id"] == "turn-1"
+    assert events[2]["code"] == 0
+    assert events[2]["stderr"] is None
     assert spawn.await_args is not None
     assert spawn.await_args.args[:3] == ("codex", "app-server", "--stdio")
     methods = [message.get("method") for message in process.stdin.writes]
@@ -143,7 +225,9 @@ async def test_initialize_failure_releases_owned_process(
     with (
         patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn,
         patch("workbench.backend.agents.codex_app_server.register_process") as register,
-        patch("workbench.backend.agents.codex_app_server.unregister_process") as unregister,
+        patch(
+            "workbench.backend.agents.codex_app_server.unregister_process"
+        ) as unregister,
     ):
         spawn.return_value = process
         session = CodexAppServerSession(tmp_path)
@@ -215,7 +299,9 @@ async def test_native_command_approval_waits_for_matching_one_shot_decision(
 
     responses = [message for message in process.stdin.writes if message.get("id") == 4]
     assert responses == [{"id": 4, "result": {"decision": "accept"}}]
-    assert events[-1] == {"type": "exit", "code": 0, "stderr": None}
+    assert events[-1]["type"] == "exit"
+    assert events[-1]["code"] == 0
+    assert events[-1]["stderr"] is None
     await session.stop()
 
 
@@ -306,9 +392,7 @@ def test_native_apply_patch_approval_binds_changes_and_rejects_escape(
         {
             "conversationId": "thread-1",
             "callId": "call-patch-1",
-            "fileChanges": {
-                "new.txt": {"type": "add", "content": "hello\n"}
-            },
+            "fileChanges": {"new.txt": {"type": "add", "content": "hello\n"}},
         },
     )
     escaped = session._intent_from_approval(
@@ -316,8 +400,19 @@ def test_native_apply_patch_approval_binds_changes_and_rejects_escape(
         {
             "conversationId": "thread-1",
             "callId": "call-patch-2",
+            "fileChanges": {"../outside.txt": {"type": "add", "content": "nope\n"}},
+        },
+    )
+    windows_escaped = session._intent_from_approval(
+        "applyPatchApproval",
+        {
+            "conversationId": "thread-1",
+            "callId": "call-patch-3",
             "fileChanges": {
-                "../outside.txt": {"type": "add", "content": "nope\n"}
+                r"C:\Users\someone\outside.txt": {
+                    "type": "add",
+                    "content": "nope\n",
+                }
             },
         },
     )
@@ -326,6 +421,7 @@ def test_native_apply_patch_approval_binds_changes_and_rejects_escape(
     assert intent.argv[0:2] == ("codex-file-change", "call-patch-1")
     assert intent.argv[-1]
     assert escaped is None
+    assert windows_escaped is None
 
 
 @pytest.mark.asyncio
@@ -432,9 +528,7 @@ async def test_native_file_change_approval_binds_cached_patch_content(
             on_approval_pending=on_pending,
             approval_timeout_seconds=5,
         )
-        task = asyncio.create_task(
-            _collect_events(session, "apply file change")
-        )
+        task = asyncio.create_task(_collect_events(session, "apply file change"))
         await asyncio.wait_for(pending_event.wait(), timeout=1)
         assert pending[0].status is ApprovalState.PENDING
         assert pending[0].argv[0] == "codex-file-change"
@@ -452,7 +546,5 @@ async def test_native_file_change_approval_binds_cached_patch_content(
     await session.stop()
 
 
-async def _collect_events(
-    session: Any, prompt: str
-) -> list[dict[str, Any]]:
+async def _collect_events(session: Any, prompt: str) -> list[dict[str, Any]]:
     return [event async for event in session.start_task(prompt)]

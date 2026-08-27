@@ -102,10 +102,32 @@ class CodexAppServerSession:
                     await self._open_thread(session_id, fork_session=fork_session)
                 elif self.current_session_id is None:
                     await self._open_thread(None, fork_session=False)
-                if self.current_session_id:
-                    yield {"type": "session_info", "session_id": self.current_session_id}
+                session_info = (
+                    {"type": "session_info", "session_id": self.current_session_id}
+                    if self.current_session_id
+                    else None
+                )
+                session_info_emitted = False
                 async for event in self._run_turn(prompt):
+                    # Keep terminal events last while associating the session with
+                    # the first real turn event when one is available.
+                    if (
+                        session_info is not None
+                        and not session_info_emitted
+                        and event.get("type") in {"exit", "error"}
+                    ):
+                        yield session_info
+                        session_info_emitted = True
                     yield event
+                    if (
+                        session_info is not None
+                        and not session_info_emitted
+                        and event.get("type") not in {"exit", "error"}
+                    ):
+                        yield session_info
+                        session_info_emitted = True
+                if session_info is not None and not session_info_emitted:
+                    yield session_info
             finally:
                 self._is_busy = False
 
@@ -365,7 +387,7 @@ class CodexAppServerSession:
             return {}, "decline"
         try:
             canonical = _canonical_json(permissions)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return {}, "decline"
         requested = {
             key: permissions[key]
@@ -429,7 +451,9 @@ class CodexAppServerSession:
                 requested_permission=requested_permission,
             )
         if method in {"item/fileChange/requestApproval", "applyPatchApproval"}:
-            patch_identity = self._file_change_identity(method, params, thread_id, item_id)
+            patch_identity = self._file_change_identity(
+                method, params, thread_id, item_id
+            )
             if patch_identity is None:
                 return None
             return CommandIntent.create(
@@ -465,7 +489,7 @@ class CodexAppServerSession:
             canonical = _canonical_json(
                 {"additionalPermissions": additional, "networkApprovalContext": network}
             )
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
         return _permission_label("process_spawn", canonical)
 
@@ -484,7 +508,7 @@ class CodexAppServerSession:
                 return None
             try:
                 return _canonical_json(changes)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 return None
         if item_id is None:
             return None
@@ -515,16 +539,28 @@ class CodexAppServerSession:
             return None
         if method == "item/agentMessage/delta":
             delta = _text(params.get("delta"))
-            return _assistant_event(delta) if delta else None
+            identity = _codex_identity(
+                params,
+                fallback_thread_id=self.current_session_id,
+            )
+            return _assistant_event(delta, identity=identity) if delta else None
         if method == "item/commandExecution/outputDelta":
             delta = _text(params.get("delta"))
-            item_id = _text(params.get("itemId")) or "codex-command"
+            identity = _codex_identity(
+                params,
+                fallback_thread_id=self.current_session_id,
+            )
+            item_id = identity.get("item_id") or "codex-command"
             if not delta:
                 return None
-            return _tool_result_event(item_id, delta)
+            return _tool_result_event(item_id, delta, identity=identity)
         if method == "item/fileChange/patchUpdated":
             thread_id = _text(params.get("threadId")) or self.current_session_id
             item_id = _text(params.get("itemId"))
+            identity = _codex_identity(
+                params,
+                fallback_thread_id=self.current_session_id,
+            )
             changes = params.get("changes")
             if (
                 thread_id
@@ -537,20 +573,47 @@ class CodexAppServerSession:
                     self._file_change_patches[(thread_id, item_id)] = _canonical_json(
                         changes
                     )
-            return {"type": "file_change", "item": dict(params)}
+            event = {"type": "file_change", "item": dict(params)}
+            event.update(identity)
+            return event
         if method == "item/started":
             item = params.get("item")
-            return _item_event(item, completed=False)
+            item_mapping = item if isinstance(item, Mapping) else None
+            identity = _codex_identity(
+                params,
+                item=item_mapping,
+                fallback_thread_id=self.current_session_id,
+            )
+            return _item_event(item, completed=False, identity=identity)
         if method == "item/completed":
             item = params.get("item")
-            return _item_event(item, completed=True)
+            item_mapping = item if isinstance(item, Mapping) else None
+            identity = _codex_identity(
+                params,
+                item=item_mapping,
+                fallback_thread_id=self.current_session_id,
+            )
+            return _item_event(item, completed=True, identity=identity)
         if method == "turn/completed":
             turn = params.get("turn")
             status = turn.get("status") if isinstance(turn, Mapping) else "completed"
             code = 0 if status in {None, "completed"} else 1
-            return {"type": "exit", "code": code, "stderr": None}
+            identity = _codex_identity(
+                params,
+                turn=turn if isinstance(turn, Mapping) else None,
+                fallback_thread_id=self.current_session_id,
+            )
+            event = {"type": "exit", "code": code, "stderr": None}
+            event.update(identity)
+            return event
         if method == "error":
-            return {"type": "error", "error": {"message": "Codex app-server error"}}
+            identity = _codex_identity(
+                params,
+                fallback_thread_id=self.current_session_id,
+            )
+            event = {"type": "error", "error": {"message": "Codex app-server error"}}
+            event.update(identity)
+            return event
         return None
 
     async def stop(self) -> bool:
@@ -621,9 +684,13 @@ def _patch_paths_stay_in_workspace(value: Any, workspace: Path) -> bool:
     """Reject patch identities that mention paths outside the native sandbox."""
     if isinstance(value, Mapping):
         for key, nested in value.items():
-            if key in {"path", "move_path"} and nested is not None and (
-                not isinstance(nested, str)
-                or not _path_stays_in_workspace(nested, workspace)
+            if (
+                key in {"path", "move_path"}
+                and nested is not None
+                and (
+                    not isinstance(nested, str)
+                    or not _path_stays_in_workspace(nested, workspace)
+                )
             ):
                 return False
             if not _patch_paths_stay_in_workspace(nested, workspace):
@@ -646,26 +713,99 @@ def _file_changes_stay_in_workspace(
 
 
 def _path_stays_in_workspace(value: str, workspace: Path) -> bool:
+    if value.startswith(("\\\\", "//")) or (
+        len(value) >= 3 and value[1] == ":" and value[2] in "/\\"
+    ):
+        return False
     try:
         candidate = Path(value)
         if not candidate.is_absolute():
             candidate = workspace / candidate
         candidate = candidate.resolve(strict=False)
         candidate.relative_to(workspace)
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return False
     return True
 
 
-def _assistant_event(text: str) -> dict[str, Any]:
-    return {
+_CODEX_IDENTITY_ALIASES: dict[str, tuple[str, ...]] = {
+    "thread_id": ("threadId", "thread_id"),
+    "turn_id": ("turnId", "turn_id"),
+    "item_id": ("itemId", "item_id"),
+    "approval_id": ("approvalId", "approval_id"),
+}
+
+
+def _codex_identity(
+    params: Mapping[str, Any],
+    *,
+    item: Mapping[str, Any] | None = None,
+    turn: Mapping[str, Any] | None = None,
+    fallback_thread_id: str | None = None,
+) -> dict[str, str]:
+    """Project only bounded lifecycle IDs from known app-server mappings."""
+    sources: tuple[Mapping[str, Any], ...] = tuple(
+        source for source in (params, item, turn) if isinstance(source, Mapping)
+    )
+    identity: dict[str, str] = {}
+    for field, aliases in _CODEX_IDENTITY_ALIASES.items():
+        for source in sources:
+            value = next(
+                (
+                    normalized
+                    for alias in aliases
+                    if (normalized := _identity_text(source.get(alias))) is not None
+                ),
+                None,
+            )
+            if value is not None:
+                identity[field] = value
+                break
+    if "item_id" not in identity and isinstance(item, Mapping):
+        item_id = _identity_text(item.get("id"))
+        if item_id is not None:
+            identity["item_id"] = item_id
+    if "turn_id" not in identity and isinstance(turn, Mapping):
+        turn_id = _identity_text(turn.get("id"))
+        if turn_id is not None:
+            identity["turn_id"] = turn_id
+    if "thread_id" not in identity:
+        fallback = _identity_text(fallback_thread_id)
+        if fallback is not None:
+            identity["thread_id"] = fallback
+    return identity
+
+
+def _identity_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > 512:
+        return None
+    if any(ord(char) < 0x20 for char in normalized):
+        return None
+    return normalized
+
+
+def _assistant_event(
+    text: str, *, identity: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
         "type": "assistant",
         "message": {"content": [{"type": "text", "text": text}]},
     }
+    if identity:
+        event.update(identity)
+    return event
 
 
-def _tool_result_event(tool_id: str, content: str) -> dict[str, Any]:
-    return {
+def _tool_result_event(
+    tool_id: str,
+    content: str,
+    *,
+    identity: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
         "type": "assistant",
         "message": {
             "content": [
@@ -678,23 +818,33 @@ def _tool_result_event(tool_id: str, content: str) -> dict[str, Any]:
             ]
         },
     }
+    if identity:
+        event.update(identity)
+    return event
 
 
-def _item_event(item: Any, *, completed: bool) -> dict[str, Any] | None:
+def _item_event(
+    item: Any,
+    *,
+    completed: bool,
+    identity: Mapping[str, str] | None = None,
+) -> dict[str, Any] | None:
     if not isinstance(item, Mapping):
         return None
     item_type = item.get("type")
     item_id = _text(item.get("id")) or "codex-item"
     if item_type == "agentMessage":
         text = _text(item.get("text"))
-        return _assistant_event(text) if text else None
+        return _assistant_event(text, identity=identity) if text else None
     if item_type == "commandExecution":
         command = _text(item.get("command")) or "command"
         if completed:
             return _tool_result_event(
-                item_id, _text(item.get("aggregatedOutput")) or ""
+                item_id,
+                _text(item.get("aggregatedOutput")) or "",
+                identity=identity,
             )
-        return {
+        event: dict[str, Any] = {
             "type": "assistant",
             "message": {
                 "content": [
@@ -707,8 +857,14 @@ def _item_event(item: Any, *, completed: bool) -> dict[str, Any] | None:
                 ]
             },
         }
+        if identity:
+            event.update(identity)
+        return event
     if item_type == "fileChange":
-        return {"type": "file_change", "item": dict(item)}
+        event = {"type": "file_change", "item": dict(item)}
+        if identity:
+            event.update(identity)
+        return event
     return None
 
 
