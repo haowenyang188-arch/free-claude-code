@@ -278,7 +278,14 @@ class WorkbenchService:
         ):
             agent_id = str(uuid.uuid4())
             try:
-                adapter = adapter_type(agent_id)
+                if adapter_type is CodexAdapter:
+                    adapter = adapter_type(
+                        agent_id,
+                        use_app_server=True,
+                        approval_manager=self.approvals,
+                    )
+                else:
+                    adapter = adapter_type(agent_id)
             except Exception as exc:
                 print(f"✗ {adapter_type.__name__} initialization failed: {exc!s}")
                 continue

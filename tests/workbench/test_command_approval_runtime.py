@@ -126,6 +126,65 @@ async def test_reject_and_cancel_after_expiry_preserve_approval_timeout(
         ).status.value == "approval_timeout"
 
 
+@pytest.mark.asyncio
+async def test_native_approval_waiter_is_released_by_matching_http_decision(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.runtime.approval import (
+        ApprovalManager,
+        ApprovalState,
+        CommandIntent,
+    )
+
+    intent = CommandIntent.create(
+        session_id="native-session",
+        call_id="native-call",
+        command="python task.py",
+        cwd=tmp_path,
+        requested_permission="process_spawn",
+    )
+    approvals = ApprovalManager()
+    pending = await approvals.request(intent)
+    waiter = asyncio.create_task(approvals.wait_for_terminal(intent))
+    await asyncio.sleep(0)
+
+    decided = await approvals.approve(
+        session_id=intent.session_id,
+        call_id=intent.call_id,
+        command_hash=intent.command_hash,
+    )
+    observed = await asyncio.wait_for(waiter, timeout=1)
+
+    assert pending.status is ApprovalState.PENDING
+    assert decided.status is ApprovalState.APPROVED
+    assert observed.status is ApprovalState.APPROVED
+
+
+@pytest.mark.asyncio
+async def test_native_approval_waiter_expires_without_starting_a_process(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.runtime.approval import (
+        ApprovalManager,
+        ApprovalState,
+        CommandIntent,
+    )
+
+    intent = CommandIntent.create(
+        session_id="native-timeout-session",
+        call_id="native-timeout-call",
+        command="python task.py",
+        cwd=tmp_path,
+        requested_permission="process_spawn",
+    )
+    approvals = ApprovalManager()
+    await approvals.request(intent, approval_timeout_seconds=10)
+
+    observed = await approvals.wait_for_terminal(intent, timeout_seconds=0.01)
+
+    assert observed.status is ApprovalState.APPROVAL_TIMEOUT
+
+
 @pytest.mark.parametrize(
     ("command", "expected"),
     [
@@ -147,7 +206,7 @@ async def test_reject_and_cancel_after_expiry_preserve_approval_timeout(
         ("systemctl status ssh", "level_b"),
         ("chmod +x scripts/check.sh", "level_b"),
         ("curl -sf http://127.0.0.1:8000/health", "level_a"),
-        ("curl -X POST http://127.0.0.1:8000/health", "level_c"),
+        ("curl -X POST http://127.0.0.1:8000/health", "level_b"),
         ("pytest tests/unit", "level_a"),
         ("npm install package", "level_b"),
         ("rm -rf /", "level_c"),

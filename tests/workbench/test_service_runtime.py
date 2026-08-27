@@ -278,6 +278,58 @@ async def test_workbench_adapter_availability_requires_safe_profile(
 
 
 @pytest.mark.asyncio
+async def test_workbench_injects_shared_one_shot_approvals_into_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class _AdapterStub:
+        def __init__(self, agent_id: str, agent_type: AgentType, **kwargs: Any) -> None:
+            self.agent_id = agent_id
+            self.agent_type = agent_type
+            self.status = AgentStatus.OFFLINE
+            self.current_run_id = None
+            captured[agent_type.value] = kwargs
+
+        def set_event_callback(self, callback: Any) -> None:
+            self.callback = callback
+
+        async def initialize(self) -> bool:
+            self.status = AgentStatus.ONLINE
+            return True
+
+    class _ClaudeStub(_AdapterStub):
+        def __init__(self, agent_id: str, **kwargs: Any) -> None:
+            super().__init__(agent_id, AgentType.CLAUDE_CODE, **kwargs)
+
+    class _CodexStub(_AdapterStub):
+        def __init__(self, agent_id: str, **kwargs: Any) -> None:
+            super().__init__(agent_id, AgentType.CODEX, **kwargs)
+
+    class _DshStub(_AdapterStub):
+        def __init__(self, agent_id: str, **kwargs: Any) -> None:
+            super().__init__(agent_id, AgentType.DEEPSEEK_HARNESS, **kwargs)
+
+    monkeypatch.setattr(main_module, "ClaudeCodeAdapter", _ClaudeStub)
+    monkeypatch.setattr(main_module, "CodexAdapter", _CodexStub)
+    monkeypatch.setattr(main_module, "DeepSeekHarnessAdapter", _DshStub)
+    service = WorkbenchService(
+        workspace_root=tmp_path,
+        event_log_path=tmp_path / "events.jsonl",
+        state_path=tmp_path / "state.json",
+    )
+
+    await service.initialize()
+
+    assert captured[AgentType.CODEX.value] == {
+        "use_app_server": True,
+        "approval_manager": service.approvals,
+    }
+    assert captured[AgentType.CLAUDE_CODE.value] == {}
+    assert captured[AgentType.DEEPSEEK_HARNESS.value] == {}
+
+
+@pytest.mark.asyncio
 async def test_start_task_does_not_overwrite_immediate_terminal_event(
     tmp_path: Path,
 ) -> None:

@@ -236,10 +236,12 @@ def _risk_for(argv: tuple[str, ...], cwd: Path | None = None) -> CommandRisk:
     if _contains_sensitive_reference(arguments, executable=executable):
         return CommandRisk.LEVEL_C
     if executable in {"curl", "curl.exe", "wget", "wget.exe"}:
+        if _is_loopback_health_check(arguments, executable=executable):
+            return CommandRisk.LEVEL_A
         return (
-            CommandRisk.LEVEL_A
-            if _is_loopback_health_check(arguments)
-            else CommandRisk.LEVEL_C
+            CommandRisk.LEVEL_C
+            if _network_request_is_destructive(arguments)
+            else CommandRisk.LEVEL_B
         )
     if executable in _SHELL_WRAPPER_EXECUTABLES:
         return _shell_wrapper_risk(executable, arguments)
@@ -646,7 +648,25 @@ def _looks_like_non_path(value: str) -> bool:
     )
 
 
-def _is_loopback_health_check(arguments: tuple[str, ...]) -> bool:
+def _network_request_is_destructive(arguments: tuple[str, ...]) -> bool:
+    """Return whether a network request has an explicit destructive method."""
+    for index, value in enumerate(arguments):
+        if (
+            value in {"-X", "--request", "--method"}
+            and index + 1 < len(arguments)
+            and arguments[index + 1].upper() in {"DELETE", "PURGE"}
+        ):
+            return True
+        if value.startswith(("-X=", "--request=", "--method=")):
+            method = value.split("=", 1)[1].upper()
+            if method in {"DELETE", "PURGE"}:
+                return True
+    return False
+
+
+def _is_loopback_health_check(
+    arguments: tuple[str, ...], *, executable: str | None = None
+) -> bool:
     urls = [value for value in arguments if value.startswith(("http://", "https://"))]
     if not urls:
         return False
@@ -672,6 +692,14 @@ def _is_loopback_health_check(arguments: tuple[str, ...]) -> bool:
             "--show-error",
             "--fail",
             "--head",
+            "--location",
+            "--compressed",
+            "--no-progress-meter",
+            "--retry-all-errors",
+            "--spider",
+            "-nv",
+            "--no-verbose",
+            "--server-response",
         }:
             index += 1
             continue
@@ -679,15 +707,66 @@ def _is_loopback_health_check(arguments: tuple[str, ...]) -> bool:
             value.startswith("-")
             and not value.startswith("--")
             and len(value) > 1
-            and all(flag in "sSfIL" for flag in value[1:])
+            and all(flag in "sSfILqnv" for flag in value[1:])
         ):
             index += 1
             continue
-        if value in {"-X", "--request"} and index + 1 < len(arguments):
-            if arguments[index + 1].upper() == "GET":
+        if value in {"-X", "--request", "--method"} and index + 1 < len(arguments):
+            if arguments[index + 1].upper() in {"GET", "HEAD"}:
                 index += 2
                 continue
             return False
+        if value.startswith(("-X=", "--request=", "--method=")):
+            if value.split("=", 1)[1].upper() in {"GET", "HEAD"}:
+                index += 1
+                continue
+            return False
+        if value in {"--url", "-u"} and index + 1 < len(arguments):
+            if arguments[index + 1].startswith(("http://", "https://")):
+                index += 2
+                continue
+            return False
+        if value.startswith("--url="):
+            index += 1
+            continue
+        if value in {
+            "--max-time",
+            "--connect-timeout",
+            "--retry",
+            "--retry-delay",
+            "--retry-max-time",
+            "--timeout",
+            "--tries",
+        } and index + 1 < len(arguments):
+            index += 2
+            continue
+        if any(
+            value.startswith(prefix)
+            for prefix in (
+                "--max-time=",
+                "--connect-timeout=",
+                "--retry=",
+                "--retry-delay=",
+                "--retry-max-time=",
+                "--timeout=",
+                "--tries=",
+            )
+        ):
+            index += 1
+            continue
+        if value in {"-O", "--output", "--output-document"} and index + 1 < len(arguments):
+            # A sink/stdout does not mutate workspace state; a file output is
+            # an ordinary write and therefore requires an explicit approval.
+            if arguments[index + 1] in {"-", "/dev/null"}:
+                index += 2
+                continue
+            return False
+        if value.startswith(("-O-", "--output=-", "--output-document=-")):
+            index += 1
+            continue
+        if executable in {"wget", "wget.exe"} and value in {"--method=GET"}:
+            index += 1
+            continue
         return False
     return True
 
@@ -795,6 +874,7 @@ class ApprovalManager:
 
     def __init__(self) -> None:
         self._records: dict[tuple[str, str], ApprovalRecord] = {}
+        self._waiters: dict[tuple[str, str], asyncio.Future[ApprovalRecord]] = {}
         self._lock = asyncio.Lock()
 
     async def request(
@@ -863,6 +943,7 @@ class ApprovalManager:
                 reason="allow_once",
             )
             self._records[(session_id, call_id)] = approved
+            self._resolve_waiter_locked(session_id, call_id, approved)
             return approved
 
     async def reject(
@@ -878,6 +959,7 @@ class ApprovalManager:
                 raise ApprovalIntegrityError("approval_unavailable")
             rejected = replace(record, status=ApprovalState.REJECTED, reason="rejected")
             self._records[(session_id, call_id)] = rejected
+            self._resolve_waiter_locked(session_id, call_id, rejected)
             return rejected
 
     async def cancel(
@@ -895,7 +977,53 @@ class ApprovalManager:
                 record, status=ApprovalState.CANCELLED, reason="cancelled"
             )
             self._records[(session_id, call_id)] = cancelled
+            self._resolve_waiter_locked(session_id, call_id, cancelled)
             return cancelled
+
+    async def wait_for_terminal(
+        self, intent: CommandIntent, *, timeout_seconds: float | None = None
+    ) -> ApprovalRecord:
+        """Wait for an external decision on this exact one-shot grant."""
+        intent.verify_integrity()
+        if timeout_seconds is not None and timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be non-negative")
+        key = (intent.session_id, intent.call_id)
+        async with self._lock:
+            record = self._records.get(key)
+            if record is None:
+                raise ApprovalIntegrityError("approval_unavailable")
+            record = self._expire_if_needed(record)
+            self._records[key] = record
+            if record.status is not ApprovalState.PENDING:
+                return record
+            if key in self._waiters:
+                raise ApprovalIntegrityError("approval_unavailable")
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[ApprovalRecord] = loop.create_future()
+            self._waiters[key] = future
+            remaining = max(0.0, (record.expires_at - datetime.now(UTC)).total_seconds())
+            if timeout_seconds is not None:
+                remaining = min(remaining, timeout_seconds)
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout=remaining)
+        except TimeoutError:
+            async with self._lock:
+                current = self._records.get(key)
+                if current is None:
+                    raise ApprovalIntegrityError("approval_unavailable") from None
+                if current.status is ApprovalState.PENDING:
+                    current = replace(
+                        current,
+                        status=ApprovalState.APPROVAL_TIMEOUT,
+                        reason="approval_timeout",
+                    )
+                    self._records[key] = current
+                self._resolve_waiter_locked(*key, current)
+                return current
+        finally:
+            async with self._lock:
+                if self._waiters.get(key) is future:
+                    self._waiters.pop(key, None)
 
     async def consume(self, intent: CommandIntent) -> ApprovalRecord:
         intent.verify_integrity()
@@ -940,6 +1068,13 @@ class ApprovalManager:
         if not hmac.compare_digest(record.command_hash, command_hash):
             raise ApprovalIntegrityError("approval_integrity_mismatch")
         return record
+
+    def _resolve_waiter_locked(
+        self, session_id: str, call_id: str, record: ApprovalRecord
+    ) -> None:
+        future = self._waiters.get((session_id, call_id))
+        if future is not None and not future.done():
+            future.set_result(record)
 
     @staticmethod
     def _expire_if_needed(record: ApprovalRecord) -> ApprovalRecord:

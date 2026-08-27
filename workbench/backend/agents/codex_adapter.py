@@ -9,6 +9,9 @@ from typing import Any
 from cli.codex_session import CodexSession
 from cli.runtime_registry import RuntimeBackend, RuntimeRegistry
 
+from ..runtime.approval import ApprovalManager, ApprovalRecord
+from .codex_app_server import CodexAppServerSession
+
 if __package__:
     from ..models import AgentStatus, AgentType, EventType
     from .base import BaseAgentAdapter
@@ -17,14 +20,23 @@ if __package__:
 class CodexAdapter(BaseAgentAdapter):
     """Codex CLI适配器 - 使用 CodexSession 实现真实会话管理"""
 
-    def __init__(self, agent_id: str):
+    def __init__(
+        self,
+        agent_id: str,
+        *,
+        use_app_server: bool = False,
+        approval_manager: ApprovalManager | None = None,
+    ):
         super().__init__(agent_id, AgentType.CODEX)
         self.cli_path = "codex"
         self.workspace_path: str = ""
         self.runtime_registry = RuntimeRegistry(
             executables={RuntimeBackend.CODEX: self.cli_path}
         )
-        self.session: CodexSession | None = None
+        self.session: CodexSession | CodexAppServerSession | None = None
+        self.app_server_session: CodexAppServerSession | None = None
+        self.use_app_server = use_app_server
+        self.approval_manager = approval_manager
         self.session_id: str | None = None
         self.generation: str | None = None
 
@@ -59,8 +71,16 @@ class CodexAdapter(BaseAgentAdapter):
                 },
             )
 
-            # Workbench and messaging now share one Codex session contract.
-            if self.session is None:
+            if self.use_app_server:
+                if self.app_server_session is None:
+                    self.app_server_session = CodexAppServerSession(
+                        workspace_path=workspace_path,
+                        sandbox_mode="read-only",
+                        approval_manager=self.approval_manager,
+                        on_approval_pending=self._on_approval_pending,
+                    )
+                self.session = self.app_server_session
+            elif self.session is None:
                 self.session = CodexSession(
                     workspace_path=workspace_path,
                     sandbox_mode="read-only",
@@ -87,6 +107,26 @@ class CodexAdapter(BaseAgentAdapter):
             )
             self.current_run_id = None
             return False
+
+    async def _on_approval_pending(self, record: ApprovalRecord) -> None:
+        """Expose the exact native approval request to the Workbench UI."""
+        await self.emit_event(
+            EventType.USER_INPUT_REQUIRED,
+            {
+                "message": "等待一次性审批",
+                "awaiting_approval": True,
+                "approval": {
+                    "session_id": record.session_id,
+                    "call_id": record.call_id,
+                    "normalized_command": record.normalized_command,
+                    "command_hash": record.command_hash,
+                    "cwd": str(record.cwd),
+                    "requested_permission": record.requested_permission,
+                    "risk": record.risk.value,
+                    "status": record.status.value,
+                },
+            },
+        )
 
     async def _run_codex_task(
         self,
@@ -306,6 +346,9 @@ class CodexAdapter(BaseAgentAdapter):
         """Close the shared session before resetting adapter lifecycle state."""
         if self.session is not None:
             await self.session.stop()
-            self.session.reject()
+            reject = getattr(self.session, "reject", None)
+            if callable(reject):
+                reject()
             self.session = None
+            self.app_server_session = None
         await super().cleanup()
