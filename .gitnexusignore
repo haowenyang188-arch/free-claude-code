@@ -1,0 +1,9 @@
+# Local generated state and binary assets are not source-level graph inputs.
+data/rag-index/vectors.db-wal
+prompt-optimizer/packages/desktop/icons/app-icon.icns
+
+# Captured webpack vendor payloads are opaque third-party bundles.
+tools/Spider_XHS/static/xhs_a1_other.js
+tools/Spider_XHS/static/xhs_creator_sign_other.js
+tools/Spider_XHS/static/xhs_xray_pack1.js
+tools/Spider_XHS/static/xhs_xray_pack2.js

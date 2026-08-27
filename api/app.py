@@ -175,9 +175,13 @@ async def lifespan(app: FastAPI):
                 os.path.join(settings.claude_workspace, "plans")
             )
             plans_directory = os.path.relpath(plans_dir_abs, workspace)
-            approval_scope = ApprovalScope(
-                getattr(settings, "cli_auto_approval_scope", "once")
-            )
+            approval_scope_value = getattr(settings, "cli_auto_approval_scope", "once")
+            if not isinstance(approval_scope_value, str):
+                approval_scope_value = "once"
+            try:
+                approval_scope = ApprovalScope(approval_scope_value)
+            except ValueError:
+                approval_scope = ApprovalScope.ONCE
             approval_commands_value = getattr(
                 settings, "cli_auto_approval_commands", ""
             )
@@ -198,15 +202,24 @@ async def lifespan(app: FastAPI):
                 for value in approval_workspaces_value.split(",")
                 if value.strip()
             ] or [workspace]
+            approval_enabled = getattr(settings, "cli_auto_approval_enabled", False)
+            if not isinstance(approval_enabled, bool):
+                approval_enabled = False
+            approval_allow_permanent = getattr(
+                settings, "cli_auto_approval_allow_permanent", False
+            )
+            if not isinstance(approval_allow_permanent, bool):
+                approval_allow_permanent = False
+            mcp_config_path = getattr(settings, "cli_mcp_config", "")
+            if not isinstance(mcp_config_path, str):
+                mcp_config_path = ""
             approval_policy = ApprovalPolicy(
-                enabled=getattr(settings, "cli_auto_approval_enabled", False),
+                enabled=approval_enabled,
                 allowed_command_prefixes=approval_commands
                 or DEFAULT_SAFE_COMMAND_PREFIXES,
                 allowed_workspaces=approval_workspaces,
                 max_auto_scope=approval_scope,
-                allow_permanent=getattr(
-                    settings, "cli_auto_approval_allow_permanent", False
-                ),
+                allow_permanent=approval_allow_permanent,
             )
             cli_manager = CLISessionManager(
                 workspace_path=workspace,
@@ -228,7 +241,7 @@ async def lifespan(app: FastAPI):
                 preflight_runtime=getattr(settings, "cli_runtime_preflight", True),
                 isolation_mode=getattr(settings, "cli_isolation_mode", "safe"),
                 approval_policy=approval_policy,
-                mcp_config_path=getattr(settings, "cli_mcp_config", ""),
+                mcp_config_path=mcp_config_path,
             )
 
             # Initialize session store
