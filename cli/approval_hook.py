@@ -47,7 +47,9 @@ def _record_activity(payload: dict[str, Any], output: dict[str, Any] | None) -> 
         path = Path(health_file)
         if not path.is_absolute():
             return
-        backend = "codex" if payload.get("turn_id") or payload.get("turnId") else "claude"
+        backend = (
+            "codex" if payload.get("turn_id") or payload.get("turnId") else "claude"
+        )
         decision = "deny" if output is not None else "silent"
         event = {
             "backend": backend,
