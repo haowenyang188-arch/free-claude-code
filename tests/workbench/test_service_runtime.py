@@ -330,6 +330,47 @@ async def test_workbench_injects_shared_one_shot_approvals_into_codex(
 
 
 @pytest.mark.asyncio
+async def test_codex_native_approval_event_contains_exact_one_shot_identity(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.runtime.approval import ApprovalManager, CommandIntent
+
+    adapter = CodexAdapter(
+        "agent-1", use_app_server=True, approval_manager=ApprovalManager()
+    )
+    adapter.current_run_id = "run-1"
+    intent = CommandIntent.create(
+        session_id="thread-1",
+        call_id="call-1",
+        command="python task.py",
+        cwd=tmp_path,
+        requested_permission="process_spawn",
+    )
+    approval_manager = adapter.approval_manager
+    assert approval_manager is not None
+    record = await approval_manager.request(intent)
+    observed: list[Event] = []
+
+    async def callback(event: Event) -> None:
+        observed.append(event)
+
+    adapter.set_event_callback(callback)
+    await adapter._on_approval_pending(record)
+
+    approval = observed[0].data["approval"]
+    assert approval == {
+        "session_id": "thread-1",
+        "call_id": "call-1",
+        "normalized_command": intent.normalized_command,
+        "command_hash": intent.command_hash,
+        "cwd": str(tmp_path.resolve()),
+        "requested_permission": "process_spawn",
+        "risk": "level_b",
+        "status": "pending",
+    }
+
+
+@pytest.mark.asyncio
 async def test_start_task_does_not_overwrite_immediate_terminal_event(
     tmp_path: Path,
 ) -> None:
