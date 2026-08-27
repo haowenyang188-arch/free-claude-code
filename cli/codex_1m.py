@@ -435,6 +435,12 @@ def _prepare_catalog_content(result: CommandResult) -> bytes:
         percent = _optional_int(model.get("effective_context_window_percent")) or 100
     except (ValueError, json.JSONDecodeError) as exc:
         raise ConfigurationBlocked(_safe_error(str(exc))) from exc
+    if current_maximum < DESIRED_CONTEXT_WINDOW:
+        raise ConfigurationBlocked(
+            "Bundled catalog max context "
+            f"{current_maximum:,} is below the requested "
+            f"{DESIRED_CONTEXT_WINDOW:,}-token default"
+        )
     if DESIRED_CONTEXT_WINDOW * percent // 100 <= AUTO_COMPACT_TOKEN_LIMIT:
         raise ConfigurationBlocked(
             "The catalog effective context percentage is too small for a 900,000-token "

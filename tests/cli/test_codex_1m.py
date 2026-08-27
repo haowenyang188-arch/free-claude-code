@@ -61,11 +61,13 @@ class FakeCodexRunner:
     def __init__(
         self,
         *,
-        bundled_max_context_window: int = 272_000,
+        bundled_max_context_window: int = DESIRED_CONTEXT_WINDOW,
+        active_max_context_window: int | None = None,
         ignore_custom_catalog: bool = False,
         include_target_model: bool = True,
     ) -> None:
         self.bundled_max_context_window = bundled_max_context_window
+        self.active_max_context_window = active_max_context_window
         self.ignore_custom_catalog = ignore_custom_catalog
         self.include_target_model = include_target_model
 
@@ -92,7 +94,11 @@ class FakeCodexRunner:
         if command == ["debug", "models", "--bundled"]:
             return CommandResult(0, json.dumps(self._bundled_catalog()), "")
         if command == ["debug", "models"]:
-            payload = self._bundled_catalog()
+            payload = (
+                _catalog(self.active_max_context_window)
+                if self.active_max_context_window is not None
+                else self._bundled_catalog()
+            )
             config_path = Path(env["CODEX_HOME"]) / "config.toml"
             if config_path.exists() and not self.ignore_custom_catalog:
                 config = tomllib.loads(config_path.read_text("utf-8"))
@@ -142,7 +148,10 @@ def _target(tmp_path: Path) -> CodexTarget:
 def test_status_reports_current_272k_catalog_before_configuration(
     tmp_path: Path,
 ) -> None:
-    status = inspect_target(_target(tmp_path), runner=FakeCodexRunner())
+    status = inspect_target(
+        _target(tmp_path),
+        runner=FakeCodexRunner(bundled_max_context_window=272_000),
+    )
 
     assert status.catalog_max_context_window == 272_000
     assert status.effective_context_window == 258_400
@@ -201,13 +210,13 @@ def test_configure_is_idempotent_for_managed_files(tmp_path: Path) -> None:
 
 
 def test_prepare_catalog_disables_parallel_calls_on_duplicate_target_models() -> None:
-    payload = _catalog()
+    payload = _catalog(DESIRED_CONTEXT_WINDOW)
     payload["models"].append(
         {
             "slug": MODEL_SLUG,
             "display_name": "GPT-5.6-Sol duplicate",
-            "context_window": 272_000,
-            "max_context_window": 272_000,
+            "context_window": DESIRED_CONTEXT_WINDOW,
+            "max_context_window": DESIRED_CONTEXT_WINDOW,
             "supports_parallel_tool_calls": True,
         }
     )
@@ -220,6 +229,19 @@ def test_prepare_catalog_disables_parallel_calls_on_duplicate_target_models() ->
         for item in catalog["models"]
         if item["slug"] == MODEL_SLUG
     ] == [False, False]
+
+
+def test_configure_refuses_catalog_below_requested_1m_context(tmp_path: Path) -> None:
+    target = _target(tmp_path)
+
+    with pytest.raises(ConfigurationBlocked, match="max context"):
+        configure_target(
+            target,
+            runner=FakeCodexRunner(bundled_max_context_window=872_000),
+        )
+
+    assert not (target.home / "config.toml").exists()
+    assert not (target.home / CATALOG_RELATIVE_PATH).exists()
 
 
 def test_configure_refuses_unmanaged_default_keys(tmp_path: Path) -> None:
@@ -273,7 +295,11 @@ def test_configure_rolls_back_all_files_when_runtime_ignores_catalog(
     with pytest.raises(ConfigurationBlocked, match="verification failed"):
         configure_target(
             target,
-            runner=FakeCodexRunner(ignore_custom_catalog=True),
+            runner=FakeCodexRunner(
+                bundled_max_context_window=DESIRED_CONTEXT_WINDOW,
+                active_max_context_window=272_000,
+                ignore_custom_catalog=True,
+            ),
         )
 
     assert config_path.read_text("utf-8") == original
