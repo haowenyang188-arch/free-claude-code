@@ -237,7 +237,8 @@ _DANGEROUS_RE = re.compile(
     r"wmic\s+shadowcopy\s+delete|wevtutil\s+cl\b|auditpol\s+/clear\b|"
     r"format-volume\b|clear-disk\b|remove-partition\b|initialize-disk\b|"
     r"reset-physicaldisk\b|bcdedit\s+/delete\b)|"
-    r"(?:cmd(?:\.exe)?\s+/(?:c|k))?\s*(?:reg|sc(?:\.exe)?|netsh)\s+|"
+    r"(?:cmd(?:\.exe)?\s+/(?:c|k))?\s*(?:reg|sc(?:\.exe)?|netsh)\s+"
+    r"(?:delete|add|create|config|stop|start|change|set)\b|"
     r"(?:curl|wget)\b[^;&|]*(?:[|]|\b(?:sh|bash|pwsh|powershell)\b)|"
     r"(?:python|python3|node|ruby)\s+-c\b|"
     r"npm\s+publish\b|"
@@ -859,7 +860,24 @@ def _contains_dangerous_command(tokens: tuple[str, ...]) -> bool:
         if executable_index is None:
             continue
         executable = _executable_name(tokens[executable_index])
-        if executable in _DANGEROUS_EXECUTABLES:
+        if executable in _DANGEROUS_EXECUTABLES and (
+            executable
+            not in {
+                "reg",
+                "reg.exe",
+                "sc",
+                "sc.exe",
+                "systemctl",
+                "systemctl.exe",
+                "service",
+                "service.exe",
+                "chmod",
+                "chmod.exe",
+                "chown",
+                "chown.exe",
+            }
+            or _system_command_is_dangerous(tokens[executable_index:])
+        ):
             return True
         if executable in {
             "powershell",
@@ -998,6 +1016,32 @@ def _windows_command_is_dangerous(tokens: tuple[str, ...]) -> bool:
             r"\b(?:invoke-webrequest|iwr|invoke-expression|iex|downloadstring)\b", text
         )
     )
+
+
+def _system_command_is_dangerous(tokens: tuple[str, ...]) -> bool:
+    """Identify mutating system commands while allowing status/query probes."""
+    executable = _executable_name(tokens[0]) if tokens else ""
+    arguments = tuple(value.lower() for value in tokens[1:])
+    if executable in {"reg", "reg.exe"}:
+        return bool(arguments) and arguments[0] not in {"query", "compare"}
+    if executable in {"sc", "sc.exe"}:
+        return bool(arguments) and arguments[0] not in {"query", "qc", "enumdepends"}
+    if executable in {"systemctl", "systemctl.exe"}:
+        return bool(arguments) and arguments[0] not in {
+            "status",
+            "is-active",
+            "is-enabled",
+            "show",
+            "list-units",
+            "list-unit-files",
+        }
+    if executable in {"service", "service.exe"}:
+        return bool(arguments) and arguments[-1] != "status"
+    if executable in {"chmod", "chmod.exe"}:
+        return any(value in {"-R", "--recursive", "-rf"} for value in arguments)
+    if executable in {"chown", "chown.exe"}:
+        return any(value in {"-R", "--recursive"} for value in arguments)
+    return False
 
 
 def _safe_tool_input_is_valid(request: ApprovalRequest) -> bool:

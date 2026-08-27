@@ -245,7 +245,9 @@ def _risk_for(argv: tuple[str, ...], cwd: Path | None = None) -> CommandRisk:
         return _shell_wrapper_risk(executable, arguments)
     if _direct_system_command_is_dangerous(executable, arguments):
         return CommandRisk.LEVEL_C
-    if executable in _DANGEROUS_EXECUTABLES:
+    if executable in _DANGEROUS_EXECUTABLES and not _safe_system_diagnostic(
+        executable, arguments
+    ):
         return CommandRisk.LEVEL_C
     if executable in {"git", "git.exe"}:
         command_index = _git_subcommand_index(arguments)
@@ -483,6 +485,31 @@ def _direct_system_command_is_dangerous(
         }
     if executable in {"wsl", "wsl.exe"}:
         return "--unregister" in arguments
+    return False
+
+
+def _safe_system_diagnostic(executable: str, arguments: tuple[str, ...]) -> bool:
+    """Allow non-mutating status/query probes to reach the native sandbox."""
+    if executable in {"reg", "reg.exe"}:
+        return bool(arguments) and arguments[0] in {"query", "compare"}
+    if executable in {"sc", "sc.exe"}:
+        return bool(arguments) and arguments[0] in {"query", "qc", "enumdepends"}
+    if executable in {"systemctl", "systemctl.exe"}:
+        return bool(arguments) and arguments[0] in {
+            "status",
+            "is-active",
+            "is-enabled",
+            "show",
+            "list-units",
+            "list-unit-files",
+        }
+    if executable in {"chmod", "chmod.exe", "chown", "chown.exe"}:
+        return not any(
+            value in {"-R", "--recursive", "-rf", "--reference=/", "/"}
+            for value in arguments
+        )
+    if executable in {"service", "service.exe"}:
+        return bool(arguments) and arguments[1:2] in [("status",)]
     return False
 
 

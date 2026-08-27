@@ -227,6 +227,63 @@ def test_policy_denies_explicit_system_and_policy_mutations(
 @pytest.mark.parametrize(
     "command",
     [
+        "reg query HKLM\\\\Software\\\\Acme",
+        "sc query AcmeService",
+        "systemctl status ssh",
+        "service ssh status",
+        "chmod +x scripts/check.sh",
+        "chown gnen:gnen scripts/check.sh",
+    ],
+)
+def test_policy_does_not_deny_non_destructive_system_diagnostics(
+    tmp_path: Path, command: str
+) -> None:
+    from cli.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
+
+    result = ApprovalPolicy.low_risk(
+        enabled=True, allowed_workspaces=[tmp_path]
+    ).evaluate(
+        ApprovalRequest(
+            backend="codex",
+            tool_name="Bash",
+            command=command,
+            workspace=str(tmp_path),
+        )
+    )
+
+    assert result.decision is not ApprovalDecision.DENY
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "reg query HKLM\\\\Software\\\\Acme",
+        "sc query AcmeService",
+        "systemctl status ssh",
+        "systemctl is-active ssh",
+        "chmod +x scripts/check.sh",
+        "chown gnen:gnen scripts/check.sh",
+    ],
+)
+def test_policy_leaves_read_only_system_diagnostics_for_native_boundaries(
+    tmp_path: Path, command: str
+) -> None:
+    from cli.approval import ApprovalPolicy, ApprovalRequest
+
+    policy = ApprovalPolicy.low_risk(enabled=True, allowed_workspaces=[tmp_path])
+    request = ApprovalRequest(
+        backend="codex",
+        tool_name="Bash",
+        command=command,
+        workspace=str(tmp_path),
+    )
+
+    assert policy.evaluate(request).decision.name == "ASK"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "cat ~/.netrc",
         "cat $HOME/.netrc",
         "cat $PWD/../outside/secret",
