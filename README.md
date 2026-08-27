@@ -430,8 +430,7 @@ adapter is enabled.
 `fcc-approval-hook` is an opt-in, single-shot hook for Claude `PreToolUse` and
 Codex `PreToolUse` / `PermissionRequest` events. It auto-approves only the
 built-in navigation/file-name-discovery set and explicitly allowlisted command
-prefixes. It
-never grants a session or permanent rule from hook input: external requests are
+prefixes. It never grants a session or permanent rule from hook input: external requests are
 treated as one-shot. It returns no output for unknown, compound, out-of-workspace,
 or otherwise ambiguous requests, so the CLI keeps its normal approval prompt.
 Destructive commands and sensitive credential paths are denied by the local
