@@ -754,7 +754,9 @@ def _is_loopback_health_check(
         ):
             index += 1
             continue
-        if value in {"-O", "--output", "--output-document"} and index + 1 < len(arguments):
+        if value in {"-O", "--output", "--output-document"} and index + 1 < len(
+            arguments
+        ):
             # A sink/stdout does not mutate workspace state; a file output is
             # an ordinary write and therefore requires an explicit approval.
             if arguments[index + 1] in {"-", "/dev/null"}:
@@ -1004,7 +1006,9 @@ class ApprovalManager:
             loop = asyncio.get_running_loop()
             future: asyncio.Future[ApprovalRecord] = loop.create_future()
             self._waiters[key] = future
-            remaining = max(0.0, (record.expires_at - datetime.now(UTC)).total_seconds())
+            remaining = max(
+                0.0, (record.expires_at - datetime.now(UTC)).total_seconds()
+            )
             if timeout_seconds is not None:
                 remaining = min(remaining, timeout_seconds)
         try:
