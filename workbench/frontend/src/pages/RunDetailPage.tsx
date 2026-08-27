@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Run, Event, EventType, RunStatus } from '../types'
+import { ApprovalIdentity, Run, Event, EventType, RunStatus } from '../types'
 import { api } from '../services/api'
 
 export default function RunDetailPage() {
@@ -9,6 +9,7 @@ export default function RunDetailPage() {
   const [run, setRun] = useState<(Omit<Run, 'events'> & { events: Event[] }) | null>(null)
   const [message, setMessage] = useState('')
   const [activeTab, setActiveTab] = useState<'messages' | 'tools' | 'files' | 'terminal'>('messages')
+  const [approvalBusy, setApprovalBusy] = useState(false)
 
   useEffect(() => {
     if (runId) {
@@ -39,6 +40,25 @@ export default function RunDetailPage() {
     setTimeout(loadRun, 500)
   }
 
+  const handleApproval = async (
+    approval: ApprovalIdentity,
+    decision: 'approve' | 'reject',
+  ) => {
+    if (approvalBusy) return
+    setApprovalBusy(true)
+    try {
+      await api.decideApproval(
+        approval.session_id,
+        approval.call_id,
+        decision,
+        approval.command_hash,
+      )
+      await loadRun()
+    } finally {
+      setApprovalBusy(false)
+    }
+  }
+
   if (!run) {
     return (
       <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
@@ -58,6 +78,10 @@ export default function RunDetailPage() {
   const fileEvents = run.events.filter((e) => e.type === EventType.FILE_CHANGED)
 
   const terminalEvents = run.events.filter((e) => e.type === EventType.TERMINAL_OUTPUT)
+  const pendingApproval = [...run.events]
+    .reverse()
+    .find((event) => event.type === EventType.USER_INPUT_REQUIRED && event.data.approval)
+    ?.data.approval as ApprovalIdentity | undefined
 
   const canControl = [RunStatus.RUNNING, RunStatus.PAUSED, RunStatus.WAITING_HUMAN].includes(run.status)
 
@@ -178,6 +202,34 @@ export default function RunDetailPage() {
                       {event.message && <div className="text-sm">{event.message}</div>}
                     </div>
                   ))}
+                  {run.status === RunStatus.WAITING_HUMAN &&
+                    pendingApproval?.status === 'pending' && (
+                      <div className="border border-yellow-600 bg-yellow-900/20 rounded p-4" role="status">
+                        <div className="text-sm font-medium text-yellow-300 mb-2">需要一次性审批</div>
+                        <code className="block text-xs text-gray-200 whitespace-pre-wrap break-words">{pendingApproval.normalized_command}</code>
+                        <div className="text-xs text-gray-400 mt-2 break-all">
+                          {pendingApproval.cwd} · {pendingApproval.requested_permission}
+                        </div>
+                        <div className="flex gap-2 mt-3">
+                          <button
+                            type="button"
+                            disabled={approvalBusy}
+                            onClick={() => handleApproval(pendingApproval, 'approve')}
+                            className="bg-green-700 hover:bg-green-600 disabled:opacity-50 px-3 py-2 rounded text-sm"
+                          >
+                            允许一次
+                          </button>
+                          <button
+                            type="button"
+                            disabled={approvalBusy}
+                            onClick={() => handleApproval(pendingApproval, 'reject')}
+                            className="bg-red-700 hover:bg-red-600 disabled:opacity-50 px-3 py-2 rounded text-sm"
+                          >
+                            拒绝
+                          </button>
+                        </div>
+                      </div>
+                    )}
                 </div>
               )}
 

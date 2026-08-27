@@ -102,6 +102,26 @@ export interface Event {
   session_id?: string
 }
 
+export interface ApprovalIdentity {
+  session_id: string
+  call_id: string
+  normalized_command: string
+  argv: string[]
+  cwd: string
+  requested_permission: string
+  command_hash: string
+  risk: string
+  status: string
+}
+
+export interface ApprovalRecord extends ApprovalIdentity {
+  created_at: string
+  expires_at: string
+  approved_at?: string
+  consumed_at?: string
+  reason?: string
+}
+
 export interface CreateTaskRequest {
   title: string
   description: string
