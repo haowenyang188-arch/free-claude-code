@@ -917,12 +917,15 @@ class ApprovalManager:
             reason=reason,
         )
         async with self._lock:
-            existing = self._records.get((intent.session_id, intent.call_id))
+            key = (intent.session_id, intent.call_id)
+            existing = self._records.get(key)
             if existing is not None:
                 if hmac.compare_digest(existing.command_hash, intent.command_hash):
-                    return existing
+                    refreshed = self._expire_if_needed(existing)
+                    self._records[key] = refreshed
+                    return refreshed
                 raise ApprovalIntegrityError("approval_integrity_mismatch")
-            self._records[(intent.session_id, intent.call_id)] = record
+            self._records[key] = record
         return record
 
     async def approve(

@@ -127,6 +127,32 @@ async def test_reject_and_cancel_after_expiry_preserve_approval_timeout(
 
 
 @pytest.mark.asyncio
+async def test_repeated_request_refreshes_an_expired_pending_record(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.runtime.approval import (
+        ApprovalManager,
+        ApprovalState,
+        CommandIntent,
+    )
+
+    intent = CommandIntent.create(
+        session_id="expired-request-session",
+        call_id="expired-request-call",
+        command="python task.py",
+        cwd=tmp_path,
+        requested_permission="process_spawn",
+    )
+    approvals = ApprovalManager()
+    await approvals.request(intent, approval_timeout_seconds=0.001)
+    await asyncio.sleep(0.01)
+
+    refreshed = await approvals.request(intent, approval_timeout_seconds=30)
+
+    assert refreshed.status is ApprovalState.APPROVAL_TIMEOUT
+
+
+@pytest.mark.asyncio
 async def test_native_approval_waiter_is_released_by_matching_http_decision(
     tmp_path: Path,
 ) -> None:
