@@ -27,3 +27,4 @@ node_modules
 .claude-flow/data/
 .claude-flow/logs/
 .claude-flow/sessions/
+/deliverables/
