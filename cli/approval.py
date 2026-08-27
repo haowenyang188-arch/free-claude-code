@@ -164,18 +164,6 @@ class ApprovalResult:
 
 
 @dataclass(frozen=True, slots=True)
-class ApprovalRule:
-    """An exact token-prefix rule for a safe command."""
-
-    command_prefix: str
-    max_scope: ApprovalScope = ApprovalScope.ONCE
-    backends: frozenset[str] = field(
-        default_factory=lambda: frozenset({"claude", "codex"})
-    )
-    workspace: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class ApprovalOption:
     """One option rendered in a terminal approval menu."""
 
@@ -1158,7 +1146,6 @@ __all__ = [
     "ApprovalPromptParser",
     "ApprovalRequest",
     "ApprovalResult",
-    "ApprovalRule",
     "ApprovalScope",
     "ParsedApprovalPrompt",
 ]

@@ -9,7 +9,6 @@ from .approval import (
     ApprovalPromptParser,
     ApprovalRequest,
     ApprovalResult,
-    ApprovalRule,
     ApprovalScope,
     ParsedApprovalPrompt,
 )
@@ -34,7 +33,6 @@ __all__ = [
     "ApprovalPromptParser",
     "ApprovalRequest",
     "ApprovalResult",
-    "ApprovalRule",
     "ApprovalScope",
     "CLISession",
     "CLISessionManager",
