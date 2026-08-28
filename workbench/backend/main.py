@@ -30,7 +30,11 @@ if __package__:
     from .agents.base import BaseAgentAdapter
     from .agents.claude_adapter import ClaudeCodeAdapter
     from .agents.codex_adapter import CodexAdapter
+    from .agents.codex_runner import CodexSubagentRunner
     from .agents.dsh_adapter import DeepSeekHarnessAdapter
+    from .agents.fake_runner import FakeSubagentRunner
+    from .artifacts.store import FileArtifactStore
+    from .domain.models import Goal, GoalStatus, SopDefinition
     from .models import (
         Agent,
         AgentStatus,
@@ -44,6 +48,7 @@ if __package__:
         Task,
         TaskStatus,
     )
+    from .persistence.store import JsonWorkflowStore
     from .runtime.approval import (
         ApprovalIntegrityError,
         ApprovalManager,
@@ -56,6 +61,21 @@ if __package__:
     from .runtime.jobs import ApprovalExecutor, JobRecord, JobRuntime, JobRuntimeError
     from .runtime.state import StateStore, StateStoreError
     from .runtime.workspace import WorkspacePolicy, WorkspacePolicyError
+    from .sop_models import (
+        ArtifactResponse,
+        HandoffResponse,
+        SopControlRequest,
+        SopEventResponse,
+        SopRunStatusResponse,
+        StartSopRunRequest,
+        StartSopRunResponse,
+        StepRunResponse,
+        TaskResponse,
+    )
+    from .validation.always_accept import AlwaysAcceptValidator
+    from .workflow.context_builder import ContextPackageBuilder
+    from .workflow.engine import WorkflowEngine
+    from .workflow.orchestrator import AutoOrchestrator
 else:  # Support ``python workbench/backend/main.py`` as a local entry point.
     import sys
 
@@ -187,7 +207,44 @@ class WorkbenchService:
         self.event_envelopes: dict[str, EventEnvelope] = {}
         self._run_provenance: dict[str, tuple[str | None, str | None, str | None]] = {}
         self.websocket_connections: list[WebSocket] = []
+
+        # SOP workflow components
+        self._init_sop_workflow()
+
         self._restore_state()
+
+    def _init_sop_workflow(self) -> None:
+        """Initialize SOP workflow components."""
+        sop_workspace = self.workspace_policy.root / ".workbench" / "sop"
+        sop_workspace.mkdir(parents=True, exist_ok=True)
+
+        # Workflow persistence
+        self.workflow_store = JsonWorkflowStore(
+            state_path=sop_workspace / "workflow_state.json",
+            event_path=sop_workspace / "workflow_events.jsonl",
+        )
+        self.artifact_store = FileArtifactStore(
+            root=sop_workspace / "artifacts",
+        )
+
+        # Use FakeSubagentRunner by default (can be replaced with real runners)
+        runner = FakeSubagentRunner()
+        validator = AlwaysAcceptValidator()
+
+        self.workflow_engine = WorkflowEngine(
+            store=self.workflow_store,
+            runner=runner,
+            validator=validator,
+            artifact_store=self.artifact_store,
+        )
+        self.context_builder = ContextPackageBuilder(
+            store=self.workflow_store,
+            artifact_store=self.artifact_store,
+        )
+        self.orchestrator = AutoOrchestrator(self.workflow_engine)
+
+        # SOP definitions cache (will be loaded from storage)
+        self.sop_definitions: dict[str, SopDefinition] = {}
 
     def _restore_state(self) -> None:
         try:
@@ -1218,6 +1275,212 @@ async def control_run(run_id: str, request: ControlRequest):
     request.run_id = run_id
     success = await service.control_run(request)
     return {"success": success}
+
+
+# ============================================================================
+# SOP Workflow API
+# ============================================================================
+
+
+@app.post("/api/sop-runs", response_model=StartSopRunResponse)
+async def start_sop_run(request: StartSopRunRequest):
+    """Start a new SOP run."""
+    if request.sop_definition_id not in service.sop_definitions:
+        raise HTTPException(status_code=404, detail="SOP definition not found")
+
+    sop = service.sop_definitions[request.sop_definition_id]
+    goal = Goal(
+        id=str(uuid.uuid4()),
+        project_id=request.project_id,
+        description=request.goal_description,
+        acceptance_criteria=list(request.acceptance_criteria),
+        constraints=list(request.constraints),
+        status=GoalStatus.RUNNING,
+        created_at=datetime.now(),
+    )
+
+    sop_run = service.workflow_engine.start_sop_run(goal=goal, sop=sop)
+
+    return StartSopRunResponse(
+        sop_run_id=sop_run.id,
+        goal_id=goal.id,
+        status=sop_run.status.value,
+        started_at=sop_run.started_at,
+    )
+
+
+@app.get("/api/sop-runs/{run_id}", response_model=SopRunStatusResponse)
+async def get_sop_run(run_id: str):
+    """Get SOP run status and summary."""
+    try:
+        sop_run = service.workflow_store.get_entity("sop_runs", run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="SOP run not found") from exc
+
+    step_runs = [
+        item
+        for item in service.workflow_store.list_entities("step_runs")
+        if item.get("sop_run_id") == run_id
+    ]
+
+    steps_by_status: dict[str, int] = {}
+    for step_run in step_runs:
+        status = step_run.get("status", "unknown")
+        steps_by_status[status] = steps_by_status.get(status, 0) + 1
+
+    return SopRunStatusResponse(
+        id=sop_run["id"],
+        goal_id=sop_run["goal_id"],
+        sop_definition_id=sop_run["sop_definition_id"],
+        status=sop_run["status"],
+        started_at=sop_run["started_at"],
+        completed_at=sop_run.get("completed_at"),
+        step_count=len(step_runs),
+        steps_completed=steps_by_status.get("completed", 0),
+        steps_ready=steps_by_status.get("ready", 0),
+        steps_running=steps_by_status.get("running", 0),
+    )
+
+
+@app.get("/api/sop-runs/{run_id}/steps", response_model=list[StepRunResponse])
+async def get_sop_steps(run_id: str):
+    """Get all step runs for a SOP run."""
+    step_runs = [
+        item
+        for item in service.workflow_store.list_entities("step_runs")
+        if item.get("sop_run_id") == run_id
+    ]
+    return [
+        StepRunResponse(
+            id=item["id"],
+            sop_run_id=item["sop_run_id"],
+            step_id=item["step_id"],
+            stage_run_id=item["stage_run_id"],
+            status=item["status"],
+            task_id=item.get("task_id"),
+        )
+        for item in step_runs
+    ]
+
+
+@app.get("/api/sop-runs/{run_id}/tasks", response_model=list[TaskResponse])
+async def get_sop_tasks(run_id: str):
+    """Get all tasks for a SOP run."""
+    step_runs = [
+        item
+        for item in service.workflow_store.list_entities("step_runs")
+        if item.get("sop_run_id") == run_id
+    ]
+    step_run_ids = {item["id"] for item in step_runs}
+
+    tasks = [
+        item
+        for item in service.workflow_store.list_entities("tasks")
+        if item.get("step_run_id") in step_run_ids
+    ]
+    return [
+        TaskResponse(
+            id=item["id"],
+            step_run_id=item["step_run_id"],
+            title=item["title"],
+            description=item["description"],
+            role_id=item["role_id"],
+            status=item["status"],
+            input_artifact_ids=item.get("input_artifact_ids", []),
+            output_artifact_ids=item.get("output_artifact_ids", []),
+        )
+        for item in tasks
+    ]
+
+
+@app.get("/api/sop-runs/{run_id}/artifacts", response_model=list[ArtifactResponse])
+async def get_sop_artifacts(run_id: str):
+    """Get all artifacts for a SOP run."""
+    step_runs = [
+        item
+        for item in service.workflow_store.list_entities("step_runs")
+        if item.get("sop_run_id") == run_id
+    ]
+    step_run_ids = {item["id"] for item in step_runs}
+
+    tasks = [
+        item
+        for item in service.workflow_store.list_entities("tasks")
+        if item.get("step_run_id") in step_run_ids
+    ]
+    task_ids = {item["id"] for item in tasks}
+
+    artifacts = [
+        item
+        for item in service.workflow_store.list_entities("artifacts")
+        if item.get("task_id") in task_ids
+    ]
+    return [
+        ArtifactResponse(
+            id=item["id"],
+            task_id=item["task_id"],
+            type=item["type"],
+            uri=item.get("uri"),
+            summary=item.get("summary"),
+            sha256=item.get("sha256"),
+            accepted=item.get("accepted", False),
+            created_at=item["created_at"],
+        )
+        for item in artifacts
+    ]
+
+
+@app.get("/api/sop-runs/{run_id}/handoffs", response_model=list[HandoffResponse])
+async def get_sop_handoffs(run_id: str):
+    """Get all handoffs for a SOP run."""
+    step_runs = [
+        item
+        for item in service.workflow_store.list_entities("step_runs")
+        if item.get("sop_run_id") == run_id
+    ]
+    step_run_ids = {item["id"] for item in step_runs}
+
+    tasks = [
+        item
+        for item in service.workflow_store.list_entities("tasks")
+        if item.get("step_run_id") in step_run_ids
+    ]
+    task_ids = {item["id"] for item in tasks}
+
+    handoffs = [
+        item
+        for item in service.workflow_store.list_entities("handoffs")
+        if item.get("from_task_id") in task_ids
+    ]
+    return [
+        HandoffResponse(
+            id=item["id"],
+            from_task_id=item["from_task_id"],
+            to_step_id=item["to_step_id"],
+            status=item["status"],
+            artifact_ids=item.get("artifact_ids", []),
+            created_at=item.get("created_at"),
+            accepted_at=item.get("accepted_at"),
+        )
+        for item in handoffs
+    ]
+
+
+@app.get("/api/sop-runs/{run_id}/events", response_model=list[SopEventResponse])
+async def get_sop_events(run_id: str, after: int = Query(default=0, ge=0)):
+    """Get SOP workflow events."""
+    events = service.workflow_store.replay_events(run_id, after=after)
+    return [
+        SopEventResponse(
+            id=event.id,
+            stream_id=event.stream_id,
+            sequence=event.sequence,
+            event_type=event.event_type,
+            payload=event.payload,
+            occurred_at=event.occurred_at,
+        )
+        for event in events
+    ]
 
 
 @app.websocket("/ws")
