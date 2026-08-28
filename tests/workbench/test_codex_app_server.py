@@ -291,6 +291,7 @@ async def test_native_command_approval_waits_for_matching_one_shot_decision(
         assert pending[0].status is ApprovalState.PENDING
         assert not hasattr(pending[0], "pid")
         await approvals.approve(
+            provider="codex_cli",
             session_id=pending[0].session_id,
             call_id=pending[0].call_id,
             command_hash=pending[0].command_hash,
@@ -460,6 +461,7 @@ async def test_native_permission_request_grants_only_requested_turn_scope(
     await asyncio.wait_for(pending_event.wait(), timeout=1)
     assert pending[0].status is ApprovalState.PENDING
     await approvals.approve(
+        provider="codex_cli",
         session_id=pending[0].session_id,
         call_id=pending[0].call_id,
         command_hash=pending[0].command_hash,
@@ -479,7 +481,7 @@ async def test_native_file_change_approval_binds_cached_patch_content(
     tmp_path: Path,
 ) -> None:
     from workbench.backend.agents.codex_app_server import CodexAppServerSession
-    from workbench.backend.runtime.approval import ApprovalManager, ApprovalState
+    from workbench.backend.runtime.approval import ApprovalManager
 
     changes = [
         {
@@ -514,11 +516,9 @@ async def test_native_file_change_approval_binds_cached_patch_content(
     process = _FakeProcess(messages)
     approvals = ApprovalManager()
     pending: list[Any] = []
-    pending_event = asyncio.Event()
 
     async def on_pending(record: Any) -> None:
         pending.append(record)
-        pending_event.set()
 
     with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
         spawn.return_value = process
@@ -529,19 +529,11 @@ async def test_native_file_change_approval_binds_cached_patch_content(
             approval_timeout_seconds=5,
         )
         task = asyncio.create_task(_collect_events(session, "apply file change"))
-        await asyncio.wait_for(pending_event.wait(), timeout=1)
-        assert pending[0].status is ApprovalState.PENDING
-        assert pending[0].argv[0] == "codex-file-change"
-        assert pending[0].argv[-1]
-        await approvals.approve(
-            session_id=pending[0].session_id,
-            call_id=pending[0].call_id,
-            command_hash=pending[0].command_hash,
-        )
         events = await asyncio.wait_for(task, timeout=1)
 
     responses = [message for message in process.stdin.writes if message.get("id") == 4]
     assert responses == [{"id": 4, "result": {"decision": "accept"}}]
+    assert pending == []
     assert events[-1]["type"] == "exit"
     await session.stop()
 

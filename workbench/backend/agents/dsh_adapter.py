@@ -12,9 +12,15 @@ from typing import Any
 from harness.bridge import DeepSeekHarnessBridge
 from harness.config import HarnessConfig
 from harness.events import safe_log_context
+from providers.common.identity import RuntimeIdentity
 
 from ..models import AgentStatus, AgentType, EventType
 from .base import BaseAgentAdapter
+
+
+def _dsh_event_identity(notification: Mapping[str, Any]) -> RuntimeIdentity:
+    """Project bridge-owned lifecycle ids without copying notification payloads."""
+    return RuntimeIdentity.from_mapping(notification)
 
 
 class DeepSeekHarnessAdapter(BaseAgentAdapter):
@@ -74,6 +80,7 @@ class DeepSeekHarnessAdapter(BaseAgentAdapter):
         task_description: str,
         workspace_path: str,
     ) -> None:
+        turn_identity = RuntimeIdentity()
         try:
             turn = await self.bridge.run(
                 [{"type": "text", "text": task_description}],
@@ -81,16 +88,20 @@ class DeepSeekHarnessAdapter(BaseAgentAdapter):
                 cwd=workspace_path,
             )
             for notification in turn.notifications:
+                identity = _dsh_event_identity(notification)
+                turn_identity = turn_identity.merge(identity)
                 await self.emit_event(
                     self._event_type(notification),
                     {"notification": safe_log_context(notification)},
                     run_id=run_id,
+                    identity=identity,
                 )
             if not self._terminal_event_emitted and not self._cancel_requested:
                 await self.emit_event(
                     EventType.RUN_FINISHED,
                     {"message": "DeepSeek Harness task completed"},
                     run_id=run_id,
+                    identity=turn_identity,
                 )
         except asyncio.CancelledError:
             raise
@@ -100,6 +111,7 @@ class DeepSeekHarnessAdapter(BaseAgentAdapter):
                     EventType.RUN_FAILED,
                     {"error": str(exc)},
                     run_id=run_id,
+                    identity=turn_identity,
                 )
                 self.status = AgentStatus.ERROR
         finally:

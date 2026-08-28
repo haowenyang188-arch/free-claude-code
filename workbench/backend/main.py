@@ -14,6 +14,7 @@ import uvicorn
 from fastapi import (
     FastAPI,
     HTTPException,
+    Query,
     Request,
     Response,
     WebSocket,
@@ -22,6 +23,8 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+from providers.common.identity import RuntimeIdentity
 
 if __package__:
     from .agents.base import BaseAgentAdapter
@@ -98,6 +101,31 @@ else:  # Support ``python workbench/backend/main.py`` as a local entry point.
 
 class _SessionAwareAdapter(Protocol):
     session_id: str | None
+
+
+def _event_identity_for_workbench(
+    identity: RuntimeIdentity | None,
+    *,
+    run_id: str,
+    provider: str | None,
+    agent_id: str | None,
+    generation: str | None,
+    session_id: str | None,
+) -> RuntimeIdentity:
+    """Merge provider lifecycle ids with immutable Workbench run provenance."""
+    explicit = identity if isinstance(identity, RuntimeIdentity) else RuntimeIdentity()
+    fallback = RuntimeIdentity(
+        provider=provider,
+        agent_id=agent_id,
+        generation=generation,
+        session_id=session_id,
+        run_id=run_id,
+    )
+    merged = explicit.merge(fallback)
+    values = merged.to_mapping()
+    # A provider event must never redirect persistence to another Workbench run.
+    values["run_id"] = run_id
+    return RuntimeIdentity(**values)
 
 
 class WorkbenchService:
@@ -284,6 +312,12 @@ class WorkbenchService:
                         use_app_server=True,
                         approval_manager=self.approvals,
                     )
+                elif adapter_type is ClaudeCodeAdapter:
+                    adapter = adapter_type(
+                        agent_id,
+                        use_compatibility_bridge=True,
+                        approval_manager=self.approvals,
+                    )
                 else:
                     adapter = adapter_type(agent_id)
             except Exception as exc:
@@ -299,7 +333,8 @@ class WorkbenchService:
 
     async def _handle_event(self, event: Event):
         """处理Agent事件"""
-        # 从 adapter 获取 session_id
+        # Workbench-owned run provenance is authoritative; provider event
+        # metadata may add lifecycle ids but cannot redirect the event.
         session_id = self._session_id_for_run(event.run_id)
         if event.type is EventType.RUN_STARTED:
             self._run_provenance.setdefault(
@@ -318,6 +353,20 @@ class WorkbenchService:
                 session_id = adapter_session_id
                 run.metadata["session_id"] = session_id
 
+        event_identity = _event_identity_for_workbench(
+            event.identity,
+            run_id=event.run_id,
+            provider=runtime_kind,
+            agent_id=agent_profile_id,
+            generation=generation,
+            session_id=session_id,
+        )
+        if event_identity.session_id is not None:
+            session_id = event_identity.session_id
+            run = self.runs.get(event.run_id)
+            if run is not None:
+                run.metadata["session_id"] = session_id
+
         envelope = await asyncio.to_thread(
             self.event_log.append,
             run_id=event.run_id,
@@ -327,9 +376,11 @@ class WorkbenchService:
             session_id=session_id,
             runtime_kind=runtime_kind,
             agent_profile_id=agent_profile_id,
-            generation=generation,
+            generation=event_identity.generation or generation,
+            identity=event_identity,
         )
         event.data = dict(envelope.payload)
+        event.identity = RuntimeIdentity.from_mapping(envelope.to_mapping()["identity"])
         message = event.data.get("message")
         event.message = message if isinstance(message, str) else None
         self.events[event.id] = event
@@ -424,6 +475,8 @@ class WorkbenchService:
 
     def _serialize_event(self, event: Event) -> dict[str, Any]:
         result = event.model_dump(mode="json")
+        if event.identity is not None:
+            result["identity"] = event.identity.to_mapping(include_unknown=False)
         envelope = self.event_envelopes.get(event.id)
         if envelope:
             result.update(
@@ -434,6 +487,7 @@ class WorkbenchService:
                     "runtime_kind": envelope.runtime_kind,
                     "agent_profile_id": envelope.agent_profile_id,
                     "generation": envelope.generation,
+                    "identity": envelope.to_mapping()["identity"],
                 }
             )
         return result
@@ -455,6 +509,7 @@ class WorkbenchService:
             "runtime_kind": envelope.runtime_kind,
             "agent_profile_id": envelope.agent_profile_id,
             "generation": envelope.generation,
+            "identity": envelope.to_mapping()["identity"],
         }
 
     def replay_events(self, run_id: str, *, after: int = 0) -> list[dict[str, Any]]:
@@ -669,6 +724,14 @@ class WorkbenchService:
             workspace = self.workspace_policy.resolve(payload.cwd)
         except WorkspacePolicyError as exc:
             raise ValueError("cwd must stay inside the Workbench workspace") from exc
+        try:
+            workspace_target = self.workspace_policy.resolve(
+                payload.workspace_target or workspace
+            )
+        except WorkspacePolicyError as exc:
+            raise ValueError(
+                "workspace_target must stay inside the Workbench workspace"
+            ) from exc
         return CommandIntent.create(
             session_id=resolved_session_id,
             call_id=resolved_call_id,
@@ -676,6 +739,11 @@ class WorkbenchService:
             argv=payload.argv,
             cwd=workspace,
             requested_permission=payload.requested_permission,
+            provider=payload.provider,
+            turn_id=payload.turn_id,
+            workspace_target=workspace_target,
+            permission_scope=payload.permission_scope,
+            patch_identity=payload.patch_identity,
         )
 
     async def request_approval(self, payload: ApprovalCommandRequest) -> ApprovalRecord:
@@ -684,8 +752,18 @@ class WorkbenchService:
             intent, approval_timeout_seconds=payload.approval_timeout_seconds
         )
 
-    async def get_approval(self, session_id: str, call_id: str) -> ApprovalRecord:
-        return await self.approvals.get(session_id=session_id, call_id=call_id)
+    async def get_approval(
+        self,
+        session_id: str,
+        call_id: str,
+        *,
+        provider: str = "codex_cli",
+    ) -> ApprovalRecord:
+        return await self.approvals.get(
+            session_id=session_id,
+            call_id=call_id,
+            provider=provider,
+        )
 
     async def decide_approval(
         self,
@@ -693,18 +771,28 @@ class WorkbenchService:
         call_id: str,
         command_hash: str,
         decision: str,
+        provider: str = "codex_cli",
     ) -> ApprovalRecord:
         if decision == "approve":
             return await self.approvals.approve(
-                session_id=session_id, call_id=call_id, command_hash=command_hash
+                session_id=session_id,
+                call_id=call_id,
+                command_hash=command_hash,
+                provider=provider,
             )
         if decision == "reject":
             return await self.approvals.reject(
-                session_id=session_id, call_id=call_id, command_hash=command_hash
+                session_id=session_id,
+                call_id=call_id,
+                command_hash=command_hash,
+                provider=provider,
             )
         if decision == "cancel":
             return await self.approvals.cancel(
-                session_id=session_id, call_id=call_id, command_hash=command_hash
+                session_id=session_id,
+                call_id=call_id,
+                command_hash=command_hash,
+                provider=provider,
             )
         raise ValueError("unknown approval decision")
 
@@ -737,16 +825,22 @@ class LoginRequest(BaseModel):
 class ApprovalCommandRequest(BaseModel):
     """Validated command identity submitted to the Workbench approval API."""
 
+    provider: str = Field(default="codex_cli", pattern=r"^(?:codex_cli|claude_cli)$")
     session_id: str = Field(min_length=1, max_length=256)
     call_id: str = Field(min_length=1, max_length=256)
+    turn_id: str | None = Field(default=None, max_length=256)
     command: str | None = Field(default=None, max_length=8192)
     argv: list[str] | None = Field(default=None, min_length=1, max_length=256)
     cwd: str = Field(min_length=1, max_length=4096)
+    workspace_target: str | None = Field(default=None, max_length=4096)
     requested_permission: str = Field(min_length=1, max_length=256)
+    permission_scope: str | None = Field(default=None, max_length=65536)
+    patch_identity: str | None = Field(default=None, max_length=65536)
     approval_timeout_seconds: float = Field(default=300.0, ge=0.0, le=3600.0)
 
 
 class ApprovalDecisionRequest(BaseModel):
+    provider: str = Field(default="codex_cli", pattern=r"^(?:codex_cli|claude_cli)$")
     command_hash: str = Field(
         min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$"
     )
@@ -765,12 +859,19 @@ class ApprovalExecuteRequest(ApprovalCommandRequest):
 def _approval_payload(record: ApprovalRecord) -> dict[str, Any]:
     """Serialize an approval without process identity or secret command output."""
     return {
+        "provider": record.provider,
         "session_id": record.session_id,
         "call_id": record.call_id,
+        "turn_id": record.turn_id,
         "normalized_command": record.normalized_command,
         "argv": list(record.argv),
         "cwd": str(record.cwd),
+        "workspace_target": (
+            str(record.workspace_target) if record.workspace_target else None
+        ),
         "requested_permission": record.requested_permission,
+        "permission_scope": record.permission_scope,
+        "patch_identity": record.patch_identity,
         "command_hash": record.command_hash,
         "risk": record.risk.value,
         "status": record.status.value,
@@ -955,10 +1056,21 @@ async def request_approval(payload: ApprovalCommandRequest):
 
 
 @app.get("/api/approvals/{session_id}/{call_id}")
-async def get_approval(session_id: str, call_id: str):
+async def get_approval(
+    session_id: str,
+    call_id: str,
+    provider: str = Query(
+        default="codex_cli",
+        pattern=r"^(?:codex_cli|claude_cli)$",
+    ),
+):
     try:
-        record = await service.get_approval(session_id, call_id)
-    except ApprovalIntegrityError as exc:
+        record = await service.get_approval(
+            session_id,
+            call_id,
+            provider=provider,
+        )
+    except (ApprovalIntegrityError, ValueError) as exc:
         return _approval_error_response(exc)
     return _approval_payload(record)
 
@@ -992,7 +1104,11 @@ async def decide_approval(
         )
     try:
         record = await service.decide_approval(
-            session_id, call_id, payload.command_hash, decision
+            session_id,
+            call_id,
+            payload.command_hash,
+            decision,
+            provider=payload.provider,
         )
     except (ApprovalIntegrityError, ValueError) as exc:
         return _approval_error_response(exc)

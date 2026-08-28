@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from providers.common import RuntimeIdentity
 from workbench.backend.runtime.events import EventEnvelope, EventLog
 
 
@@ -242,6 +243,48 @@ def test_event_log_append_accepts_optional_extended_fields(tmp_path) -> None:
     )
     assert event2.step_id == "step-run-2"
     assert event2.runtime_kind is None
+
+
+def test_event_log_merges_explicit_identity_with_legacy_fallbacks(tmp_path) -> None:
+    """Explicit identity wins while legacy fields fill only missing values."""
+    log_path = tmp_path / "events.jsonl"
+    log = EventLog(log_path)
+
+    event = log.append(
+        run_id="run-1",
+        event_type="approval.requested",
+        payload={},
+        backend="codex",
+        identity=RuntimeIdentity(
+            provider="codex",
+            thread_id="thread-explicit",
+            approval_id="approval-explicit",
+            run_id="run-1",
+        ),
+        provider="legacy-provider",
+        runtime_id="runtime-legacy",
+        thread_id="thread-legacy",
+        turn_id="turn-legacy",
+        approval_id="approval-legacy",
+    )
+
+    assert event.provider == "codex"
+    assert event.runtime_id == "runtime-legacy"
+    assert event.thread_id == "thread-explicit"
+    assert event.turn_id == "turn-legacy"
+    assert event.approval_id == "approval-explicit"
+    assert event.message_id is None
+
+    replayed = EventLog(log_path).replay("run-1")
+    assert len(replayed) == 1
+    assert replayed[0].to_mapping()["identity"] == {
+        "provider": "codex",
+        "runtime_id": "runtime-legacy",
+        "thread_id": "thread-explicit",
+        "turn_id": "turn-legacy",
+        "approval_id": "approval-explicit",
+        "run_id": "run-1",
+    }
 
 
 def test_event_log_append_validates_artifact_ids_is_list(tmp_path) -> None:

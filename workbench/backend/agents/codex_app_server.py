@@ -242,6 +242,16 @@ class CodexAppServerSession:
                 continue
             event = await self._notification_event(message)
             if event is not None:
+                if (
+                    event.get("type") == "exit"
+                    and self.approval_manager is not None
+                    and isinstance(event.get("turn_id"), str)
+                ):
+                    await self.approval_manager.clear_turn(
+                        provider="codex_cli",
+                        session_id=thread_id,
+                        turn_id=event["turn_id"],
+                    )
                 yield event
                 if event.get("type") == "exit":
                     return
@@ -402,6 +412,10 @@ class CodexAppServerSession:
             argv=("codex-permission-request", canonical),
             cwd=cwd,
             requested_permission=_permission_label("sandbox_escalation", canonical),
+            provider="codex_cli",
+            turn_id=_text(params.get("turnId")),
+            workspace_target=self.workspace,
+            permission_scope=_permission_scope_for_permissions(permissions, canonical),
         )
         record = await self.approval_manager.request(
             intent, approval_timeout_seconds=self.approval_timeout_seconds
@@ -423,6 +437,7 @@ class CodexAppServerSession:
         self, method: str, params: Mapping[str, Any]
     ) -> CommandIntent | None:
         thread_id = _text(params.get("threadId")) or _text(params.get("conversationId"))
+        turn_id = _text(params.get("turnId"))
         item_id = _text(params.get("itemId"))
         call_id = _text(params.get("callId")) or item_id
         approval_id = _text(params.get("approvalId"))
@@ -449,6 +464,10 @@ class CodexAppServerSession:
                 argv=argv,
                 cwd=cwd,
                 requested_permission=requested_permission,
+                provider="codex_cli",
+                turn_id=turn_id,
+                workspace_target=self.workspace,
+                permission_scope=self._permission_scope(params),
             )
         if method in {"item/fileChange/requestApproval", "applyPatchApproval"}:
             patch_identity = self._file_change_identity(
@@ -462,6 +481,11 @@ class CodexAppServerSession:
                 argv=("codex-file-change", item_id or call_id, patch_identity),
                 cwd=cwd,
                 requested_permission="file_write",
+                provider="codex_cli",
+                turn_id=turn_id,
+                workspace_target=self.workspace,
+                permission_scope=f"filesystem:write:{self.workspace}",
+                patch_identity=patch_identity,
             )
         if not isinstance(command, str):
             return None
@@ -475,6 +499,10 @@ class CodexAppServerSession:
                 command=command,
                 cwd=cwd,
                 requested_permission=requested_permission,
+                provider="codex_cli",
+                turn_id=turn_id,
+                workspace_target=self.workspace,
+                permission_scope=self._permission_scope(params),
             )
         except CommandSyntaxError, ValueError:
             return None
@@ -492,6 +520,20 @@ class CodexAppServerSession:
         except TypeError, ValueError:
             return None
         return _permission_label("process_spawn", canonical)
+
+    def _permission_scope(self, params: Mapping[str, Any]) -> str | None:
+        context = params.get("networkApprovalContext")
+        if isinstance(context, Mapping):
+            host = _text(context.get("host")) or _text(context.get("target"))
+            if host:
+                return f"network:{host}"
+        additional = params.get("additionalPermissions")
+        if additional is None:
+            return None
+        try:
+            return f"codex:{_canonical_json(additional)}"
+        except TypeError, ValueError:
+            return None
 
     def _file_change_identity(
         self,
@@ -678,6 +720,28 @@ def _canonical_json(value: Any) -> str:
 
 def _permission_label(prefix: str, canonical: str) -> str:
     return f"{prefix}:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _permission_scope_for_permissions(
+    permissions: Mapping[str, Any], canonical: str
+) -> str:
+    """Produce a conservative same-turn scope for a native permission profile."""
+    filesystem = permissions.get("fileSystem")
+    network = permissions.get("network")
+    if filesystem is not None and network is None:
+        entries = filesystem.get("entries") if isinstance(filesystem, Mapping) else None
+        if isinstance(entries, list) and len(entries) == 1:
+            entry = entries[0]
+            if isinstance(entry, Mapping):
+                access = _text(entry.get("access"))
+                path_info = entry.get("path")
+                if isinstance(path_info, Mapping):
+                    path = _text(path_info.get("path"))
+                    if access and path:
+                        return f"filesystem:{access}:{path}"
+    if network is not None and filesystem is None:
+        return "network:*"
+    return f"codex:{canonical}"
 
 
 def _patch_paths_stay_in_workspace(value: Any, workspace: Path) -> bool:

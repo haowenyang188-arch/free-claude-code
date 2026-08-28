@@ -18,6 +18,7 @@ from .context_compression import (
 )
 from .error_mapping import append_request_id, get_user_facing_error_message, map_error
 from .heuristic_tool_parser import HeuristicToolParser
+from .identity import IDENTITY_FIELDS, RuntimeIdentity, normalize_identity
 from .memory_integration import (
     ConversationMemory,
     MemoryClient,
@@ -50,6 +51,7 @@ from .think_parser import ContentChunk, ContentType, ThinkTagParser
 from .utils import set_if_not_none
 
 __all__ = [
+    "IDENTITY_FIELDS",
     "AnthropicToOpenAIConverter",
     "AutoOptimizer",
     "CodeQualityAnalyzer",
@@ -67,6 +69,7 @@ __all__ = [
     "MessageDeduplicator",
     "PerformanceMonitor",
     "ResponseFormatter",
+    "RuntimeIdentity",
     "SSEBuilder",
     "SelfImprovementLoop",
     "SimpleCache",
@@ -95,6 +98,7 @@ __all__ = [
     "map_error",
     "map_stop_reason",
     "memoize",
+    "normalize_identity",
     "optimize_messages",
     "set_if_not_none",
 ]

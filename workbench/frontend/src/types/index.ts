@@ -103,12 +103,17 @@ export interface Event {
 }
 
 export interface ApprovalIdentity {
+  provider: string
   session_id: string
   call_id: string
+  turn_id: string | null
   normalized_command: string
   argv: string[]
   cwd: string
+  workspace_target: string | null
   requested_permission: string
+  permission_scope: string | null
+  patch_identity: string | null
   command_hash: string
   risk: string
   status: string

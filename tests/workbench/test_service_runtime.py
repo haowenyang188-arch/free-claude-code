@@ -325,7 +325,10 @@ async def test_workbench_injects_shared_one_shot_approvals_into_codex(
         "use_app_server": True,
         "approval_manager": service.approvals,
     }
-    assert captured[AgentType.CLAUDE_CODE.value] == {}
+    assert captured[AgentType.CLAUDE_CODE.value] == {
+        "use_compatibility_bridge": True,
+        "approval_manager": service.approvals,
+    }
     assert captured[AgentType.DEEPSEEK_HARNESS.value] == {}
 
 
@@ -340,6 +343,7 @@ async def test_codex_native_approval_event_contains_exact_one_shot_identity(
     )
     adapter.current_run_id = "run-1"
     intent = CommandIntent.create(
+        provider="codex_cli",
         session_id="thread-1",
         call_id="call-1",
         command="python task.py",
@@ -359,15 +363,55 @@ async def test_codex_native_approval_event_contains_exact_one_shot_identity(
 
     approval = observed[0].data["approval"]
     assert approval == {
+        "provider": "codex_cli",
         "session_id": "thread-1",
         "call_id": "call-1",
+        "turn_id": None,
         "normalized_command": intent.normalized_command,
+        "argv": list(intent.argv),
         "command_hash": intent.command_hash,
         "cwd": str(tmp_path.resolve()),
+        "workspace_target": str(tmp_path.resolve()),
         "requested_permission": "process_spawn",
+        "permission_scope": None,
+        "patch_identity": None,
         "risk": "level_b",
         "status": "pending",
     }
+
+
+@pytest.mark.asyncio
+async def test_workbench_codex_uses_bounded_workspace_write_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from workbench.backend.runtime.approval import ApprovalManager
+
+    captured: dict[str, Any] = {}
+
+    class _AppServerStub:
+        generation = None
+        is_busy = False
+
+        def __init__(self, workspace_path: str, **kwargs: Any) -> None:
+            captured["workspace_path"] = workspace_path
+            captured.update(kwargs)
+
+        async def start_task(self, *_args: Any, **_kwargs: Any):
+            yield {"type": "exit", "code": 0, "stderr": None}
+
+        async def stop(self) -> bool:
+            return True
+
+    monkeypatch.setattr(codex_module, "CodexAppServerSession", _AppServerStub)
+    adapter = CodexAdapter(
+        "agent-1", use_app_server=True, approval_manager=ApprovalManager()
+    )
+
+    assert await adapter.start_task("run-1", "inspect", str(tmp_path)) is True
+    assert adapter.monitor_task is not None
+    await adapter.monitor_task
+
+    assert captured["sandbox_mode"] == "workspace-write"
 
 
 @pytest.mark.asyncio

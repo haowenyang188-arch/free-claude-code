@@ -10,6 +10,7 @@ from harness.events import (
     project_sse,
     safe_log_context,
 )
+from providers.common import RuntimeIdentity
 
 
 def _sse_payload(frame: str) -> tuple[str, dict]:
@@ -168,6 +169,55 @@ def test_session_event_with_unknown_event_type_keeps_event_verbatim() -> None:
     assert envelope["event_type"] == "plugin/private"
     assert envelope["event"] == event
     assert envelope["raw_event"] == event
+
+
+def test_session_event_projects_nested_runtime_identity_without_content_ids() -> None:
+    params = {
+        "sessionId": "runtime-session",
+        "event": {
+            "type": "tool/call",
+            "turnId": "turn-1",
+            "item": {"id": "item-1"},
+            "approval": {"id": "approval-1"},
+            "agent": {"id": "agent-1"},
+            "tool": {"id": "tool-1"},
+            "call": {"id": "call-1"},
+            "oneShotId": "runtime-one-shot",
+            "content": [{"messageId": "content-message-must-not-bind"}],
+            "input": {"callId": "input-call-must-not-bind"},
+        },
+    }
+    envelope = project_notification(
+        "session.event",
+        params,
+        session_id="host-session",
+        provider="deepseek-official",
+        identity=RuntimeIdentity(
+            run_id="host-run",
+            message_id="host-message",
+            one_shot_id="host-one-shot",
+        ),
+    )
+
+    assert envelope["provider"] == "deepseek-official"
+    assert envelope["runtime_id"] is None
+    assert envelope["runtime_session_id"] == "runtime-session"
+    assert envelope["turn_id"] == "turn-1"
+    assert envelope["item_id"] == "item-1"
+    assert envelope["approval_id"] == "approval-1"
+    assert envelope["agent_id"] == "agent-1"
+    assert envelope["tool_id"] == "tool-1"
+    assert envelope["call_id"] == "call-1"
+    assert envelope["run_id"] == "host-run"
+    assert envelope["message_id"] == "host-message"
+    assert envelope["one_shot_id"] == "host-one-shot"
+
+    context = safe_log_context(envelope)
+    assert context["run_id"] == "host-run"
+    assert context["approval_id"] == "approval-1"
+    assert "content" not in context
+    assert "input" not in context
+    assert "payload" not in context
 
 
 def test_project_sse_emits_one_safe_custom_frame_without_fake_anthropic_turn() -> None:

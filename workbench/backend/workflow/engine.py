@@ -440,6 +440,7 @@ class WorkflowEngine:
 
     def _refresh_run_status(self, sop_run_id: str) -> None:
         run = self._get_model("sop_runs", sop_run_id, SopRun)
+        previous_status = run.status
         steps = [
             StepRun.model_validate(item)
             for item in self.store.list_entities("step_runs")
@@ -452,6 +453,13 @@ class WorkflowEngine:
         else:
             run.status = SopRunStatus.RUNNING
         self.store.save_entity("sop_runs", run)
+
+        # Emit status change events
+        if previous_status != run.status:
+            if run.status is SopRunStatus.COMPLETED:
+                self._emit(sop_run_id, "sop_completed", {"sop_run_id": sop_run_id})
+            elif run.status is SopRunStatus.WAITING_REVIEW:
+                self._emit(sop_run_id, "sop_waiting_review", {"sop_run_id": sop_run_id})
 
     def _find_target_step_run(self, sop_run_id: str, step_id: str) -> StepRun:
         for item in self.store.list_entities("step_runs"):

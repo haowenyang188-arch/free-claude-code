@@ -21,13 +21,15 @@ from typing import Any, cast
 
 from loguru import logger
 
-from providers.common import SSEBuilder
+from providers.common import RuntimeIdentity, SSEBuilder
 
 from .config import DEFAULT_RUNTIME_COMMAND, HarnessConfig, HarnessConfigError
 from .events import HarnessEventEnvelope, project_notification, project_sse
 from .process import (
     HarnessProcess,
     HarnessProcessError,
+    HarnessProtocolError,
+    HarnessRequestTimeoutError,
     HarnessRpcError,
     HarnessRuntimeClosedError,
 )
@@ -40,6 +42,19 @@ class HarnessBridgeError(HarnessProcessError):
 
 class HarnessUnsupportedContentError(HarnessBridgeError):
     """The Anthropic request contains a block DSH cannot accept losslessly."""
+
+
+HARNESS_FAILURE_TIMEOUT = "timeout"
+HARNESS_FAILURE_RUNTIME_START = "runtime_start_failed"
+HARNESS_FAILURE_RUNTIME = "runtime_failed"
+HARNESS_FAILURE_INITIALIZE = "initialize_failed"
+
+_FAILURE_MESSAGES = {
+    HARNESS_FAILURE_TIMEOUT: "DeepSeek Harness runtime request timed out.",
+    HARNESS_FAILURE_RUNTIME_START: "DeepSeek Harness runtime failed to start.",
+    HARNESS_FAILURE_RUNTIME: "DeepSeek Harness runtime failed during execution.",
+    HARNESS_FAILURE_INITIALIZE: "DeepSeek Harness runtime initialization failed.",
+}
 
 
 # The published DeepSeek adapter deliberately owns the more specific route
@@ -66,6 +81,13 @@ class HarnessTurn:
 
     session_id: str
     message_id: str
+    run_id: str = field(default_factory=lambda: f"run-{uuid.uuid4().hex}")
+    turn_id: str | None = None
+    item_id: str | None = None
+    one_shot_id: str | None = None
+    agent_id: str | None = None
+    tool_id: str | None = None
+    call_id: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     notifications: list[HarnessEventEnvelope] = field(default_factory=list)
     final_text: str = ""
@@ -103,6 +125,8 @@ class DeepSeekHarnessBridge:
         # process.
         self._session_aliases: dict[tuple[str, str], str] = {}
         self._runtime_version: str | None = None
+        self._last_failure_category: str | None = None
+        self._last_failure_detail: str | None = None
 
     @property
     def process(self) -> HarnessProcess | None:
@@ -123,6 +147,16 @@ class DeepSeekHarnessBridge:
         """Return the version reported by the initialized runtime, if any."""
         return self._runtime_version
 
+    @property
+    def last_failure_category(self) -> str | None:
+        """Return the most recent bounded runtime failure classification."""
+        return self._last_failure_category
+
+    @property
+    def last_failure_detail(self) -> str | None:
+        """Return a safe, non-payload description of the most recent failure."""
+        return self._last_failure_detail
+
     async def start(self, *, cwd: str | Path | None = None) -> None:
         """Start and initialize the runtime on first use."""
         async with self._initialize_lock:
@@ -137,7 +171,12 @@ class DeepSeekHarnessBridge:
                 process_config,
                 environment=self._runtime_environment(workspace),
             )
-            await process.start()
+            self._clear_failure()
+            try:
+                await process.start()
+            except Exception as exc:
+                self._mark_failure(_failure_category(exc, phase="start"))
+                raise
             self._process = process
             try:
                 result = await process.request(
@@ -175,7 +214,9 @@ class DeepSeekHarnessBridge:
                     runtime_version if isinstance(runtime_version, str) else None
                 )
                 self._initialized = True
-            except Exception:
+                self._clear_failure()
+            except Exception as exc:
+                self._mark_failure(_failure_category(exc, phase="initialize"))
                 self._forget_process(process)
                 await process.close()
                 raise
@@ -232,7 +273,16 @@ class DeepSeekHarnessBridge:
                 turn = HarnessTurn(root_session_id, message_id)
                 await self._collect_turn(process, queue, turn)
                 return turn
-            except HarnessProcessError, TimeoutError:
+            except TimeoutError as exc:
+                self._mark_failure(HARNESS_FAILURE_TIMEOUT)
+                # A timed-out turn cannot be safely resumed because the runtime
+                # may still be executing plugins.  The process is exclusive,
+                # so close it before the next request.
+                await process.close()
+                self._forget_process(process)
+                raise exc
+            except HarnessProcessError:
+                self._mark_failure(HARNESS_FAILURE_RUNTIME)
                 # A timed-out turn cannot be safely resumed because the runtime
                 # may still be executing plugins.  The process is exclusive,
                 # so close it before the next request.
@@ -301,6 +351,10 @@ class DeepSeekHarnessBridge:
             yield builder.message_stop()
         except Exception as exc:  # streaming errors are encoded as SSE
             logger.warning("DSH turn failed: {}", type(exc).__name__)
+            category = self._last_failure_category or _failure_category(
+                exc, phase="runtime"
+            )
+            self._mark_failure(category)
             if started_content:
                 for frame in builder.close_all_blocks():
                     yield frame
@@ -308,7 +362,8 @@ class DeepSeekHarnessBridge:
                 "type": "error",
                 "error": {
                     "type": "api_error",
-                    "message": "DeepSeek Harness runtime request failed.",
+                    "code": category,
+                    "message": _failure_message(category),
                 },
             }
             yield _serialize_sse("error", error_payload)
@@ -365,8 +420,11 @@ class DeepSeekHarnessBridge:
                     notification.method,
                     notification.params,
                     session_id=turn.session_id,
+                    provider=self.runtime_provider,
+                    identity=self._turn_identity(turn),
                 )
                 turn.notifications.append(envelope)
+                _update_turn_identity(turn, envelope)
                 if notification.method == "session.event":
                     event = _event_from_notification(notification)
                     if event is not None:
@@ -449,10 +507,16 @@ class DeepSeekHarnessBridge:
                         if turn.finish_reason is None:
                             turn.finish_reason = "completed"
                         return
-            except HarnessProcessError, TimeoutError:
+            except TimeoutError:
+                self._mark_failure(HARNESS_FAILURE_TIMEOUT)
                 await process.close()
                 self._forget_process(process)
                 raise
+            except HarnessProcessError as exc:
+                self._mark_failure(HARNESS_FAILURE_RUNTIME)
+                await process.close()
+                self._forget_process(process)
+                raise exc
             except asyncio.CancelledError:
                 await asyncio.shield(process.close())
                 self._forget_process(process)
@@ -518,6 +582,8 @@ class DeepSeekHarnessBridge:
                     item.method,
                     item.params,
                     session_id=turn.session_id,
+                    provider=self.runtime_provider,
+                    identity=self._turn_identity(turn),
                 )
                 if not received:
                     if _is_inbox_receipt(item, turn.session_id, turn.message_id):
@@ -531,12 +597,13 @@ class DeepSeekHarnessBridge:
                         self._record_lineage(item)
                         continue
                 turn.notifications.append(envelope)
+                _update_turn_identity(turn, envelope)
                 if item.method == "session.event":
                     event = _event_from_notification(item)
                     if (
                         event is not None
-                        and isinstance(item.params, Mapping)
-                        and item.params.get("sessionId") == turn.session_id
+                        and _param_value(item.params, "sessionId", "session_id")
+                        == turn.session_id
                     ):
                         turn.events.append(event)
                         _update_turn_result(turn, event)
@@ -549,16 +616,42 @@ class DeepSeekHarnessBridge:
         try:
             await asyncio.wait_for(consume(), timeout=timeout)
         except TimeoutError as exc:
-            raise TimeoutError(
+            raise HarnessRequestTimeoutError(
                 "DeepSeek Harness turn timed out waiting for idle"
             ) from exc
+
+    def _turn_identity(self, turn: HarnessTurn) -> RuntimeIdentity:
+        """Return only stable host-owned identity for event projection."""
+        return RuntimeIdentity(
+            provider=self.runtime_provider,
+            session_id=turn.session_id,
+            run_id=turn.run_id,
+            turn_id=turn.turn_id,
+            item_id=turn.item_id,
+            one_shot_id=turn.one_shot_id,
+            agent_id=turn.agent_id,
+            tool_id=turn.tool_id,
+            call_id=turn.call_id,
+            message_id=turn.message_id or None,
+        )
+
+    def _clear_failure(self) -> None:
+        self._last_failure_category = None
+        self._last_failure_detail = None
+
+    def _mark_failure(self, category: str) -> None:
+        normalized = (
+            category if category in _FAILURE_MESSAGES else HARNESS_FAILURE_RUNTIME
+        )
+        self._last_failure_category = normalized
+        self._last_failure_detail = _failure_message(normalized)
 
     def _record_lineage(self, notification: JsonRpcNotification) -> None:
         params = _params_mapping(notification)
         if notification.method != "subagent.started" or params is None:
             return
-        parent = params.get("parentSessionId")
-        child = params.get("childSessionId")
+        parent = _param_value(params, "parentSessionId", "parent_session_id")
+        child = _param_value(params, "childSessionId", "child_session_id")
         if (
             isinstance(parent, str)
             and isinstance(child, str)
@@ -576,12 +669,15 @@ class DeepSeekHarnessBridge:
         if params is None:
             return False
         if notification.method in {"subagent.started", "subagent.finished"}:
-            ids = (params.get("parentSessionId"), params.get("childSessionId"))
+            ids = (
+                _param_value(params, "parentSessionId", "parent_session_id"),
+                _param_value(params, "childSessionId", "child_session_id"),
+            )
             return any(
                 isinstance(value, str) and self._is_descendant(value, root_session_id)
                 for value in ids
             )
-        session = params.get("sessionId")
+        session = _param_value(params, "sessionId", "session_id")
         return isinstance(session, str) and self._is_descendant(
             session, root_session_id
         )
@@ -744,20 +840,26 @@ class DeepSeekHarnessManager:
         bridge = await self._get_bridge(provider, model)
         try:
             await bridge.start(cwd=cwd)
+        except HarnessRequestTimeoutError as exc:
+            self._remember_failure(bridge, HARNESS_FAILURE_TIMEOUT, exc)
+            raise
         except HarnessRpcError as exc:
-            self._last_state = "initialize_failed"
-            detail = str(exc).strip() or type(exc).__name__
-            self._last_error = detail[:512]
+            self._remember_failure(bridge, HARNESS_FAILURE_INITIALIZE, exc)
             raise
         except HarnessBridgeError as exc:
-            self._last_state = "initialize_failed"
-            detail = str(exc).strip() or type(exc).__name__
-            self._last_error = detail[:512]
+            self._remember_failure(bridge, HARNESS_FAILURE_INITIALIZE, exc)
+            raise
+        except HarnessRuntimeClosedError as exc:
+            self._remember_failure(bridge, HARNESS_FAILURE_RUNTIME_START, exc)
+            raise
+        except HarnessProtocolError as exc:
+            self._remember_failure(bridge, HARNESS_FAILURE_RUNTIME_START, exc)
+            raise
+        except HarnessProcessError as exc:
+            self._remember_failure(bridge, HARNESS_FAILURE_RUNTIME_START, exc)
             raise
         except Exception as exc:
-            self._last_state = "runtime_start_failed"
-            detail = str(exc).strip() or type(exc).__name__
-            self._last_error = detail[:512]
+            self._remember_failure(bridge, HARNESS_FAILURE_RUNTIME_START, exc)
             raise
         self._last_error = None
         self._last_state = "ready"
@@ -768,15 +870,28 @@ class DeepSeekHarnessManager:
         bridges = tuple(self._bridges.values())
         running = any(bridge.is_running for bridge in bridges)
         ready = any(bridge.is_ready for bridge in bridges)
+        bridge_failure = next(
+            (
+                (bridge.last_failure_category, bridge.last_failure_detail)
+                for bridge in bridges
+                if bridge.last_failure_category is not None
+            ),
+            (None, None),
+        )
         versions = {bridge.runtime_version for bridge in bridges}
         versions.discard(None)
+        bridge_failure_category, bridge_failure_detail = bridge_failure
         error = preflight_error or self._last_error
         if preflight_error:
             state = preflight_state
         elif ready:
             state = "ready"
+            error = None
         elif self._last_error:
             state = self._last_state or "initialize_failed"
+        elif bridge_failure_category:
+            state = bridge_failure_category
+            error = bridge_failure_detail
         else:
             state = "configured"
         return {
@@ -785,6 +900,19 @@ class DeepSeekHarnessManager:
             "ready": self.config.enabled and ready and error is None,
             "running": running,
             "state": state,
+            "failure_category": (
+                None
+                if state in {"configured", "ready"}
+                else state
+                if state
+                in {
+                    HARNESS_FAILURE_TIMEOUT,
+                    HARNESS_FAILURE_RUNTIME_START,
+                    HARNESS_FAILURE_RUNTIME,
+                    HARNESS_FAILURE_INITIALIZE,
+                }
+                else None
+            ),
             "runtime_version": next(iter(versions), None),
             "runtime_command": list(self.config.command_argv or ()),
             "cordis_config": (
@@ -808,14 +936,34 @@ class DeepSeekHarnessManager:
         request_id: str | None = None,
     ) -> AsyncIterator[str]:
         bridge = await self._get_bridge(provider, model)
-        async for frame in bridge.stream_messages(
-            content_blocks,
-            model=response_model or f"dsh/{provider}/{model}",
-            session_id=session_id,
-            cwd=cwd,
-            request_id=request_id,
-        ):
-            yield frame
+        try:
+            async for frame in bridge.stream_messages(
+                content_blocks,
+                model=response_model or f"dsh/{provider}/{model}",
+                session_id=session_id,
+                cwd=cwd,
+                request_id=request_id,
+            ):
+                yield frame
+        finally:
+            self._sync_bridge_failure(bridge)
+
+    def _remember_failure(
+        self,
+        bridge: DeepSeekHarnessBridge,
+        fallback_category: str,
+        _error: BaseException,
+    ) -> None:
+        category = bridge.last_failure_category or fallback_category
+        self._last_state = category
+        self._last_error = bridge.last_failure_detail or _failure_message(category)
+
+    def _sync_bridge_failure(self, bridge: DeepSeekHarnessBridge) -> None:
+        category = bridge.last_failure_category
+        if category is None:
+            return
+        self._last_state = category
+        self._last_error = bridge.last_failure_detail or _failure_message(category)
 
     async def close(self) -> None:
         """Close every sidecar process owned by this application."""
@@ -936,7 +1084,7 @@ def _is_inbox_receipt(
     params = _params_mapping(notification)
     if notification.method != "session.event" or params is None:
         return False
-    if params.get("sessionId") != session_id:
+    if _param_value(params, "sessionId", "session_id") != session_id:
         return False
     event = params.get("event")
     if not isinstance(event, Mapping) or event.get("type") != "agent/inbox/spliced":
@@ -953,8 +1101,8 @@ def _is_idle(notification: JsonRpcNotification, session_id: str) -> bool:
     return (
         notification.method == "session.status"
         and params is not None
-        and params.get("sessionId") == session_id
-        and params.get("status") == "idle"
+        and _param_value(params, "sessionId", "session_id") == session_id
+        and _param_value(params, "status") == "idle"
     )
 
 
@@ -964,6 +1112,54 @@ def _params_mapping(
     if not isinstance(notification.params, Mapping):
         return None
     return cast(Mapping[str, Any], notification.params)
+
+
+def _param_value(params: Any, *names: str) -> Any:
+    if not isinstance(params, Mapping):
+        return None
+    for name in names:
+        value = params.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def _failure_category(exc: BaseException, *, phase: str) -> str:
+    if isinstance(exc, (HarnessRequestTimeoutError, TimeoutError)):
+        return HARNESS_FAILURE_TIMEOUT
+    if phase == "initialize":
+        return (
+            HARNESS_FAILURE_RUNTIME_START
+            if isinstance(exc, (HarnessRuntimeClosedError, HarnessProtocolError))
+            else HARNESS_FAILURE_INITIALIZE
+        )
+    if phase == "start":
+        return HARNESS_FAILURE_RUNTIME_START
+    return HARNESS_FAILURE_RUNTIME
+
+
+def _failure_message(category: str) -> str:
+    return _FAILURE_MESSAGES.get(category, _FAILURE_MESSAGES[HARNESS_FAILURE_RUNTIME])
+
+
+def _update_turn_identity(
+    turn: HarnessTurn,
+    envelope: Mapping[str, Any],
+) -> None:
+    """Keep the first runtime IDs observed during one turn only."""
+    for identity_field in (
+        "turn_id",
+        "item_id",
+        "one_shot_id",
+        "agent_id",
+        "tool_id",
+        "call_id",
+    ):
+        if getattr(turn, identity_field) is not None:
+            continue
+        value = envelope.get(identity_field)
+        if isinstance(value, str) and value:
+            setattr(turn, identity_field, value)
 
 
 def _update_turn_result(turn: HarnessTurn, event: Mapping[str, Any]) -> None:

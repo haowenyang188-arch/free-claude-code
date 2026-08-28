@@ -252,6 +252,10 @@ async def test_two_step_sop_completes_with_fake_runner(engine: WorkflowEngine, s
     assert "handoff_created" in event_types
     assert "handoff_accepted" in event_types
     assert "step_completed" in event_types
+    assert "sop_completed" in event_types
+
+    # Verify sop_completed is the last event
+    assert final_events[-1].event_type == "sop_completed"
 
 
 @pytest.mark.asyncio

@@ -82,6 +82,7 @@ export const api = {
   },
 
   async decideApproval(
+    provider: string,
     sessionId: string,
     callId: string,
     decision: 'approve' | 'reject' | 'cancel',
@@ -91,7 +92,7 @@ export const api = {
       `/approvals/${encodeURIComponent(sessionId)}/${encodeURIComponent(callId)}/${decision}`,
       {
         method: 'POST',
-        body: JSON.stringify({ command_hash: commandHash }),
+        body: JSON.stringify({ provider, command_hash: commandHash }),
       },
     )
   },

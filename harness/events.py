@@ -14,6 +14,8 @@ import math
 from collections.abc import Mapping
 from typing import Any, TypedDict, cast
 
+from providers.common.identity import IDENTITY_FIELDS, RuntimeIdentity
+
 SOURCE = "deepseek_harness"
 
 SESSION_EVENT_METHOD = "session.event"
@@ -60,6 +62,17 @@ class HarnessEventEnvelope(TypedDict, total=False):
     method: str
     session_id: str | None
     runtime_session_id: str | None
+    runtime_id: str | None
+    generation: str | None
+    thread_id: str | None
+    turn_id: str | None
+    item_id: str | None
+    approval_id: str | None
+    one_shot_id: str | None
+    tool_id: str | None
+    call_id: str | None
+    message_id: str | None
+    run_id: str | None
     payload: Any
     raw: Any
     event: dict[str, Any] | None
@@ -86,6 +99,8 @@ def project_notification(
     params: Any = _MISSING,
     *,
     session_id: str | None = None,
+    provider: str | None = None,
+    identity: RuntimeIdentity | None = None,
 ) -> HarnessEventEnvelope:
     """Project one SDK notification into a stable internal envelope.
 
@@ -101,6 +116,10 @@ def project_notification(
             complete notification object.
         session_id: Optional host-side fallback when the runtime payload does
             not carry a session id.
+        provider: Optional provider route used as a trusted fallback identity.
+        identity: Optional host-side identity.  Values supplied here take
+            precedence over untrusted runtime fields, which keeps a runtime
+            message or run id from being confused with the API request id.
     """
     if isinstance(method, Mapping):
         notification = cast(Mapping[str, Any], method)
@@ -117,6 +136,12 @@ def project_notification(
     raw_payload = _clone_json(params)
     payload_session_id = _payload_session_id(params)
     default_session_id = payload_session_id or fallback_session_id
+    normalized_identity = _notification_identity(
+        params,
+        provider=provider,
+        session_id=default_session_id,
+        fallback=identity,
+    )
     envelope: HarnessEventEnvelope = {
         "type": "unknown",
         "source": SOURCE,
@@ -126,6 +151,7 @@ def project_notification(
         "payload": raw_payload,
         "raw": raw_payload,
     }
+    _apply_identity(envelope, normalized_identity)
 
     if method_name == SESSION_EVENT_METHOD:
         return _project_session_event(envelope, params, fallback_session_id)
@@ -203,6 +229,8 @@ def safe_log_context(envelope: Mapping[str, Any] | Any) -> dict[str, str | None]
         "event_type": _identifier(envelope.get("event_type")),
         "status": _identifier(envelope.get("status")),
     }
+    for field in IDENTITY_FIELDS:
+        context[field] = _identifier(envelope.get(field))
     return context
 
 
@@ -222,6 +250,10 @@ def _project_session_event(
     target = runtime_session_id or fallback_session_id
     envelope["session_id"] = target
     envelope["runtime_session_id"] = target
+    if envelope.get("runtime_id") is None:
+        envelope["runtime_id"] = _identifier(
+            params.get("runtimeId", params.get("runtime_id"))
+        )
 
     raw_event = _clone_json(params.get("event"))
     envelope["raw_event"] = raw_event
@@ -275,6 +307,8 @@ def _project_subagent_started(
             "child_session_id": child,
         }
     )
+    if envelope.get("runtime_id") is None:
+        envelope["runtime_id"] = child
     return envelope
 
 
@@ -333,6 +367,8 @@ def _project_subagent_finished(
             "last_assistant_message": normalized_assistant_message,
         }
     )
+    if envelope.get("runtime_id") is None:
+        envelope["runtime_id"] = child
     return envelope
 
 
@@ -350,6 +386,98 @@ def _payload_session_id(params: Any) -> str | None:
     if not isinstance(params, Mapping):
         return None
     return _identifier(params.get("sessionId", params.get("session_id")))
+
+
+_IDENTITY_CONTAINER_FIELDS: dict[str, str] = {
+    "agent": "agent_id",
+    "tool": "tool_id",
+    "call": "call_id",
+    "message": "message_id",
+    "turn": "turn_id",
+    "item": "item_id",
+    "approval": "approval_id",
+    "runtime": "runtime_id",
+    "oneShot": "one_shot_id",
+    "one_shot": "one_shot_id",
+}
+_IDENTITY_SKIP_CONTAINERS = frozenset(
+    {"payload", "raw", "content", "arguments", "input", "prompt", "secret"}
+)
+
+
+def _notification_identity(
+    params: Any,
+    *,
+    provider: str | None,
+    session_id: str | None,
+    fallback: RuntimeIdentity | None,
+) -> RuntimeIdentity:
+    """Build a bounded identity projection from trusted and runtime fields.
+
+    Only fields in :mod:`providers.common.identity` are copied.  Nested
+    mappings are traversed to find IDs emitted by DSH agent/tool events, while
+    content-like containers are deliberately skipped so no prompt or tool
+    input can become part of this contract.
+    """
+    explicit = fallback or RuntimeIdentity()
+    trusted = RuntimeIdentity(
+        provider=_identifier(provider),
+        session_id=session_id,
+    )
+    result = explicit.merge(trusted)
+    for mapping in _identity_mappings(params):
+        result = result.merge(_identity_from_mapping(mapping))
+    return result
+
+
+def _identity_mappings(value: Any, *, depth: int = 0) -> list[Mapping[str, Any]]:
+    if not isinstance(value, Mapping) or depth > 5:
+        return []
+    result: list[Mapping[str, Any]] = [value]
+    for key, nested in value.items():
+        if key in _IDENTITY_SKIP_CONTAINERS:
+            continue
+        if isinstance(nested, Mapping):
+            result.extend(_identity_mappings(nested, depth=depth + 1))
+    return result
+
+
+def _identity_from_mapping(value: Mapping[str, Any]) -> RuntimeIdentity:
+    identity = RuntimeIdentity.from_mapping(value)
+    session_id = _identifier(value.get("sessionId", value.get("session_id")))
+    runtime_session_id = _identifier(
+        value.get("runtimeSessionId", value.get("runtime_session_id"))
+    )
+    parent_id = _identifier(
+        value.get("parentSessionId", value.get("parent_session_id"))
+    )
+    child_id = _identifier(value.get("childSessionId", value.get("child_session_id")))
+    # DSH's session/parent/child aliases are not part of the provider-neutral
+    # mapping, so normalize them into the corresponding common fields here.
+    identity = identity.merge(
+        RuntimeIdentity(
+            session_id=session_id or parent_id,
+            runtime_id=runtime_session_id or child_id,
+        )
+    )
+    for container, field in _IDENTITY_CONTAINER_FIELDS.items():
+        nested = value.get(container)
+        if not isinstance(nested, Mapping):
+            continue
+        nested_id = _identifier(nested.get("id"))
+        if nested_id is None:
+            continue
+        identity = identity.merge(RuntimeIdentity(**{field: nested_id}))
+    return identity
+
+
+def _apply_identity(
+    envelope: HarnessEventEnvelope,
+    identity: RuntimeIdentity,
+) -> None:
+    target = cast(dict[str, Any], envelope)
+    for field, value in identity.to_mapping().items():
+        target[field] = value
 
 
 def _frame_from_envelope(envelope: Mapping[str, Any] | Any) -> SSEFrame:

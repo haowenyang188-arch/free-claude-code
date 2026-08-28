@@ -17,6 +17,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from providers.common.identity import RuntimeIdentity
+
 _REDACTED = "[redacted]"
 _SENSITIVE_KEY_PARTS = (
     "api_key",
@@ -60,9 +62,38 @@ class EventEnvelope:
     step_id: str | None = None
     artifact_ids: list[str] | None = None
     generation: str | None = None
+    # Provider-neutral execution identity.  These fields intentionally stay
+    # outside ``payload`` so correlation never requires copying provider data.
+    provider: str | None = None
+    runtime_id: str | None = None
+    thread_id: str | None = None
+    turn_id: str | None = None
+    item_id: str | None = None
+    approval_id: str | None = None
+    one_shot_id: str | None = None
+    agent_id: str | None = None
+    tool_id: str | None = None
+    call_id: str | None = None
+    message_id: str | None = None
 
     def to_mapping(self) -> dict[str, Any]:
         """Return a JSON-compatible mapping for APIs and persistence."""
+        identity = RuntimeIdentity(
+            provider=self.provider,
+            runtime_id=self.runtime_id,
+            session_id=self.session_id,
+            generation=self.generation,
+            thread_id=self.thread_id,
+            turn_id=self.turn_id,
+            item_id=self.item_id,
+            approval_id=self.approval_id,
+            one_shot_id=self.one_shot_id,
+            agent_id=self.agent_id,
+            tool_id=self.tool_id,
+            call_id=self.call_id,
+            message_id=self.message_id,
+            run_id=self.run_id,
+        ).to_mapping(include_unknown=False)
         return {
             "id": self.id,
             "run_id": self.run_id,
@@ -77,6 +108,18 @@ class EventEnvelope:
             "step_id": self.step_id,
             "artifact_ids": self.artifact_ids,
             "generation": self.generation,
+            "provider": self.provider,
+            "runtime_id": self.runtime_id,
+            "thread_id": self.thread_id,
+            "turn_id": self.turn_id,
+            "item_id": self.item_id,
+            "approval_id": self.approval_id,
+            "one_shot_id": self.one_shot_id,
+            "agent_id": self.agent_id,
+            "tool_id": self.tool_id,
+            "call_id": self.call_id,
+            "message_id": self.message_id,
+            "identity": identity,
         }
 
     @classmethod
@@ -94,9 +137,22 @@ class EventEnvelope:
             payload = value["payload"]
             if not isinstance(payload, Mapping):
                 raise TypeError("payload must be an object")
-            session_id = value.get("session_id")
-            if session_id is not None:
-                session_id = _required_text(session_id, "session_id")
+            raw_identity = value.get("identity")
+            if raw_identity is not None and not isinstance(raw_identity, Mapping):
+                raise TypeError("identity must be an object")
+            identity_source = raw_identity if isinstance(raw_identity, Mapping) else {}
+
+            def identity_field(field: str) -> str | None:
+                candidate = identity_source.get(field)
+                if candidate is None:
+                    candidate = value.get(field)
+                return (
+                    _identity_text(candidate, field)
+                    if candidate is not None
+                    else None
+                )
+
+            session_id = identity_field("session_id")
 
             # Extended fields (optional, for backward compatibility)
             runtime_kind = value.get("runtime_kind")
@@ -119,9 +175,18 @@ class EventEnvelope:
                     _required_text(aid, "artifact_id") for aid in artifact_ids
                 ]
 
-            generation = value.get("generation")
-            if generation is not None:
-                generation = _required_text(generation, "generation")
+            generation = identity_field("generation")
+            provider = identity_field("provider")
+            runtime_id = identity_field("runtime_id")
+            thread_id = identity_field("thread_id")
+            turn_id = identity_field("turn_id")
+            item_id = identity_field("item_id")
+            approval_id = identity_field("approval_id")
+            one_shot_id = identity_field("one_shot_id")
+            agent_id = identity_field("agent_id")
+            tool_id = identity_field("tool_id")
+            call_id = identity_field("call_id")
+            message_id = identity_field("message_id")
         except (KeyError, TypeError, ValueError) as exc:
             raise EventLogError("invalid event envelope") from exc
 
@@ -142,6 +207,17 @@ class EventEnvelope:
             step_id=step_id,
             artifact_ids=artifact_ids,
             generation=generation,
+            provider=provider,
+            runtime_id=runtime_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            item_id=item_id,
+            approval_id=approval_id,
+            one_shot_id=one_shot_id,
+            agent_id=agent_id,
+            tool_id=tool_id,
+            call_id=call_id,
+            message_id=message_id,
         )
 
 
@@ -168,6 +244,18 @@ class EventLog:
         step_id: str | None = None,
         artifact_ids: list[str] | None = None,
         generation: str | None = None,
+        identity: RuntimeIdentity | None = None,
+        provider: str | None = None,
+        runtime_id: str | None = None,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+        item_id: str | None = None,
+        approval_id: str | None = None,
+        one_shot_id: str | None = None,
+        agent_id: str | None = None,
+        tool_id: str | None = None,
+        call_id: str | None = None,
+        message_id: str | None = None,
     ) -> EventEnvelope:
         """Append one event and return its assigned sequence."""
         run_id = _required_text(run_id, "run_id")
@@ -187,6 +275,60 @@ class EventLog:
             artifact_ids = [_required_text(aid, "artifact_id") for aid in artifact_ids]
         if generation is not None:
             generation = _required_text(generation, "generation")
+        if identity is not None and not isinstance(identity, RuntimeIdentity):
+            raise TypeError("identity must be a RuntimeIdentity")
+        if identity is not None and identity.run_id not in (None, run_id):
+            raise ValueError("identity run_id does not match event run_id")
+        identity_values: dict[str, str | None] = {
+            field: None
+            for field in (
+                "provider",
+                "runtime_id",
+                "thread_id",
+                "turn_id",
+                "item_id",
+                "approval_id",
+                "one_shot_id",
+                "agent_id",
+                "tool_id",
+                "call_id",
+                "message_id",
+            )
+        }
+        if identity is not None:
+            for field, value in identity.to_mapping(include_unknown=False).items():
+                if field in identity_values:
+                    identity_values[field] = value
+        # Explicit identity is authoritative.  Legacy flat arguments are only
+        # compatibility fallbacks and must never overwrite a provider identity
+        # with their default ``None`` values (or with stale adapter metadata).
+        legacy_values = {
+            "provider": provider,
+            "runtime_id": runtime_id,
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "item_id": item_id,
+            "approval_id": approval_id,
+            "one_shot_id": one_shot_id,
+            "agent_id": agent_id,
+            "tool_id": tool_id,
+            "call_id": call_id,
+            "message_id": message_id,
+        }
+        for field, value in legacy_values.items():
+            if value is not None and identity_values[field] is None:
+                identity_values[field] = _identity_text(value, field)
+        for field, value in tuple(identity_values.items()):
+            if value is not None:
+                identity_values[field] = _identity_text(value, field)
+        if identity is not None and identity.session_id is not None:
+            session_id = identity.session_id
+        if session_id is not None:
+            session_id = _identity_text(session_id, "session_id")
+        if identity is not None and identity.generation is not None:
+            generation = identity.generation
+        if generation is not None:
+            generation = _identity_text(generation, "generation")
         if payload is not None and not isinstance(payload, Mapping):
             raise TypeError("payload must be a mapping")
 
@@ -206,6 +348,17 @@ class EventLog:
                 step_id=step_id,
                 artifact_ids=artifact_ids,
                 generation=generation,
+                provider=identity_values["provider"],
+                runtime_id=identity_values["runtime_id"],
+                thread_id=identity_values["thread_id"],
+                turn_id=identity_values["turn_id"],
+                item_id=identity_values["item_id"],
+                approval_id=identity_values["approval_id"],
+                one_shot_id=identity_values["one_shot_id"],
+                agent_id=identity_values["agent_id"],
+                tool_id=identity_values["tool_id"],
+                call_id=identity_values["call_id"],
+                message_id=identity_values["message_id"],
             )
             self.path.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -266,6 +419,14 @@ def _required_text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise TypeError(f"{field} must be a non-empty string")
     return value.strip()
+
+
+def _identity_text(value: object, field: str) -> str:
+    """Validate a bounded lifecycle identifier without accepting controls."""
+    normalized = _required_text(value, field)
+    if len(normalized) > 512 or any(ord(char) < 0x20 for char in normalized):
+        raise TypeError(f"{field} contains invalid identifier text")
+    return normalized
 
 
 def redact(value: Any, *, key: str | None = None) -> Any:

@@ -66,6 +66,256 @@ async def test_one_shot_approval_binds_the_full_command_identity(
 
 
 @pytest.mark.asyncio
+async def test_same_turn_reuses_equal_and_narrower_capability_once_approved(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.runtime.approval import (
+        ApprovalManager,
+        ApprovalState,
+        CommandIntent,
+    )
+
+    approvals = ApprovalManager()
+    broad = CommandIntent.create(
+        provider="codex_cli",
+        session_id="same-turn-session",
+        turn_id="turn-1",
+        call_id="filesystem-call-1",
+        command="python fetch.py --cache",
+        cwd=tmp_path,
+        requested_permission="filesystem",
+        permission_scope=f"filesystem:write:{tmp_path}",
+    )
+    equal = CommandIntent.create(
+        provider="codex_cli",
+        session_id="same-turn-session",
+        turn_id="turn-1",
+        call_id="filesystem-call-2",
+        command="python fetch.py --again",
+        cwd=tmp_path,
+        requested_permission="filesystem",
+        permission_scope=f"filesystem:write:{tmp_path}",
+    )
+    narrower = CommandIntent.create(
+        provider="codex_cli",
+        session_id="same-turn-session",
+        turn_id="turn-1",
+        call_id="filesystem-call-3",
+        command="python fetch.py --cache",
+        cwd=tmp_path,
+        requested_permission="filesystem",
+        permission_scope=f"filesystem:write:{tmp_path / 'nested'}",
+    )
+    different_turn = CommandIntent.create(
+        provider="codex_cli",
+        session_id="same-turn-session",
+        turn_id="turn-2",
+        call_id="filesystem-call-4",
+        command="python fetch.py",
+        cwd=tmp_path,
+        requested_permission="filesystem",
+        permission_scope=f"filesystem:write:{tmp_path}",
+    )
+    network = CommandIntent.create(
+        provider="codex_cli",
+        session_id="same-turn-session",
+        turn_id="turn-1",
+        call_id="network-call-1",
+        command="curl https://api.example.com/health",
+        cwd=tmp_path,
+        requested_permission="network",
+        permission_scope="network:api.example.com",
+    )
+    network_equal = CommandIntent.create(
+        provider="codex_cli",
+        session_id="same-turn-session",
+        turn_id="turn-1",
+        call_id="network-call-2",
+        command="curl https://api.example.com/status",
+        cwd=tmp_path,
+        requested_permission="network",
+        permission_scope="network:api.example.com",
+    )
+    network_narrower = CommandIntent.create(
+        provider="codex_cli",
+        session_id="same-turn-session",
+        turn_id="turn-1",
+        call_id="network-call-3",
+        command="curl https://sub.api.example.com/health",
+        cwd=tmp_path,
+        requested_permission="network",
+        permission_scope="network:sub.api.example.com",
+    )
+    filesystem_after_network = CommandIntent.create(
+        provider="codex_cli",
+        session_id="same-turn-session",
+        turn_id="turn-1",
+        call_id="filesystem-call-5",
+        command="python fetch.py --final",
+        cwd=tmp_path,
+        requested_permission="filesystem",
+        permission_scope=f"filesystem:write:{tmp_path}",
+    )
+
+    pending = await approvals.request(broad)
+    assert pending.status is ApprovalState.PENDING
+    await approvals.approve(
+        provider="codex_cli",
+        session_id=broad.session_id,
+        call_id=broad.call_id,
+        command_hash=broad.command_hash,
+    )
+
+    reused_equal = await approvals.request(equal)
+    reused_narrower = await approvals.request(narrower)
+    new_turn = await approvals.request(different_turn)
+    await approvals.request(network)
+    await approvals.approve(
+        provider="codex_cli",
+        session_id=network.session_id,
+        call_id=network.call_id,
+        command_hash=network.command_hash,
+    )
+    reused_network = await approvals.request(network_equal)
+    reused_network_narrower = await approvals.request(network_narrower)
+    reused_filesystem = await approvals.request(filesystem_after_network)
+
+    assert reused_equal.status is ApprovalState.APPROVED
+    assert reused_equal.reason == "same_turn_capability"
+    assert reused_narrower.status is ApprovalState.APPROVED
+    assert reused_narrower.reason == "same_turn_capability"
+    assert reused_network.status is ApprovalState.APPROVED
+    assert reused_network.reason == "same_turn_capability"
+    assert reused_network_narrower.status is ApprovalState.APPROVED
+    assert reused_network_narrower.reason == "same_turn_capability"
+    assert reused_filesystem.status is ApprovalState.APPROVED
+    assert reused_filesystem.reason == "same_turn_capability"
+    assert new_turn.status is ApprovalState.PENDING
+
+
+@pytest.mark.asyncio
+async def test_same_turn_capability_does_not_cross_provider_or_expand_scope(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.runtime.approval import (
+        ApprovalManager,
+        ApprovalState,
+        CommandIntent,
+    )
+
+    approvals = ApprovalManager()
+    approved = CommandIntent.create(
+        provider="codex_cli",
+        session_id="scope-session",
+        turn_id="turn-1",
+        call_id="scope-call-1",
+        command="python task.py",
+        cwd=tmp_path,
+        requested_permission="filesystem",
+        permission_scope=f"filesystem:read:{tmp_path}",
+    )
+    write_upgrade = CommandIntent.create(
+        provider="codex_cli",
+        session_id="scope-session",
+        turn_id="turn-1",
+        call_id="scope-call-2",
+        command="python task.py --write",
+        cwd=tmp_path,
+        requested_permission="filesystem",
+        permission_scope=f"filesystem:write:{tmp_path}",
+    )
+    other_provider = CommandIntent.create(
+        provider="claude_cli",
+        session_id="scope-session",
+        turn_id="turn-1",
+        call_id="scope-call-3",
+        command="python task.py",
+        cwd=tmp_path,
+        requested_permission="filesystem",
+        permission_scope=f"filesystem:read:{tmp_path}",
+    )
+
+    await approvals.request(approved)
+    await approvals.approve(
+        provider="codex_cli",
+        session_id=approved.session_id,
+        call_id=approved.call_id,
+        command_hash=approved.command_hash,
+    )
+
+    assert (await approvals.request(write_upgrade)).status is ApprovalState.PENDING
+    assert (await approvals.request(other_provider)).status is ApprovalState.PENDING
+
+
+@pytest.mark.parametrize("provider", ["codex_cli", "claude_cli"])
+def test_native_workspace_write_scope_is_level_a(tmp_path: Path, provider: str) -> None:
+    from workbench.backend.runtime.approval import CommandIntent, CommandRisk
+
+    path = tmp_path / "src" / "main.py"
+    intent = CommandIntent.create(
+        provider=provider,
+        session_id="workspace-session",
+        turn_id="turn-1",
+        call_id=f"workspace-{provider}",
+        argv=(provider.replace("_cli", "") + "-file-change", "edit", str(path)),
+        cwd=tmp_path,
+        workspace_target=tmp_path,
+        requested_permission="filesystem",
+        permission_scope=f"filesystem:write:{path}",
+        patch_identity='{"path":"src/main.py","content":"ok"}',
+    )
+
+    assert intent.risk is CommandRisk.LEVEL_A
+
+
+@pytest.mark.asyncio
+async def test_approval_records_are_isolated_by_provider(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.runtime.approval import (
+        ApprovalManager,
+        ApprovalState,
+        CommandIntent,
+    )
+
+    approvals = ApprovalManager()
+    codex = CommandIntent.create(
+        provider="codex_cli",
+        session_id="shared-session",
+        call_id="shared-call",
+        command="python task.py",
+        cwd=tmp_path,
+        requested_permission="process_spawn",
+    )
+    claude = CommandIntent.create(
+        provider="claude_cli",
+        session_id="shared-session",
+        call_id="shared-call",
+        command="python task.py",
+        cwd=tmp_path,
+        requested_permission="process_spawn",
+    )
+
+    codex_record = await approvals.request(codex)
+    claude_record = await approvals.request(claude)
+    await approvals.approve(
+        provider="codex_cli",
+        session_id=codex.session_id,
+        call_id=codex.call_id,
+        command_hash=codex.command_hash,
+    )
+
+    remaining = await approvals.get(
+        provider="claude_cli",
+        session_id=claude.session_id,
+        call_id=claude.call_id,
+    )
+    assert codex_record.provider == "codex_cli"
+    assert claude_record.provider == "claude_cli"
+    assert remaining.status is ApprovalState.PENDING
+
+
+@pytest.mark.asyncio
 async def test_approval_timeout_never_creates_a_process(tmp_path: Path) -> None:
     from workbench.backend.runtime.approval import (
         ApprovalManager,
@@ -215,6 +465,7 @@ async def test_native_approval_waiter_expires_without_starting_a_process(
     ("command", "expected"),
     [
         ("git status", "level_a"),
+        ("git branch", "level_a"),
         ("git -C /tmp/outside status", "level_b"),
         ("git diff --no-index /tmp/a /tmp/b", "level_b"),
         ("git diff ../outside", "level_b"),
@@ -235,6 +486,9 @@ async def test_native_approval_waiter_expires_without_starting_a_process(
         ("curl -X POST http://127.0.0.1:8000/health", "level_b"),
         ("pytest tests/unit", "level_a"),
         ("npm install package", "level_b"),
+        ("npm run lint", "level_a"),
+        ("npm run build", "level_a"),
+        ("npm run dev", "level_a"),
         ("rm -rf /", "level_c"),
     ],
 )
@@ -681,6 +935,102 @@ async def test_workbench_approval_api_blocks_integrity_mismatch_and_timeout(
     assert mismatch_execute.json()["error"]["code"] == "approval_integrity_mismatch"
     assert dangerous.status_code == 200
     assert dangerous.json()["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_workbench_approval_api_isolates_provider_identity(
+    tmp_path: Path,
+) -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    from workbench.backend import main as main_module
+    from workbench.backend.main import WorkbenchService
+    from workbench.backend.runtime.auth import WorkbenchAuth
+
+    script = tmp_path / "task.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    service = WorkbenchService(
+        workspace_root=tmp_path,
+        event_log_path=tmp_path / "events.jsonl",
+        state_path=tmp_path / "state.json",
+    )
+    previous_service = main_module.service
+    previous_auth = main_module.auth
+    main_module.service = service
+    main_module.auth = WorkbenchAuth("test-token")
+    headers = {"Authorization": "Bearer test-token"}
+
+    def body(provider: str) -> dict[str, object]:
+        return {
+            "provider": provider,
+            "session_id": "shared-session",
+            "call_id": "shared-call",
+            "turn_id": f"{provider}-turn",
+            "argv": [sys.executable, str(script)],
+            "cwd": str(tmp_path),
+            "workspace_target": str(tmp_path),
+            "requested_permission": "project_write",
+            "permission_scope": f"filesystem:write:{tmp_path}",
+            "patch_identity": f"{provider}-patch",
+        }
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=main_module.app), base_url="http://test"
+        ) as client:
+            codex_request = await client.post(
+                "/api/approvals", json=body("codex_cli"), headers=headers
+            )
+            claude_request = await client.post(
+                "/api/approvals", json=body("claude_cli"), headers=headers
+            )
+            codex = codex_request.json()
+            claude = claude_request.json()
+            codex_get = await client.get(
+                "/api/approvals/shared-session/shared-call?provider=codex_cli",
+                headers=headers,
+            )
+            claude_get = await client.get(
+                "/api/approvals/shared-session/shared-call?provider=claude_cli",
+                headers=headers,
+            )
+            claude_approved = await client.post(
+                "/api/approvals/shared-session/shared-call/approve",
+                json={
+                    "provider": "claude_cli",
+                    "command_hash": claude["command_hash"],
+                },
+                headers=headers,
+            )
+            codex_after_claude = await client.get(
+                "/api/approvals/shared-session/shared-call?provider=codex_cli",
+                headers=headers,
+            )
+            invalid_provider = await client.get(
+                "/api/approvals/shared-session/shared-call?provider=unknown",
+                headers=headers,
+            )
+    finally:
+        main_module.service = previous_service
+        main_module.auth = previous_auth
+
+    assert codex_request.status_code == 200
+    assert claude_request.status_code == 200
+    assert codex["provider"] == "codex_cli"
+    assert claude["provider"] == "claude_cli"
+    assert codex["command_hash"] != claude["command_hash"]
+    assert codex["turn_id"] == "codex_cli-turn"
+    assert codex["workspace_target"] == str(tmp_path)
+    assert codex["permission_scope"] == f"filesystem:write:{tmp_path}"
+    assert codex["patch_identity"] == "codex_cli-patch"
+    assert codex_get.status_code == 200
+    assert claude_get.status_code == 200
+    assert codex_get.json()["provider"] == "codex_cli"
+    assert claude_get.json()["provider"] == "claude_cli"
+    assert claude_approved.status_code == 200
+    assert claude_approved.json()["status"] == "approved"
+    assert codex_after_claude.json()["status"] == "pending"
+    assert invalid_provider.status_code == 422
 
 
 @pytest.mark.asyncio

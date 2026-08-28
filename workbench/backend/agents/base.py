@@ -10,6 +10,8 @@ from contextlib import suppress
 from datetime import datetime
 from typing import Any
 
+from providers.common.identity import RuntimeIdentity
+
 if __package__:
     from ..models import AgentStatus, AgentType, Event, EventType
 
@@ -97,10 +99,12 @@ class BaseAgentAdapter(ABC):
         data: dict[str, Any],
         *,
         run_id: str | None = None,
+        identity: RuntimeIdentity | None = None,
     ) -> None:
         """发出事件"""
         event_run_id = run_id or self.current_run_id
         if self.event_callback and event_run_id:
+            event_identity = self._event_identity(event_run_id, identity)
             event = Event(
                 id=str(uuid.uuid4()),
                 run_id=event_run_id,
@@ -108,6 +112,7 @@ class BaseAgentAdapter(ABC):
                 timestamp=datetime.now(),
                 data=data,
                 message=data.get("message"),
+                identity=event_identity,
             )
             await self.event_callback(event)
             if event_type in {
@@ -117,6 +122,38 @@ class BaseAgentAdapter(ABC):
                 EventType.RUN_CANCELLED,
             }:
                 self._terminal_event_emitted = True
+
+    def _event_identity(
+        self, run_id: str, identity: RuntimeIdentity | None = None
+    ) -> RuntimeIdentity:
+        """Attach adapter-owned provenance without trusting arbitrary payloads."""
+        explicit = identity or RuntimeIdentity()
+        if explicit.session_id is None and explicit.thread_id is not None:
+            explicit = RuntimeIdentity(session_id=explicit.thread_id).merge(explicit)
+
+        generation = getattr(self, "generation", None)
+        if not isinstance(generation, str) or not generation.strip():
+            session = getattr(self, "session", None)
+            generation = getattr(session, "generation", None)
+        session_id = getattr(self, "session_id", None)
+        if not isinstance(session_id, str) or not session_id.strip():
+            session = getattr(self, "session", None)
+            session_id = getattr(session, "current_session_id", None)
+            if not isinstance(session_id, str) or not session_id.strip():
+                session_id = getattr(session, "session_id", None)
+        fallback = RuntimeIdentity(
+            provider=self.agent_type.value,
+            agent_id=self.agent_id,
+            run_id=run_id,
+            generation=generation if isinstance(generation, str) else None,
+            session_id=session_id if isinstance(session_id, str) else None,
+        )
+        merged = explicit.merge(fallback)
+        values = merged.to_mapping()
+        # The Workbench event stream is authoritative for its run key.  A
+        # provider cannot redirect an event into another run via metadata.
+        values["run_id"] = run_id
+        return RuntimeIdentity(**values)
 
     async def verify_completion(self) -> dict[str, Any]:
         """验证Agent完成声明"""

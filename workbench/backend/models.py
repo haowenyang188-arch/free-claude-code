@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from providers.common.identity import RuntimeIdentity
+
 
 class AgentType(StrEnum):
     """Agent类型"""
@@ -125,6 +127,9 @@ class Event(BaseModel):
     timestamp: datetime = Field(default_factory=datetime.now)
     data: dict[str, Any] = {}
     message: str | None = None
+    # Provider lifecycle identifiers are kept separate from arbitrary event
+    # data so correlation never depends on copying untrusted payload fields.
+    identity: RuntimeIdentity | None = None
 
 
 class ToolCall(BaseModel):

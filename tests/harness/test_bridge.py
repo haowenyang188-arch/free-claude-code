@@ -10,6 +10,10 @@ from typing import Any, cast
 import pytest
 
 from harness.bridge import (
+    HARNESS_FAILURE_INITIALIZE,
+    HARNESS_FAILURE_RUNTIME,
+    HARNESS_FAILURE_RUNTIME_START,
+    HARNESS_FAILURE_TIMEOUT,
     DeepSeekHarnessBridge,
     DeepSeekHarnessManager,
     HarnessBridgeError,
@@ -17,6 +21,7 @@ from harness.bridge import (
     messages_to_content_blocks,
 )
 from harness.config import HarnessConfig
+from harness.process import HarnessRequestTimeoutError, HarnessRuntimeClosedError
 from harness.protocol import JsonRpcNotification
 
 
@@ -143,6 +148,85 @@ class _ConcurrentFakeProcess:
 
     async def close(self) -> None:
         self.is_running = False
+
+
+class _IdentityFakeProcess(_ConcurrentFakeProcess):
+    """Emit changing runtime ids so host-owned turn identity can be checked."""
+
+    async def request(self, method: str, params: object = None, **_: object) -> dict:
+        if method != "session/prompt" or not isinstance(params, dict):
+            return await super().request(method, params)
+
+        self._next_message += 1
+        message_number = self._next_message
+        message_id = f"message-{message_number}"
+        session_id = params["sessionId"]
+        assert isinstance(session_id, str)
+        one_shot_id = f"one-shot-{message_number}"
+
+        def event_notification(event: dict[str, Any]) -> JsonRpcNotification:
+            return JsonRpcNotification(
+                "session.event",
+                {
+                    "sessionId": session_id,
+                    "event": event,
+                },
+            )
+
+        self._publish(
+            event_notification(
+                {
+                    "type": "agent/inbox/spliced",
+                    "oneShotId": one_shot_id,
+                    "turnId": f"turn-{message_number}",
+                    "itemId": f"item-{message_number}",
+                    "agentId": "agent-1",
+                    "data": {"inserted": [{"id": message_id}]},
+                }
+            )
+        )
+        self._publish(
+            event_notification(
+                {
+                    "type": "assistant/message",
+                    # A later untrusted runtime value must not replace the
+                    # first one-shot identity bound to this host turn.
+                    "oneShotId": "runtime-conflict",
+                    "data": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "reply"}],
+                        }
+                    },
+                }
+            )
+        )
+        self._publish(
+            event_notification(
+                {
+                    "type": "turn/end",
+                    "data": {"reason": {"kind": "completed"}},
+                }
+            )
+        )
+        self._publish(
+            JsonRpcNotification(
+                "session.status",
+                {"sessionId": session_id, "status": "idle"},
+            )
+        )
+        return {"messageId": message_id}
+
+
+class _FailingFakeProcess(_ConcurrentFakeProcess):
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error = error
+
+    async def request(self, method: str, params: object = None, **_: object) -> dict:
+        if method == "session/prompt":
+            raise self.error
+        return await super().request(method, params)
 
 
 class _FakeBridge(DeepSeekHarnessBridge):
@@ -306,6 +390,138 @@ async def test_same_session_prompts_are_serialized(tmp_path: Path) -> None:
     assert process.max_active_prompts == 1
     assert [turn.final_text for turn in turns] == ["reply-1", "reply-2"]
     await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_identity_is_stable_and_one_shot_is_not_reused(
+    tmp_path: Path,
+) -> None:
+    process = _IdentityFakeProcess()
+    bridge = _FakeBridge(HarnessConfig(enabled=False), process)
+
+    first, second = await asyncio.gather(
+        bridge.run([{"type": "text", "text": "one"}], session_id="first", cwd=tmp_path),
+        bridge.run(
+            [{"type": "text", "text": "two"}], session_id="second", cwd=tmp_path
+        ),
+    )
+
+    assert first.run_id != second.run_id
+    assert first.one_shot_id == "one-shot-1"
+    assert second.one_shot_id == "one-shot-2"
+    for turn in (first, second):
+        assert turn.message_id.startswith("message-")
+        assert turn.turn_id is not None
+        assert turn.item_id is not None
+        assert turn.agent_id == "agent-1"
+        assert turn.notifications
+        assert all(item["run_id"] == turn.run_id for item in turn.notifications)
+        assert all(item["message_id"] == turn.message_id for item in turn.notifications)
+        assert all(
+            item["one_shot_id"] == turn.one_shot_id for item in turn.notifications
+        )
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_bridge_classifies_timeout_without_resuming_process(
+    tmp_path: Path,
+) -> None:
+    process = _FailingFakeProcess(HarnessRequestTimeoutError("timed out"))
+    bridge = _FakeBridge(HarnessConfig(enabled=False), process)
+
+    with pytest.raises(HarnessRequestTimeoutError):
+        await bridge.run([{"type": "text", "text": "timeout"}], cwd=tmp_path)
+
+    assert bridge.last_failure_category == HARNESS_FAILURE_TIMEOUT
+    assert bridge.last_failure_detail == "DeepSeek Harness runtime request timed out."
+    assert bridge.process is None
+    assert process.is_running is False
+
+
+@pytest.mark.asyncio
+async def test_bridge_classifies_runtime_process_failure(tmp_path: Path) -> None:
+    process = _FailingFakeProcess(HarnessRuntimeClosedError("closed"))
+    bridge = _FakeBridge(HarnessConfig(enabled=False), process)
+
+    with pytest.raises(HarnessRuntimeClosedError):
+        await bridge.run([{"type": "text", "text": "closed"}], cwd=tmp_path)
+
+    assert bridge.last_failure_category == HARNESS_FAILURE_RUNTIME
+    assert (
+        bridge.last_failure_detail
+        == "DeepSeek Harness runtime failed during execution."
+    )
+    assert bridge.process is None
+    assert process.is_running is False
+
+
+@pytest.mark.asyncio
+async def test_manager_classifies_runtime_start_failure(tmp_path: Path) -> None:
+    manager = DeepSeekHarnessManager(
+        HarnessConfig(
+            enabled=True,
+            runtime_command=(sys.executable, "-c", "pass"),
+            workspace_root=tmp_path,
+            request_timeout_seconds=1,
+        )
+    )
+
+    with pytest.raises(HarnessRuntimeClosedError):
+        await manager.ensure_ready(
+            provider="deepseek",
+            model="deepseek-test",
+            cwd=tmp_path,
+        )
+
+    status = manager.diagnostics()
+    assert status["ready"] is False
+    assert status["state"] == HARNESS_FAILURE_RUNTIME_START
+    assert status["failure_category"] == HARNESS_FAILURE_RUNTIME_START
+    assert status["error"] == "DeepSeek Harness runtime failed to start."
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_manager_classifies_initialize_failure(tmp_path: Path) -> None:
+    script = tmp_path / "initialize_error_runtime.py"
+    script.write_text(
+        """
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("method") == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32001,"message":"bad initialize"}}), flush=True)
+    elif request.get("method") == "shutdown":
+        print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":{}}), flush=True)
+        break
+""".strip(),
+        encoding="utf-8",
+    )
+    manager = DeepSeekHarnessManager(
+        HarnessConfig(
+            enabled=True,
+            runtime_command=(sys.executable, str(script)),
+            workspace_root=tmp_path,
+            request_timeout_seconds=1,
+        )
+    )
+
+    with pytest.raises(Exception, match="bad initialize"):
+        await manager.ensure_ready(
+            provider="deepseek",
+            model="deepseek-test",
+            cwd=tmp_path,
+        )
+
+    status = manager.diagnostics()
+    assert status["ready"] is False
+    assert status["state"] == HARNESS_FAILURE_INITIALIZE
+    assert status["failure_category"] == HARNESS_FAILURE_INITIALIZE
+    assert status["error"] == "DeepSeek Harness runtime initialization failed."
+    await manager.close()
 
 
 @pytest.mark.asyncio
