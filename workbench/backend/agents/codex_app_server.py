@@ -250,6 +250,7 @@ class CodexAppServerSession:
                     await self.approval_manager.clear_turn(
                         provider="codex_cli",
                         session_id=thread_id,
+                        thread_id=thread_id,
                         turn_id=event["turn_id"],
                     )
                 yield event
@@ -408,6 +409,8 @@ class CodexAppServerSession:
             return {}, "decline"
         intent = CommandIntent.create(
             session_id=thread_id,
+            thread_id=thread_id,
+            item_id=item_id,
             call_id=item_id,
             argv=("codex-permission-request", canonical),
             cwd=cwd,
@@ -441,8 +444,6 @@ class CodexAppServerSession:
         item_id = _text(params.get("itemId"))
         call_id = _text(params.get("callId")) or item_id
         approval_id = _text(params.get("approvalId"))
-        if approval_id:
-            call_id = approval_id
         cwd = self._resolve_cwd(params.get("cwd"))
         if not thread_id or not call_id or cwd is None:
             return None
@@ -460,7 +461,10 @@ class CodexAppServerSession:
                 return None
             return CommandIntent.create(
                 session_id=thread_id,
+                thread_id=thread_id,
                 call_id=call_id,
+                item_id=item_id,
+                approval_id=approval_id,
                 argv=argv,
                 cwd=cwd,
                 requested_permission=requested_permission,
@@ -477,7 +481,10 @@ class CodexAppServerSession:
                 return None
             return CommandIntent.create(
                 session_id=thread_id,
+                thread_id=thread_id,
                 call_id=call_id,
+                item_id=item_id,
+                approval_id=approval_id,
                 argv=("codex-file-change", item_id or call_id, patch_identity),
                 cwd=cwd,
                 requested_permission="file_write",
@@ -495,7 +502,10 @@ class CodexAppServerSession:
         try:
             return CommandIntent.create(
                 session_id=thread_id,
+                thread_id=thread_id,
                 call_id=call_id,
+                item_id=item_id,
+                approval_id=approval_id,
                 command=command,
                 cwd=cwd,
                 requested_permission=requested_permission,

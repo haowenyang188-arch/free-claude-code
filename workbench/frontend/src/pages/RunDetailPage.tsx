@@ -48,11 +48,8 @@ export default function RunDetailPage() {
     setApprovalBusy(true)
     try {
       await api.decideApproval(
-        approval.provider,
-        approval.session_id,
-        approval.call_id,
+        approval,
         decision,
-        approval.command_hash,
       )
       await loadRun()
     } finally {

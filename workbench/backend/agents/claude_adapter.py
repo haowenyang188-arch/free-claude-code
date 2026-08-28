@@ -6,11 +6,13 @@ import asyncio
 import uuid
 from collections.abc import Mapping
 from contextlib import suppress
+from pathlib import Path
 from typing import Any, ClassVar
 
 from cli.process_registry import register_process, unregister_process
 from cli.runtime_environment import build_cli_environment
 from cli.runtime_registry import RuntimeBackend, RuntimeRegistry
+from providers.common.identity import RuntimeIdentity
 
 if __package__:
     from ..models import AgentStatus, AgentType, EventType
@@ -96,6 +98,16 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
             )
 
             if self.use_compatibility_bridge:
+                requested_workspace = (
+                    Path(workspace_path).expanduser().resolve(strict=True)
+                )
+                if (
+                    self.compatibility_session is not None
+                    and self.compatibility_session.workspace != requested_workspace
+                ):
+                    await self.compatibility_session.stop()
+                    self.compatibility_session = None
+                    self.session_id = None
                 if self.compatibility_session is None:
                     self.compatibility_session = ClaudeCompatibilitySession(
                         workspace_path=workspace_path,
@@ -155,6 +167,10 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
                     "provider": record.provider,
                     "session_id": record.session_id,
                     "call_id": record.call_id,
+                    "one_shot_id": record.one_shot_id,
+                    "thread_id": record.thread_id,
+                    "item_id": record.item_id,
+                    "approval_id": record.approval_id,
                     "turn_id": record.turn_id,
                     "normalized_command": record.normalized_command,
                     "argv": list(record.argv),
@@ -167,10 +183,21 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
                     ),
                     "requested_permission": record.requested_permission,
                     "permission_scope": record.permission_scope,
+                    "patch_identity": record.patch_identity,
                     "risk": record.risk.value,
                     "status": record.status.value,
                 },
             },
+            identity=RuntimeIdentity(
+                provider=record.provider,
+                session_id=record.session_id,
+                thread_id=record.thread_id,
+                turn_id=record.turn_id,
+                item_id=record.item_id,
+                approval_id=record.approval_id,
+                one_shot_id=record.one_shot_id,
+                call_id=record.call_id,
+            ),
         )
 
     async def _monitor_compatibility(

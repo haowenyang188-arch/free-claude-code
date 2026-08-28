@@ -53,6 +53,7 @@ if __package__:
         ApprovalIntegrityError,
         ApprovalManager,
         ApprovalRecord,
+        ApprovalReference,
         CommandIntent,
         CommandSyntaxError,
     )
@@ -101,6 +102,7 @@ else:  # Support ``python workbench/backend/main.py`` as a local entry point.
         ApprovalIntegrityError,
         ApprovalManager,
         ApprovalRecord,
+        ApprovalReference,
         CommandIntent,
         CommandSyntaxError,
     )
@@ -781,14 +783,7 @@ class WorkbenchService:
             workspace = self.workspace_policy.resolve(payload.cwd)
         except WorkspacePolicyError as exc:
             raise ValueError("cwd must stay inside the Workbench workspace") from exc
-        try:
-            workspace_target = self.workspace_policy.resolve(
-                payload.workspace_target or workspace
-            )
-        except WorkspacePolicyError as exc:
-            raise ValueError(
-                "workspace_target must stay inside the Workbench workspace"
-            ) from exc
+        workspace_target = self._approval_workspace_target(payload, workspace)
         return CommandIntent.create(
             session_id=resolved_session_id,
             call_id=resolved_call_id,
@@ -797,11 +792,53 @@ class WorkbenchService:
             cwd=workspace,
             requested_permission=payload.requested_permission,
             provider=payload.provider,
+            thread_id=payload.thread_id,
             turn_id=payload.turn_id,
+            item_id=payload.item_id,
+            approval_id=payload.approval_id,
             workspace_target=workspace_target,
             permission_scope=payload.permission_scope,
             patch_identity=payload.patch_identity,
         )
+
+    def _approval_workspace_target(
+        self, payload: ApprovalCommandRequest, workspace: Path
+    ) -> Path:
+        if payload.workspace_target is None:
+            return workspace
+        candidate = Path(payload.workspace_target).expanduser()
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(
+                "workspace_target must reference an existing path"
+            ) from exc
+        try:
+            resolved.relative_to(self.workspace_policy.root)
+        except ValueError:
+            self._validate_external_filesystem_scope(payload, resolved)
+        return resolved
+
+    @staticmethod
+    def _validate_external_filesystem_scope(
+        payload: ApprovalCommandRequest, target: Path
+    ) -> None:
+        scope = payload.permission_scope
+        if not scope:
+            raise ValueError("external workspace target requires filesystem scope")
+        parts = scope.split(":", 2)
+        if len(parts) != 3 or parts[:2] not in (
+            ["filesystem", "read"],
+            ["filesystem", "write"],
+        ):
+            raise ValueError("external workspace target requires filesystem scope")
+        scoped_path = Path(parts[2]).expanduser().resolve(strict=False)
+        try:
+            scoped_path.relative_to(target)
+        except ValueError as exc:
+            raise ValueError(
+                "filesystem scope must stay within external workspace target"
+            ) from exc
 
     async def request_approval(self, payload: ApprovalCommandRequest) -> ApprovalRecord:
         intent = self._approval_intent(payload)
@@ -829,26 +866,37 @@ class WorkbenchService:
         command_hash: str,
         decision: str,
         provider: str = "codex_cli",
+        reference: ApprovalReference | None = None,
     ) -> ApprovalRecord:
+        if reference is not None and (
+            reference.provider != provider
+            or reference.session_id != session_id
+            or reference.call_id != call_id
+            or reference.command_hash != command_hash.lower()
+        ):
+            raise ApprovalIntegrityError("approval_integrity_mismatch")
         if decision == "approve":
             return await self.approvals.approve(
-                session_id=session_id,
-                call_id=call_id,
-                command_hash=command_hash,
+                reference,
+                session_id=None if reference is not None else session_id,
+                call_id=None if reference is not None else call_id,
+                command_hash=None if reference is not None else command_hash,
                 provider=provider,
             )
         if decision == "reject":
             return await self.approvals.reject(
-                session_id=session_id,
-                call_id=call_id,
-                command_hash=command_hash,
+                reference,
+                session_id=None if reference is not None else session_id,
+                call_id=None if reference is not None else call_id,
+                command_hash=None if reference is not None else command_hash,
                 provider=provider,
             )
         if decision == "cancel":
             return await self.approvals.cancel(
-                session_id=session_id,
-                call_id=call_id,
-                command_hash=command_hash,
+                reference,
+                session_id=None if reference is not None else session_id,
+                call_id=None if reference is not None else call_id,
+                command_hash=None if reference is not None else command_hash,
                 provider=provider,
             )
         raise ValueError("unknown approval decision")
@@ -885,7 +933,10 @@ class ApprovalCommandRequest(BaseModel):
     provider: str = Field(default="codex_cli", pattern=r"^(?:codex_cli|claude_cli)$")
     session_id: str = Field(min_length=1, max_length=256)
     call_id: str = Field(min_length=1, max_length=256)
+    thread_id: str | None = Field(default=None, max_length=256)
     turn_id: str | None = Field(default=None, max_length=256)
+    item_id: str | None = Field(default=None, max_length=256)
+    approval_id: str | None = Field(default=None, max_length=256)
     command: str | None = Field(default=None, max_length=8192)
     argv: list[str] | None = Field(default=None, min_length=1, max_length=256)
     cwd: str = Field(min_length=1, max_length=4096)
@@ -901,6 +952,11 @@ class ApprovalDecisionRequest(BaseModel):
     command_hash: str = Field(
         min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$"
     )
+    one_shot_id: str | None = Field(default=None, min_length=1, max_length=128)
+    thread_id: str | None = Field(default=None, max_length=256)
+    turn_id: str | None = Field(default=None, max_length=256)
+    item_id: str | None = Field(default=None, max_length=256)
+    approval_id: str | None = Field(default=None, max_length=256)
 
 
 class ApprovalExecuteRequest(ApprovalCommandRequest):
@@ -919,6 +975,10 @@ def _approval_payload(record: ApprovalRecord) -> dict[str, Any]:
         "provider": record.provider,
         "session_id": record.session_id,
         "call_id": record.call_id,
+        "one_shot_id": record.one_shot_id,
+        "thread_id": record.thread_id,
+        "item_id": record.item_id,
+        "approval_id": record.approval_id,
         "turn_id": record.turn_id,
         "normalized_command": record.normalized_command,
         "argv": list(record.argv),
@@ -1160,12 +1220,34 @@ async def decide_approval(
             },
         )
     try:
+        reference = None
+        identity_fields = (
+            payload.thread_id,
+            payload.turn_id,
+            payload.item_id,
+            payload.approval_id,
+        )
+        if payload.one_shot_id is not None:
+            reference = ApprovalReference.create(
+                provider=payload.provider,
+                session_id=session_id,
+                thread_id=payload.thread_id,
+                turn_id=payload.turn_id,
+                item_id=payload.item_id,
+                approval_id=payload.approval_id,
+                call_id=call_id,
+                one_shot_id=payload.one_shot_id,
+                command_hash=payload.command_hash,
+            )
+        elif any(value is not None for value in identity_fields):
+            raise ApprovalIntegrityError("approval_integrity_mismatch")
         record = await service.decide_approval(
             session_id,
             call_id,
             payload.command_hash,
             decision,
             provider=payload.provider,
+            reference=reference,
         )
     except (ApprovalIntegrityError, ValueError) as exc:
         return _approval_error_response(exc)

@@ -1,4 +1,4 @@
-import { Agent, Task, Run, Event, CreateTaskRequest, ApprovalRecord } from '../types'
+import { Agent, Task, Run, Event, CreateTaskRequest, ApprovalIdentity, ApprovalRecord } from '../types'
 
 const API_BASE = '/api'
 
@@ -82,17 +82,22 @@ export const api = {
   },
 
   async decideApproval(
-    provider: string,
-    sessionId: string,
-    callId: string,
+    approval: ApprovalIdentity,
     decision: 'approve' | 'reject' | 'cancel',
-    commandHash: string,
   ): Promise<ApprovalRecord> {
     return requestJson(
-      `/approvals/${encodeURIComponent(sessionId)}/${encodeURIComponent(callId)}/${decision}`,
+      `/approvals/${encodeURIComponent(approval.session_id)}/${encodeURIComponent(approval.call_id)}/${decision}`,
       {
         method: 'POST',
-        body: JSON.stringify({ provider, command_hash: commandHash }),
+        body: JSON.stringify({
+          provider: approval.provider,
+          command_hash: approval.command_hash,
+          one_shot_id: approval.one_shot_id,
+          thread_id: approval.thread_id,
+          turn_id: approval.turn_id,
+          item_id: approval.item_id,
+          approval_id: approval.approval_id,
+        }),
       },
     )
   },

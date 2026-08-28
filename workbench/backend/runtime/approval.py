@@ -12,6 +12,7 @@ import hmac
 import json
 import re
 import shlex
+import uuid
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -228,7 +229,13 @@ def _validate_argv(argv: tuple[str, ...] | list[str]) -> tuple[str, ...]:
 def _command_hash(
     *,
     provider: str,
+    session_id: str,
+    thread_id: str | None,
     turn_id: str | None,
+    item_id: str | None,
+    approval_id: str | None,
+    call_id: str | None,
+    one_shot_id: str | None,
     normalized_command: str,
     argv: tuple[str, ...],
     cwd: Path,
@@ -237,14 +244,22 @@ def _command_hash(
     permission_scope: str | None,
     patch_identity: str | None,
 ) -> str:
+    # ``one_shot_id`` is a server-side lookup nonce, not command content.  It
+    # must remain separate so the same normalized intent can be bound to one
+    # approval record without changing the hash shown to the executor/UI.
     payload = {
         "argv": list(argv),
         "cwd": str(cwd),
+        "approval_id": approval_id,
+        "call_id": call_id,
+        "item_id": item_id,
         "normalized_command": normalized_command,
         "patch_identity": patch_identity,
         "permission_scope": permission_scope,
         "provider": provider,
         "requested_permission": requested_permission,
+        "session_id": session_id,
+        "thread_id": thread_id,
         "turn_id": turn_id,
         "workspace_target": str(workspace_target),
     }
@@ -262,6 +277,8 @@ def _risk_for(argv: tuple[str, ...], cwd: Path | None = None) -> CommandRisk:
         if _critical_path_reference(target):
             return CommandRisk.LEVEL_C
         return CommandRisk.LEVEL_B
+    if any(_critical_path_reference(argument) for argument in argv[1:]):
+        return CommandRisk.LEVEL_C
     if _contains_sensitive_reference(arguments, executable=executable):
         return CommandRisk.LEVEL_C
     if executable in {"curl", "curl.exe", "wget", "wget.exe"}:
@@ -833,10 +850,10 @@ def _executable_name(value: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class CommandIntent:
-    """A fully normalized command identity that can be approved once."""
+    """A normalized command identity, unbound until Workbench records it."""
 
     session_id: str
-    call_id: str
+    call_id: str | None
     normalized_command: str
     argv: tuple[str, ...]
     cwd: Path
@@ -844,7 +861,11 @@ class CommandIntent:
     command_hash: str
     risk: CommandRisk
     provider: str = "workbench"
+    thread_id: str | None = None
     turn_id: str | None = None
+    item_id: str | None = None
+    approval_id: str | None = None
+    one_shot_id: str | None = None
     workspace_target: Path | None = None
     permission_scope: str | None = None
     patch_identity: str | None = None
@@ -854,13 +875,16 @@ class CommandIntent:
         cls,
         *,
         session_id: str,
-        call_id: str,
         cwd: str | Path,
         requested_permission: str,
+        call_id: str | None = None,
         command: str | None = None,
         argv: list[str] | tuple[str, ...] | None = None,
         provider: str = "workbench",
+        thread_id: str | None = None,
         turn_id: str | None = None,
+        item_id: str | None = None,
+        approval_id: str | None = None,
         workspace_target: str | Path | None = None,
         permission_scope: str | None = None,
         patch_identity: str | None = None,
@@ -881,7 +905,15 @@ class CommandIntent:
             raise ValueError("cwd must reference a directory")
         permission = _required_text(requested_permission, "requested_permission")
         normalized_provider = _provider_text(provider)
+        normalized_thread_id = _optional_text(thread_id, "thread_id")
         normalized_turn_id = _optional_text(turn_id, "turn_id")
+        normalized_item_id = _optional_text(item_id, "item_id")
+        normalized_approval_id = _optional_text(approval_id, "approval_id")
+        normalized_call_id = _optional_text(call_id, "call_id")
+        if not any((normalized_item_id, normalized_approval_id, normalized_call_id)):
+            raise ValueError(
+                "one of item_id, approval_id, or call_id must identify the request"
+            )
         normalized_scope = _optional_text(permission_scope, "permission_scope")
         normalized_patch = _optional_text(patch_identity, "patch_identity")
         target_value = (
@@ -899,20 +931,40 @@ class CommandIntent:
             normalized_provider,
             resolved_argv,
             normalized_scope,
+            resolved_cwd,
             resolved_target,
             risk,
         ):
             risk = CommandRisk.LEVEL_A
-        return cls(
-            session_id=_required_text(session_id, "session_id"),
-            call_id=_required_text(call_id, "call_id"),
+        elif risk is CommandRisk.LEVEL_A and (
+            not _path_within(resolved_cwd, resolved_target)
+            or _permission_scope_requires_approval(
+                normalized_scope,
+                resolved_argv,
+                resolved_target,
+            )
+        ):
+            # A provider may attach a capability request to an otherwise safe
+            # command. The command itself remains readable, but the added
+            # capability still needs one-shot approval.
+            risk = CommandRisk.LEVEL_B
+        normalized_session_id = _required_text(session_id, "session_id")
+        intent = cls(
+            session_id=normalized_session_id,
+            call_id=normalized_call_id,
             normalized_command=normalized,
             argv=resolved_argv,
             cwd=resolved_cwd,
             requested_permission=permission,
             command_hash=_command_hash(
                 provider=normalized_provider,
+                session_id=normalized_session_id,
+                thread_id=normalized_thread_id,
                 turn_id=normalized_turn_id,
+                item_id=normalized_item_id,
+                approval_id=normalized_approval_id,
+                call_id=normalized_call_id,
+                one_shot_id=None,
                 normalized_command=normalized,
                 argv=resolved_argv,
                 cwd=resolved_cwd,
@@ -923,31 +975,174 @@ class CommandIntent:
             ),
             risk=risk,
             provider=normalized_provider,
+            thread_id=normalized_thread_id,
             turn_id=normalized_turn_id,
+            item_id=normalized_item_id,
+            approval_id=normalized_approval_id,
+            one_shot_id=None,
             workspace_target=resolved_target,
             permission_scope=normalized_scope,
             patch_identity=normalized_patch,
         )
+        intent.verify_integrity()
+        return intent
 
-    def verify_integrity(self) -> None:
+    def verify_integrity(self, *, require_bound: bool = False) -> None:
         """Recompute the canonical command identity immediately before use."""
         canonical_command = shlex.join(self.argv)
-        expected_hash = _command_hash(
-            provider=self.provider,
-            turn_id=self.turn_id,
+        expected_risk = _risk_for(self.argv, self.cwd)
+        if _native_workspace_write_is_level_a(
+            self.provider,
+            self.argv,
+            self.permission_scope,
+            self.cwd,
+            self.workspace_target or self.cwd,
+            expected_risk,
+        ):
+            expected_risk = CommandRisk.LEVEL_A
+        elif expected_risk is CommandRisk.LEVEL_A and (
+            not _path_within(self.cwd, self.workspace_target or self.cwd)
+            or _permission_scope_requires_approval(
+                self.permission_scope,
+                self.argv,
+                self.workspace_target or self.cwd,
+            )
+        ):
+            expected_risk = CommandRisk.LEVEL_B
+        expected_hash = _command_hash_for_intent(
+            self,
             normalized_command=canonical_command,
-            argv=self.argv,
-            cwd=self.cwd,
-            requested_permission=self.requested_permission,
-            workspace_target=self.workspace_target or self.cwd,
-            permission_scope=self.permission_scope,
-            patch_identity=self.patch_identity,
+            one_shot_id=self.one_shot_id,
         )
         if (
             self.normalized_command != canonical_command
             or not hmac.compare_digest(self.command_hash, expected_hash)
             or _provider_text(self.provider) != self.provider
+            or _required_text(self.session_id, "session_id") != self.session_id
+            or _optional_text(self.thread_id, "thread_id") != self.thread_id
+            or _optional_text(self.turn_id, "turn_id") != self.turn_id
+            or _optional_text(self.item_id, "item_id") != self.item_id
+            or _optional_text(self.approval_id, "approval_id") != self.approval_id
+            or _optional_text(self.call_id, "call_id") != self.call_id
+            or _optional_text(self.one_shot_id, "one_shot_id") != self.one_shot_id
+            or not any((self.item_id, self.approval_id, self.call_id))
+            or (require_bound and self.one_shot_id is None)
             or self.workspace_target is None
+            or self.risk is not expected_risk
+        ):
+            raise ApprovalIntegrityError("approval_integrity_mismatch")
+
+    @property
+    def reference(self) -> ApprovalReference:
+        """Return the exact bound identity used by decision endpoints."""
+        self.verify_integrity(require_bound=True)
+        assert self.one_shot_id is not None
+        return ApprovalReference.create(
+            provider=self.provider,
+            session_id=self.session_id,
+            thread_id=self.thread_id,
+            turn_id=self.turn_id,
+            item_id=self.item_id,
+            approval_id=self.approval_id,
+            call_id=self.call_id,
+            one_shot_id=self.one_shot_id,
+            command_hash=self.command_hash,
+        )
+
+
+def _command_hash_for_intent(
+    intent: CommandIntent,
+    *,
+    normalized_command: str | None = None,
+    one_shot_id: str | None,
+) -> str:
+    return _command_hash(
+        provider=intent.provider,
+        session_id=intent.session_id,
+        thread_id=intent.thread_id,
+        turn_id=intent.turn_id,
+        item_id=intent.item_id,
+        approval_id=intent.approval_id,
+        call_id=intent.call_id,
+        one_shot_id=one_shot_id,
+        normalized_command=normalized_command or intent.normalized_command,
+        argv=intent.argv,
+        cwd=intent.cwd,
+        requested_permission=intent.requested_permission,
+        workspace_target=intent.workspace_target or intent.cwd,
+        permission_scope=intent.permission_scope,
+        patch_identity=intent.patch_identity,
+    )
+
+
+def _bind_one_shot(intent: CommandIntent, one_shot_id: str) -> CommandIntent:
+    """Bind a Workbench-owned one-shot identifier to an unbound intent."""
+    intent.verify_integrity()
+    if intent.one_shot_id is not None:
+        raise ApprovalIntegrityError("approval_integrity_mismatch")
+    normalized = _required_text(one_shot_id, "one_shot_id")
+    bound = replace(
+        intent,
+        one_shot_id=normalized,
+    )
+    bound.verify_integrity(require_bound=True)
+    return bound
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalReference:
+    """Complete immutable identity required for every post-request action."""
+
+    provider: str
+    session_id: str
+    one_shot_id: str
+    command_hash: str
+    thread_id: str | None = None
+    turn_id: str | None = None
+    item_id: str | None = None
+    approval_id: str | None = None
+    call_id: str | None = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        provider: str,
+        session_id: str,
+        one_shot_id: str,
+        command_hash: str,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+        item_id: str | None = None,
+        approval_id: str | None = None,
+        call_id: str | None = None,
+    ) -> ApprovalReference:
+        reference = cls(
+            provider=_provider_text(provider),
+            session_id=_required_text(session_id, "session_id"),
+            thread_id=_optional_text(thread_id, "thread_id"),
+            turn_id=_optional_text(turn_id, "turn_id"),
+            item_id=_optional_text(item_id, "item_id"),
+            approval_id=_optional_text(approval_id, "approval_id"),
+            call_id=_optional_text(call_id, "call_id"),
+            one_shot_id=_required_text(one_shot_id, "one_shot_id"),
+            command_hash=_required_text(command_hash, "command_hash").lower(),
+        )
+        reference.verify_integrity()
+        return reference
+
+    def verify_integrity(self) -> None:
+        if (
+            _provider_text(self.provider) != self.provider
+            or _required_text(self.session_id, "session_id") != self.session_id
+            or _optional_text(self.thread_id, "thread_id") != self.thread_id
+            or _optional_text(self.turn_id, "turn_id") != self.turn_id
+            or _optional_text(self.item_id, "item_id") != self.item_id
+            or _optional_text(self.approval_id, "approval_id") != self.approval_id
+            or _optional_text(self.call_id, "call_id") != self.call_id
+            or _required_text(self.one_shot_id, "one_shot_id") != self.one_shot_id
+            or not re.fullmatch(r"[0-9a-f]{64}", self.command_hash)
+            or not any((self.item_id, self.approval_id, self.call_id))
         ):
             raise ApprovalIntegrityError("approval_integrity_mismatch")
 
@@ -955,7 +1150,8 @@ class CommandIntent:
 @dataclass(frozen=True, slots=True)
 class ApprovalRecord:
     session_id: str
-    call_id: str
+    call_id: str | None
+    one_shot_id: str
     normalized_command: str
     argv: tuple[str, ...]
     cwd: Path
@@ -969,16 +1165,49 @@ class ApprovalRecord:
     consumed_at: datetime | None = None
     reason: str | None = None
     provider: str = "workbench"
+    thread_id: str | None = None
     turn_id: str | None = None
+    item_id: str | None = None
+    approval_id: str | None = None
     workspace_target: Path | None = None
     permission_scope: str | None = None
     patch_identity: str | None = None
 
+    @property
+    def intent(self) -> CommandIntent:
+        intent = CommandIntent(
+            session_id=self.session_id,
+            call_id=self.call_id,
+            normalized_command=self.normalized_command,
+            argv=self.argv,
+            cwd=self.cwd,
+            requested_permission=self.requested_permission,
+            command_hash=self.command_hash,
+            risk=self.risk,
+            provider=self.provider,
+            thread_id=self.thread_id,
+            turn_id=self.turn_id,
+            item_id=self.item_id,
+            approval_id=self.approval_id,
+            one_shot_id=self.one_shot_id,
+            workspace_target=self.workspace_target,
+            permission_scope=self.permission_scope,
+            patch_identity=self.patch_identity,
+        )
+        intent.verify_integrity(require_bound=True)
+        return intent
+
+    @property
+    def reference(self) -> ApprovalReference:
+        return self.intent.reference
+
 
 @dataclass(frozen=True, slots=True)
 class _CapabilityGrant:
+    one_shot_id: str
     provider: str
     session_id: str
+    thread_id: str | None
     turn_id: str
     workspace_target: Path
     permission_scope: str
@@ -993,66 +1222,105 @@ class ApprovalManager:
     """
 
     def __init__(self) -> None:
-        self._records: dict[tuple[str, str, str], ApprovalRecord] = {}
-        self._waiters: dict[tuple[str, str, str], asyncio.Future[ApprovalRecord]] = {}
-        self._capability_grants: dict[tuple[str, str, str], list[_CapabilityGrant]] = {}
+        self._records: dict[
+            tuple[
+                str,
+                str,
+                str | None,
+                str | None,
+                str | None,
+                str | None,
+                str | None,
+            ],
+            ApprovalRecord,
+        ] = {}
+        self._one_shot_keys: dict[
+            str,
+            tuple[
+                str,
+                str,
+                str | None,
+                str | None,
+                str | None,
+                str | None,
+                str | None,
+            ],
+        ] = {}
+        self._waiters: dict[str, asyncio.Future[ApprovalRecord]] = {}
+        self._capability_grants: dict[
+            tuple[str, str, str | None, str], list[_CapabilityGrant]
+        ] = {}
         self._lock = asyncio.Lock()
 
     async def request(
         self, intent: CommandIntent, *, approval_timeout_seconds: float = 300.0
     ) -> ApprovalRecord:
         intent.verify_integrity()
+        if intent.one_shot_id is not None:
+            raise ApprovalIntegrityError("approval_integrity_mismatch")
         if approval_timeout_seconds < 0:
             raise ValueError("approval_timeout_seconds must be non-negative")
-        now = datetime.now(UTC)
-        expires_at = now + timedelta(seconds=approval_timeout_seconds)
-        if intent.risk is CommandRisk.LEVEL_A:
-            status = ApprovalState.APPROVED
-            approved_at: datetime | None = now
-            reason = "level_a_policy"
-        elif intent.risk is CommandRisk.LEVEL_C:
-            status = ApprovalState.REJECTED
-            approved_at = None
-            reason = "level_c_denied"
-        elif approval_timeout_seconds == 0:
-            status = ApprovalState.APPROVAL_TIMEOUT
-            approved_at = None
-            reason = "approval_timeout"
-        else:
-            status = ApprovalState.PENDING
-            approved_at = None
-            reason = None
-        record = ApprovalRecord(
-            session_id=intent.session_id,
-            call_id=intent.call_id,
-            normalized_command=intent.normalized_command,
-            argv=intent.argv,
-            cwd=intent.cwd,
-            requested_permission=intent.requested_permission,
-            command_hash=intent.command_hash,
-            risk=intent.risk,
-            status=status,
-            created_at=now,
-            expires_at=expires_at,
-            approved_at=approved_at,
-            reason=reason,
-            provider=intent.provider,
-            turn_id=intent.turn_id,
-            workspace_target=intent.workspace_target,
-            permission_scope=intent.permission_scope,
-            patch_identity=intent.patch_identity,
-        )
         async with self._lock:
-            key = self._record_key(intent.provider, intent.session_id, intent.call_id)
+            key = self._record_key(intent)
             existing = self._records.get(key)
             if existing is not None:
-                if hmac.compare_digest(existing.command_hash, intent.command_hash):
+                existing_unbound_hash = _command_hash_for_intent(
+                    existing.intent, one_shot_id=None
+                )
+                if hmac.compare_digest(existing_unbound_hash, intent.command_hash):
                     refreshed = self._expire_if_needed(existing)
                     self._records[key] = refreshed
                     return refreshed
                 raise ApprovalIntegrityError("approval_integrity_mismatch")
+            one_shot_id = uuid.uuid4().hex
+            while one_shot_id in self._one_shot_keys:
+                one_shot_id = uuid.uuid4().hex
+            bound_intent = _bind_one_shot(intent, one_shot_id)
+            now = datetime.now(UTC)
+            expires_at = now + timedelta(seconds=approval_timeout_seconds)
+            if bound_intent.risk is CommandRisk.LEVEL_A:
+                status = ApprovalState.APPROVED
+                approved_at: datetime | None = now
+                reason = "level_a_policy"
+            elif bound_intent.risk is CommandRisk.LEVEL_C:
+                status = ApprovalState.REJECTED
+                approved_at = None
+                reason = "level_c_denied"
+            elif approval_timeout_seconds == 0:
+                status = ApprovalState.APPROVAL_TIMEOUT
+                approved_at = None
+                reason = "approval_timeout"
+            else:
+                status = ApprovalState.PENDING
+                approved_at = None
+                reason = None
+            assert bound_intent.one_shot_id is not None
+            record = ApprovalRecord(
+                session_id=bound_intent.session_id,
+                call_id=bound_intent.call_id,
+                one_shot_id=bound_intent.one_shot_id,
+                normalized_command=bound_intent.normalized_command,
+                argv=bound_intent.argv,
+                cwd=bound_intent.cwd,
+                requested_permission=bound_intent.requested_permission,
+                command_hash=bound_intent.command_hash,
+                risk=bound_intent.risk,
+                status=status,
+                created_at=now,
+                expires_at=expires_at,
+                approved_at=approved_at,
+                reason=reason,
+                provider=bound_intent.provider,
+                thread_id=bound_intent.thread_id,
+                turn_id=bound_intent.turn_id,
+                item_id=bound_intent.item_id,
+                approval_id=bound_intent.approval_id,
+                workspace_target=bound_intent.workspace_target,
+                permission_scope=bound_intent.permission_scope,
+                patch_identity=bound_intent.patch_identity,
+            )
             if intent.risk is CommandRisk.LEVEL_B and self._reusable_grant_locked(
-                intent
+                bound_intent
             ):
                 record = replace(
                     record,
@@ -1061,21 +1329,27 @@ class ApprovalManager:
                     reason="same_turn_capability",
                 )
             self._records[key] = record
+            self._one_shot_keys[record.one_shot_id] = key
         return record
 
     async def approve(
         self,
+        reference: ApprovalReference | None = None,
         *,
-        session_id: str,
-        call_id: str,
-        command_hash: str,
+        session_id: str | None = None,
+        call_id: str | None = None,
+        command_hash: str | None = None,
         provider: str = "workbench",
     ) -> ApprovalRecord:
         async with self._lock:
-            key = self._record_key(provider, session_id, call_id)
-            record = self._require_matching(
-                session_id, call_id, command_hash, provider=provider
+            reference = self._coerce_reference_locked(
+                reference,
+                session_id=session_id,
+                call_id=call_id,
+                command_hash=command_hash,
+                provider=provider,
             )
+            key, record = self._require_matching(reference)
             record = self._expire_if_needed(record)
             if record.status is ApprovalState.APPROVAL_TIMEOUT:
                 self._records[key] = record
@@ -1090,22 +1364,27 @@ class ApprovalManager:
             )
             self._records[key] = approved
             self._register_grant_locked(approved)
-            self._resolve_waiter_locked(*key, approved)
+            self._resolve_waiter_locked(approved.one_shot_id, approved)
             return approved
 
     async def reject(
         self,
+        reference: ApprovalReference | None = None,
         *,
-        session_id: str,
-        call_id: str,
-        command_hash: str,
+        session_id: str | None = None,
+        call_id: str | None = None,
+        command_hash: str | None = None,
         provider: str = "workbench",
     ) -> ApprovalRecord:
         async with self._lock:
-            key = self._record_key(provider, session_id, call_id)
-            record = self._require_matching(
-                session_id, call_id, command_hash, provider=provider
+            reference = self._coerce_reference_locked(
+                reference,
+                session_id=session_id,
+                call_id=call_id,
+                command_hash=command_hash,
+                provider=provider,
             )
+            key, record = self._require_matching(reference)
             record = self._expire_if_needed(record)
             if record.status is ApprovalState.APPROVAL_TIMEOUT:
                 self._records[key] = record
@@ -1114,33 +1393,40 @@ class ApprovalManager:
                 raise ApprovalIntegrityError("approval_unavailable")
             rejected = replace(record, status=ApprovalState.REJECTED, reason="rejected")
             self._records[key] = rejected
-            self._resolve_waiter_locked(*key, rejected)
+            self._resolve_waiter_locked(rejected.one_shot_id, rejected)
             return rejected
 
     async def cancel(
         self,
+        reference: ApprovalReference | None = None,
         *,
-        session_id: str,
-        call_id: str,
-        command_hash: str,
+        session_id: str | None = None,
+        call_id: str | None = None,
+        command_hash: str | None = None,
         provider: str = "workbench",
     ) -> ApprovalRecord:
         async with self._lock:
-            key = self._record_key(provider, session_id, call_id)
-            record = self._require_matching(
-                session_id, call_id, command_hash, provider=provider
+            reference = self._coerce_reference_locked(
+                reference,
+                session_id=session_id,
+                call_id=call_id,
+                command_hash=command_hash,
+                provider=provider,
             )
+            key, record = self._require_matching(reference)
             record = self._expire_if_needed(record)
             if record.status is ApprovalState.APPROVAL_TIMEOUT:
                 self._records[key] = record
                 raise ApprovalIntegrityError("approval_timeout")
-            if record.status is not ApprovalState.PENDING:
+            if record.status not in {ApprovalState.PENDING, ApprovalState.APPROVED}:
                 raise ApprovalIntegrityError("approval_unavailable")
             cancelled = replace(
                 record, status=ApprovalState.CANCELLED, reason="cancelled"
             )
             self._records[key] = cancelled
-            self._resolve_waiter_locked(*key, cancelled)
+            if record.status is ApprovalState.APPROVED:
+                self._revoke_grant_locked(record)
+            self._resolve_waiter_locked(cancelled.one_shot_id, cancelled)
             return cancelled
 
     async def wait_for_terminal(
@@ -1150,20 +1436,18 @@ class ApprovalManager:
         intent.verify_integrity()
         if timeout_seconds is not None and timeout_seconds < 0:
             raise ValueError("timeout_seconds must be non-negative")
-        key = self._record_key(intent.provider, intent.session_id, intent.call_id)
         async with self._lock:
-            record = self._records.get(key)
-            if record is None:
-                raise ApprovalIntegrityError("approval_unavailable")
+            key, record = self._require_matching_intent(intent)
             record = self._expire_if_needed(record)
             self._records[key] = record
             if record.status is not ApprovalState.PENDING:
                 return record
-            if key in self._waiters:
+            one_shot_id = record.one_shot_id
+            if one_shot_id in self._waiters:
                 raise ApprovalIntegrityError("approval_unavailable")
             loop = asyncio.get_running_loop()
             future: asyncio.Future[ApprovalRecord] = loop.create_future()
-            self._waiters[key] = future
+            self._waiters[one_shot_id] = future
             remaining = max(
                 0.0, (record.expires_at - datetime.now(UTC)).total_seconds()
             )
@@ -1183,23 +1467,17 @@ class ApprovalManager:
                         reason="approval_timeout",
                     )
                     self._records[key] = current
-                self._resolve_waiter_locked(*key, current)
+                self._resolve_waiter_locked(one_shot_id, current)
                 return current
         finally:
             async with self._lock:
-                if self._waiters.get(key) is future:
-                    self._waiters.pop(key, None)
+                if self._waiters.get(one_shot_id) is future:
+                    self._waiters.pop(one_shot_id, None)
 
     async def consume(self, intent: CommandIntent) -> ApprovalRecord:
         intent.verify_integrity()
         async with self._lock:
-            key = self._record_key(intent.provider, intent.session_id, intent.call_id)
-            record = self._require_matching(
-                intent.session_id,
-                intent.call_id,
-                intent.command_hash,
-                provider=intent.provider,
-            )
+            key, record = self._require_matching_intent(intent)
             record = self._expire_if_needed(record)
             if record.status is ApprovalState.APPROVAL_TIMEOUT:
                 self._records[key] = record
@@ -1220,57 +1498,146 @@ class ApprovalManager:
 
     async def get(
         self,
+        reference: ApprovalReference | None = None,
         *,
-        session_id: str,
-        call_id: str,
+        session_id: str | None = None,
+        call_id: str | None = None,
+        command_hash: str | None = None,
         provider: str | None = None,
     ) -> ApprovalRecord:
         async with self._lock:
-            key = self._find_key(session_id, call_id, provider=provider)
-            record = self._records.get(key)
-            if record is None:
-                raise ApprovalIntegrityError("approval_unavailable")
+            reference = self._coerce_reference_locked(
+                reference,
+                session_id=session_id,
+                call_id=call_id,
+                command_hash=command_hash,
+                provider=provider or "workbench",
+                allow_missing_hash=True,
+            )
+            key, record = self._require_matching(reference)
             updated = self._expire_if_needed(record)
             self._records[key] = updated
             return updated
 
     def _require_matching(
         self,
-        session_id: str,
-        call_id: str,
-        command_hash: str,
-        *,
-        provider: str | None = None,
-    ) -> ApprovalRecord:
-        key = self._find_key(session_id, call_id, provider=provider)
+        reference: ApprovalReference,
+    ) -> tuple[
+        tuple[
+            str,
+            str,
+            str | None,
+            str | None,
+            str | None,
+            str | None,
+            str | None,
+        ],
+        ApprovalRecord,
+    ]:
+        reference.verify_integrity()
+        key = self._one_shot_keys.get(reference.one_shot_id)
+        if key is None:
+            raise ApprovalIntegrityError("approval_unavailable")
         record = self._records.get(key)
         if record is None:
             raise ApprovalIntegrityError("approval_unavailable")
-        if not hmac.compare_digest(record.command_hash, command_hash):
+        if record.reference != reference:
             raise ApprovalIntegrityError("approval_integrity_mismatch")
-        return record
+        return key, record
 
-    @staticmethod
-    def _record_key(
-        provider: str, session_id: str, call_id: str
-    ) -> tuple[str, str, str]:
-        return (_provider_text(provider), session_id, call_id)
-
-    def _find_key(
+    def _coerce_reference_locked(
         self,
-        session_id: str,
-        call_id: str,
+        reference: ApprovalReference | None,
         *,
-        provider: str | None,
-    ) -> tuple[str, str, str]:
-        if provider is not None:
-            return self._record_key(provider, session_id, call_id)
+        session_id: str | None,
+        call_id: str | None,
+        command_hash: str | None,
+        provider: str,
+        allow_missing_hash: bool = False,
+    ) -> ApprovalReference:
+        """Resolve legacy identity arguments without weakening the binding.
+
+        Older adapters and the HTTP/UI contract identify a request by
+        provider/session/call/hash.  Resolve that tuple to the stored complete
+        reference, requiring exactly one candidate and an exact hash match.
+        New callers should pass ``ApprovalReference`` directly.
+        """
+        if reference is not None:
+            if any(value is not None for value in (session_id, call_id, command_hash)):
+                raise ApprovalIntegrityError("approval_integrity_mismatch")
+            return reference
+        if session_id is None or call_id is None:
+            raise ApprovalIntegrityError("approval_unavailable")
+        normalized_provider = _provider_text(provider)
+        normalized_session = _required_text(session_id, "session_id")
+        normalized_call = _required_text(call_id, "call_id")
         matches = [
-            key for key in self._records if key[1] == session_id and key[2] == call_id
+            record
+            for key, record in self._records.items()
+            if key[0] == normalized_provider
+            and key[1] == normalized_session
+            and key[-1] == normalized_call
         ]
         if len(matches) != 1:
             raise ApprovalIntegrityError("approval_unavailable")
-        return matches[0]
+        record = matches[0]
+        if command_hash is None and not allow_missing_hash:
+            raise ApprovalIntegrityError("approval_integrity_mismatch")
+        if command_hash is not None and not hmac.compare_digest(
+            record.command_hash, command_hash.lower()
+        ):
+            raise ApprovalIntegrityError("approval_integrity_mismatch")
+        return record.reference
+
+    def _require_matching_intent(
+        self, intent: CommandIntent
+    ) -> tuple[
+        tuple[
+            str,
+            str,
+            str | None,
+            str | None,
+            str | None,
+            str | None,
+            str | None,
+        ],
+        ApprovalRecord,
+    ]:
+        if intent.one_shot_id is None:
+            key = self._record_key(intent)
+            record = self._records.get(key)
+            if record is None:
+                raise ApprovalIntegrityError("approval_unavailable")
+            expected_hash = _command_hash_for_intent(record.intent, one_shot_id=None)
+            if not hmac.compare_digest(expected_hash, intent.command_hash):
+                raise ApprovalIntegrityError("approval_integrity_mismatch")
+            return key, record
+        key, record = self._require_matching(intent.reference)
+        if record.intent != intent:
+            raise ApprovalIntegrityError("approval_integrity_mismatch")
+        return key, record
+
+    @staticmethod
+    def _record_key(
+        intent: CommandIntent,
+    ) -> tuple[
+        str,
+        str,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+    ]:
+        return (
+            _provider_text(intent.provider),
+            intent.session_id,
+            intent.thread_id,
+            intent.turn_id,
+            intent.item_id,
+            intent.approval_id,
+            intent.call_id,
+        )
 
     def _register_grant_locked(self, record: ApprovalRecord) -> None:
         if (
@@ -1280,10 +1647,17 @@ class ApprovalManager:
             or record.workspace_target is None
         ):
             return
-        key = (record.provider, record.session_id, record.turn_id)
+        key = (
+            record.provider,
+            record.session_id,
+            record.thread_id,
+            record.turn_id,
+        )
         grant = _CapabilityGrant(
+            one_shot_id=record.one_shot_id,
             provider=record.provider,
             session_id=record.session_id,
+            thread_id=record.thread_id,
             turn_id=record.turn_id,
             workspace_target=record.workspace_target,
             permission_scope=record.permission_scope,
@@ -1297,6 +1671,26 @@ class ApprovalManager:
         ):
             grants.append(grant)
 
+    def _revoke_grant_locked(self, record: ApprovalRecord) -> None:
+        if record.turn_id is None:
+            return
+        key = (
+            record.provider,
+            record.session_id,
+            record.thread_id,
+            record.turn_id,
+        )
+        grants = self._capability_grants.get(key)
+        if not grants:
+            return
+        remaining = [
+            grant for grant in grants if grant.one_shot_id != record.one_shot_id
+        ]
+        if remaining:
+            self._capability_grants[key] = remaining
+        else:
+            self._capability_grants.pop(key, None)
+
     def _reusable_grant_locked(self, intent: CommandIntent) -> bool:
         if (
             intent.turn_id is None
@@ -1305,7 +1699,7 @@ class ApprovalManager:
         ):
             return False
         grants = self._capability_grants.get(
-            (intent.provider, intent.session_id, intent.turn_id)
+            (intent.provider, intent.session_id, intent.thread_id, intent.turn_id)
         )
         return any(
             _scope_allows(
@@ -1317,20 +1711,30 @@ class ApprovalManager:
             for grant in grants or ()
         )
 
-    async def clear_turn(self, *, provider: str, session_id: str, turn_id: str) -> None:
+    async def clear_turn(
+        self,
+        *,
+        provider: str,
+        session_id: str,
+        thread_id: str | None = None,
+        turn_id: str,
+    ) -> None:
         """Discard capability grants when a provider turn is complete."""
-        key = self._record_key(provider, session_id, turn_id)
+        key = (
+            _provider_text(provider),
+            _required_text(session_id, "session_id"),
+            _optional_text(thread_id, "thread_id"),
+            _required_text(turn_id, "turn_id"),
+        )
         async with self._lock:
             self._capability_grants.pop(key, None)
 
     def _resolve_waiter_locked(
         self,
-        provider: str,
-        session_id: str,
-        call_id: str,
+        one_shot_id: str,
         record: ApprovalRecord,
     ) -> None:
-        future = self._waiters.get((provider, session_id, call_id))
+        future = self._waiters.get(one_shot_id)
         if future is not None and not future.done():
             future.set_result(record)
 
@@ -1389,6 +1793,7 @@ def _native_workspace_write_is_level_a(
     provider: str,
     argv: tuple[str, ...],
     permission_scope: str | None,
+    cwd: Path,
     workspace_target: Path,
     risk: CommandRisk,
 ) -> bool:
@@ -1399,7 +1804,32 @@ def _native_workspace_write_is_level_a(
     if not argv or argv[0] not in {"codex-file-change", "claude-file-change"}:
         return False
     path = Path(permission_scope.split(":", 2)[2])
-    return _path_within(path, workspace_target)
+    return _path_within(cwd, workspace_target) and _path_within(path, workspace_target)
+
+
+def _permission_scope_requires_approval(
+    scope: str | None,
+    argv: tuple[str, ...],
+    workspace_target: Path,
+) -> bool:
+    if not scope:
+        return False
+    if scope.startswith("codex:"):
+        return True
+    if scope.startswith("network:"):
+        host = scope.removeprefix("network:").strip().lower().rstrip(".")
+        if host in {"localhost", "127.0.0.1", "::1", "[::1]"}:
+            return not _is_loopback_health_check(
+                tuple(value.lower() for value in argv[1:]),
+                executable=_executable_name(argv[0]) if argv else None,
+            )
+        return True
+    if scope.startswith("filesystem:"):
+        parts = scope.split(":", 2)
+        if len(parts) != 3 or parts[1] not in {"read", "write"}:
+            return True
+        return parts[1] != "read" or not _path_within(Path(parts[2]), workspace_target)
+    return True
 
 
 def _path_within(candidate: Path, root: Path) -> bool:

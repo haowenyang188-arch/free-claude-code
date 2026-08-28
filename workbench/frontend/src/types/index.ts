@@ -106,6 +106,10 @@ export interface ApprovalIdentity {
   provider: string
   session_id: string
   call_id: string
+  one_shot_id: string
+  thread_id: string | null
+  item_id: string | null
+  approval_id: string | null
   turn_id: string | null
   normalized_command: string
   argv: string[]

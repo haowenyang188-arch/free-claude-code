@@ -100,7 +100,12 @@ class JobRuntime:
             raise JobRuntimeError("process_failed") from exc
         record = JobRecord(
             job_id=job_id,
-            call_id=approval.call_id,
+            call_id=(
+                approval.call_id
+                or approval.approval_id
+                or approval.item_id
+                or approval.one_shot_id
+            ),
             command_hash=approval.command_hash,
             pid=process.pid,
             status=JobState.JOB_RUNNING,

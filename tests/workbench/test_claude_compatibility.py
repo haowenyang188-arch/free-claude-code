@@ -442,6 +442,155 @@ async def test_claude_adapter_uses_compatibility_session_when_enabled(
     assert adapter.session_id == "claude-session-1"
 
 
+@pytest.mark.asyncio
+async def test_claude_adapter_recreates_compatibility_session_for_new_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from workbench.backend.agents import claude_adapter as claude_module
+    from workbench.backend.agents.claude_adapter import ClaudeCodeAdapter
+    from workbench.backend.runtime.approval import ApprovalManager
+
+    first_workspace = tmp_path / "first"
+    second_workspace = tmp_path / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    sessions: list[Any] = []
+
+    class _SessionStub:
+        is_busy = False
+        process = None
+
+        def __init__(self, **kwargs: Any) -> None:
+            self.workspace = Path(kwargs["workspace_path"]).resolve()
+            sessions.append(self)
+
+        async def start_task(self, *_args: Any, **_kwargs: Any):
+            yield {"type": "session_info", "session_id": "claude-session"}
+            yield {"type": "exit", "code": 0, "stderr": None}
+
+        async def stop(self) -> bool:
+            return True
+
+    monkeypatch.setattr(claude_module, "ClaudeCompatibilitySession", _SessionStub)
+    adapter = ClaudeCodeAdapter(
+        "claude-1",
+        use_compatibility_bridge=True,
+        approval_manager=ApprovalManager(),
+    )
+
+    assert await adapter.start_task("run-1", "first", str(first_workspace))
+    assert adapter.monitor_task is not None
+    await adapter.monitor_task
+    first_session = adapter.compatibility_session
+
+    assert await adapter.start_task("run-2", "second", str(second_workspace))
+    assert adapter.monitor_task is not None
+    await adapter.monitor_task
+
+    assert len(sessions) == 2
+    assert first_session is not sessions[1]
+    assert sessions[1].workspace == second_workspace.resolve()
+
+
+@pytest.mark.asyncio
+async def test_claude_compatibility_cancel_request_cancels_pending_approval(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.agents.claude_compatibility import ClaudeCompatibilitySession
+    from workbench.backend.runtime.approval import ApprovalManager, ApprovalState
+
+    process = _FakeProcess(
+        [
+            _init_message(),
+            {
+                "type": "control_request",
+                "request_id": "request-cancel",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "Bash",
+                    "input": {"command": "python task.py"},
+                    "tool_use_id": "tool-cancel",
+                },
+            },
+            {"type": "control_cancel_request", "request_id": "request-cancel"},
+            _result_message(),
+        ]
+    )
+    approvals = ApprovalManager()
+    pending_event = asyncio.Event()
+    pending: list[Any] = []
+
+    async def on_pending(record: Any) -> None:
+        pending.append(record)
+        pending_event.set()
+
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
+        spawn.return_value = process
+        session = ClaudeCompatibilitySession(
+            tmp_path,
+            approval_manager=approvals,
+            on_approval_pending=on_pending,
+            approval_timeout_seconds=5,
+        )
+        task = asyncio.create_task(_collect_events(session, "cancel"))
+        await asyncio.wait_for(pending_event.wait(), timeout=1)
+        events = await asyncio.wait_for(task, timeout=1)
+
+    record = await approvals.get(
+        provider="claude_cli",
+        session_id=pending[0].session_id,
+        call_id=pending[0].call_id,
+    )
+    assert record.status is ApprovalState.CANCELLED
+    assert events[-1]["type"] == "exit"
+    responses = [
+        item for item in process.stdin.writes if item.get("type") == "control_response"
+    ]
+    assert responses[0]["response"]["subtype"] == "error"
+    assert responses[0]["response"]["error"] == "approval_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_claude_compatibility_allow_response_preserves_updated_input(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.agents.claude_compatibility import ClaudeCompatibilitySession
+    from workbench.backend.runtime.approval import ApprovalManager
+
+    tool_input = {"command": "git status", "description": "inspect"}
+    process = _FakeProcess(
+        [
+            _init_message(),
+            {
+                "type": "control_request",
+                "request_id": "request-input",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "Bash",
+                    "input": tool_input,
+                    "tool_use_id": "tool-input",
+                },
+            },
+            _result_message(),
+        ]
+    )
+
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
+        spawn.return_value = process
+        session = ClaudeCompatibilitySession(
+            tmp_path,
+            approval_manager=ApprovalManager(),
+        )
+        await _collect_events(session, "allow")
+
+    response = next(
+        item for item in process.stdin.writes if item.get("type") == "control_response"
+    )
+    inner = response["response"]["response"]
+    assert inner["behavior"] == "allow"
+    assert inner["updatedInput"] == tool_input
+
+
 def test_claude_compatibility_command_uses_auto_mode_and_stdio_prompt(
     tmp_path: Path,
 ) -> None:

@@ -247,6 +247,59 @@ async def test_same_turn_capability_does_not_cross_provider_or_expand_scope(
     assert (await approvals.request(other_provider)).status is ApprovalState.PENDING
 
 
+@pytest.mark.asyncio
+async def test_cancelling_approved_unconsumed_grant_revokes_same_turn_reuse(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.runtime.approval import (
+        ApprovalIntegrityError,
+        ApprovalManager,
+        ApprovalState,
+        CommandIntent,
+    )
+
+    approvals = ApprovalManager()
+    intent = CommandIntent.create(
+        provider="claude_cli",
+        session_id="cancel-approved-session",
+        thread_id="cancel-approved-thread",
+        turn_id="cancel-approved-turn",
+        call_id="cancel-approved-call",
+        command="python task.py",
+        cwd=tmp_path,
+        requested_permission="filesystem",
+        workspace_target=tmp_path,
+        permission_scope=f"filesystem:write:{tmp_path}",
+    )
+    await approvals.request(intent)
+    approved = await approvals.approve(
+        provider="claude_cli",
+        session_id=intent.session_id,
+        call_id=intent.call_id,
+        command_hash=intent.command_hash,
+    )
+
+    cancelled = await approvals.cancel(approved.reference)
+
+    assert cancelled.status is ApprovalState.CANCELLED
+    with pytest.raises(ApprovalIntegrityError, match="cancelled"):
+        await approvals.consume(intent)
+
+    same_turn = CommandIntent.create(
+        provider="claude_cli",
+        session_id=intent.session_id,
+        thread_id=intent.thread_id,
+        turn_id=intent.turn_id,
+        call_id="cancel-approved-call-2",
+        command="python task.py --again",
+        cwd=tmp_path,
+        requested_permission="filesystem",
+        workspace_target=tmp_path,
+        permission_scope=f"filesystem:write:{tmp_path}",
+    )
+    assert (await approvals.request(same_turn)).status is ApprovalState.PENDING
+
+
 @pytest.mark.parametrize("provider", ["codex_cli", "claude_cli"])
 def test_native_workspace_write_scope_is_level_a(tmp_path: Path, provider: str) -> None:
     from workbench.backend.runtime.approval import CommandIntent, CommandRisk
@@ -266,6 +319,57 @@ def test_native_workspace_write_scope_is_level_a(tmp_path: Path, provider: str) 
     )
 
     assert intent.risk is CommandRisk.LEVEL_A
+
+
+@pytest.mark.parametrize("provider", ["codex_cli", "claude_cli"])
+def test_native_file_change_outside_current_workspace_stays_level_b(
+    tmp_path: Path, provider: str
+) -> None:
+    from workbench.backend.runtime.approval import CommandIntent, CommandRisk
+
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    path = outside / "generated.txt"
+    intent = CommandIntent.create(
+        provider=provider,
+        session_id="external-workspace-session",
+        turn_id="turn-1",
+        call_id=f"external-{provider}",
+        argv=(provider.replace("_cli", "") + "-file-change", "edit", str(path)),
+        cwd=workspace,
+        workspace_target=outside,
+        requested_permission="filesystem",
+        permission_scope=f"filesystem:write:{path}",
+        patch_identity='{"path":"generated.txt","content":"ok"}',
+    )
+
+    assert intent.risk is CommandRisk.LEVEL_B
+
+
+def test_safe_command_with_external_workspace_target_requires_approval(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.runtime.approval import CommandIntent, CommandRisk
+
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    intent = CommandIntent.create(
+        provider="claude_cli",
+        session_id="external-target-session",
+        turn_id="turn-1",
+        call_id="external-target-call",
+        command="git status",
+        cwd=workspace,
+        workspace_target=outside,
+        requested_permission="filesystem",
+        permission_scope=f"filesystem:read:{outside}",
+    )
+
+    assert intent.risk is CommandRisk.LEVEL_B
 
 
 @pytest.mark.asyncio
@@ -489,6 +593,7 @@ async def test_native_approval_waiter_expires_without_starting_a_process(
         ("npm run lint", "level_a"),
         ("npm run build", "level_a"),
         ("npm run dev", "level_a"),
+        ("touch /etc/workbench-probe", "level_c"),
         ("rm -rf /", "level_c"),
     ],
 )
@@ -531,6 +636,71 @@ def test_command_intent_rejects_shell_composition(command: str, tmp_path: Path) 
             cwd=tmp_path,
             requested_permission="process_spawn",
         )
+
+
+@pytest.mark.asyncio
+async def test_workbench_api_allows_once_for_scoped_external_filesystem_target(
+    tmp_path: Path,
+) -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    from workbench.backend import main as main_module
+    from workbench.backend.main import WorkbenchService
+    from workbench.backend.runtime.auth import WorkbenchAuth
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "generated.txt"
+    service = WorkbenchService(
+        workspace_root=root,
+        event_log_path=tmp_path / "events.jsonl",
+        state_path=tmp_path / "state.json",
+    )
+    previous_service = main_module.service
+    previous_auth = main_module.auth
+    main_module.service = service
+    main_module.auth = WorkbenchAuth("test-token")
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=main_module.app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/approvals",
+                headers={"Authorization": "Bearer test-token"},
+                json={
+                    "provider": "claude_cli",
+                    "session_id": "external-session",
+                    "call_id": "external-call",
+                    "argv": ["touch", str(target)],
+                    "cwd": str(root),
+                    "workspace_target": str(outside),
+                    "requested_permission": "filesystem",
+                    "permission_scope": f"filesystem:write:{target}",
+                },
+            )
+            record = response.json()
+            approved = await client.post(
+                "/api/approvals/external-session/external-call/approve",
+                headers={"Authorization": "Bearer test-token"},
+                json={
+                    "provider": "claude_cli",
+                    "command_hash": record["command_hash"],
+                },
+            )
+    finally:
+        await service.cleanup()
+        main_module.service = previous_service
+        main_module.auth = previous_auth
+
+    assert response.status_code == 200
+    assert record["risk"] == "level_b"
+    assert record["status"] == "pending"
+    assert record["workspace_target"] == str(outside)
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "approved"
+    assert not target.exists()
 
 
 @pytest.mark.asyncio
@@ -848,6 +1018,84 @@ async def test_workbench_approval_api_enforces_one_shot_and_integrity(
     assert executed.json()["status"] == "job_completed"
     assert second_execute.status_code == 409
     assert second_execute.json()["error"]["code"] == "approval_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_workbench_approval_api_uses_complete_one_shot_reference(
+    tmp_path: Path,
+) -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    from workbench.backend import main as main_module
+    from workbench.backend.main import WorkbenchService
+    from workbench.backend.runtime.auth import WorkbenchAuth
+
+    service = WorkbenchService(
+        workspace_root=tmp_path,
+        event_log_path=tmp_path / "events.jsonl",
+        state_path=tmp_path / "state.json",
+    )
+    previous_service = main_module.service
+    previous_auth = main_module.auth
+    main_module.service = service
+    main_module.auth = WorkbenchAuth("test-token")
+    headers = {"Authorization": "Bearer test-token"}
+    request_body = {
+        "provider": "claude_cli",
+        "session_id": "reference-session",
+        "thread_id": "reference-thread",
+        "turn_id": "reference-turn",
+        "item_id": "reference-item",
+        "approval_id": "reference-approval",
+        "call_id": "reference-call",
+        "argv": ["python", "task.py"],
+        "cwd": str(tmp_path),
+        "requested_permission": "project_write",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=main_module.app), base_url="http://test"
+        ) as client:
+            requested = await client.post(
+                "/api/approvals", json=request_body, headers=headers
+            )
+            approval = requested.json()
+            tampered = await client.post(
+                "/api/approvals/reference-session/reference-call/approve",
+                json={
+                    "provider": "claude_cli",
+                    "command_hash": approval["command_hash"],
+                    "one_shot_id": approval["one_shot_id"],
+                    "thread_id": "different-thread",
+                    "turn_id": request_body["turn_id"],
+                    "item_id": request_body["item_id"],
+                    "approval_id": request_body["approval_id"],
+                },
+                headers=headers,
+            )
+            approved = await client.post(
+                "/api/approvals/reference-session/reference-call/approve",
+                json={
+                    "provider": "claude_cli",
+                    "command_hash": approval["command_hash"],
+                    "one_shot_id": approval["one_shot_id"],
+                    "thread_id": request_body["thread_id"],
+                    "turn_id": request_body["turn_id"],
+                    "item_id": request_body["item_id"],
+                    "approval_id": request_body["approval_id"],
+                },
+                headers=headers,
+            )
+    finally:
+        await service.cleanup()
+        main_module.service = previous_service
+        main_module.auth = previous_auth
+
+    assert requested.status_code == 200
+    assert tampered.status_code == 409
+    assert tampered.json()["error"]["code"] == "approval_integrity_mismatch"
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "approved"
 
 
 @pytest.mark.asyncio

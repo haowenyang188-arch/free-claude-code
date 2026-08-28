@@ -363,6 +363,76 @@ def test_native_compound_command_is_declined_without_partial_approval(
     assert intent is None
 
 
+def test_native_permission_context_cannot_downgrade_safe_command(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.agents.codex_app_server import CodexAppServerSession
+    from workbench.backend.runtime.approval import CommandRisk
+
+    session = CodexAppServerSession(tmp_path)
+    intent = session._intent_from_approval(
+        "item/commandExecution/requestApproval",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-network-1",
+            "command": "git status",
+            "cwd": str(tmp_path),
+            "networkApprovalContext": {"host": "api.example.com"},
+        },
+    )
+
+    assert intent is not None
+    assert intent.risk is CommandRisk.LEVEL_B
+
+
+def test_native_loopback_health_check_stays_level_a_with_network_context(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.agents.codex_app_server import CodexAppServerSession
+    from workbench.backend.runtime.approval import CommandRisk
+
+    session = CodexAppServerSession(tmp_path)
+    intent = session._intent_from_approval(
+        "item/commandExecution/requestApproval",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-health-1",
+            "command": "curl -sf http://127.0.0.1:8000/health",
+            "cwd": str(tmp_path),
+            "networkApprovalContext": {"host": "127.0.0.1"},
+        },
+    )
+
+    assert intent is not None
+    assert intent.risk is CommandRisk.LEVEL_A
+
+
+def test_native_approval_keeps_call_and_approval_ids_independent(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.agents.codex_app_server import CodexAppServerSession
+
+    session = CodexAppServerSession(tmp_path)
+    intent = session._intent_from_approval(
+        "item/commandExecution/requestApproval",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "callId": "call-1",
+            "approvalId": "approval-1",
+            "command": "python task.py",
+            "cwd": str(tmp_path),
+        },
+    )
+
+    assert intent is not None
+    assert intent.call_id == "call-1"
+    assert intent.approval_id == "approval-1"
+
+
 def test_native_file_change_without_patch_identity_is_declined(
     tmp_path: Path,
 ) -> None:

@@ -42,6 +42,7 @@ class ClaudeCompatibilitySession:
     """Run one Claude CLI print turn with Workbench permission mediation."""
 
     shell = False
+    _CONTROL_DRAIN_TIMEOUT_SECONDS = 1.0
 
     def __init__(
         self,
@@ -72,6 +73,9 @@ class ClaudeCompatibilitySession:
         self._is_busy = False
         self._lock = asyncio.Lock()
         self._terminal_seen = False
+        self._control_tasks: dict[str, asyncio.Task[None]] = {}
+        self._pending_control_intents: dict[str, CommandIntent] = {}
+        self._cancelled_control_requests: set[str] = set()
 
     @property
     def is_busy(self) -> bool:
@@ -148,6 +152,11 @@ class ClaudeCompatibilitySession:
                     yield event
                     if event.get("type") == "exit":
                         self._terminal_seen = True
+                        # A result can be emitted in the same read cycle as a
+                        # permission request. Give that request a chance to
+                        # finish (or cancel it) before closing the transport;
+                        # otherwise the response task loses its stdin pipe.
+                        await self._finish_control_tasks()
                         if process.stdin is not None:
                             process.stdin.close()
                         try:
@@ -162,6 +171,7 @@ class ClaudeCompatibilitySession:
                             await self.approval_manager.clear_turn(
                                 provider="claude_cli",
                                 session_id=self.current_session_id,
+                                thread_id=self.current_session_id,
                                 turn_id=self.current_turn_id,
                             )
                         break
@@ -179,6 +189,9 @@ class ClaudeCompatibilitySession:
         await self._send(
             {
                 "type": "user",
+                "session_id": self.current_session_id or "",
+                "parent_tool_use_id": None,
+                "uuid": str(uuid.uuid4()),
                 "message": {
                     "role": "user",
                     "content": [{"type": "text", "text": prompt}],
@@ -203,12 +216,24 @@ class ClaudeCompatibilitySession:
             if not isinstance(message, Mapping):
                 raise ClaudeCompatibilityError("Claude emitted a non-object message")
             if message.get("type") == "control_request":
-                await self._handle_control_request(message)
+                request_id = _text(message.get("request_id"))
+                if request_id is not None:
+                    task = asyncio.create_task(
+                        self._handle_control_request(message),
+                        name=f"claude-control-{request_id}",
+                    )
+                    self._control_tasks[request_id] = task
+                else:
+                    await self._handle_control_request(message)
+                continue
+            if message.get("type") == "control_cancel_request":
+                await self._handle_control_cancel(message)
                 continue
             event = self._event_from_message(message)
             if event is not None:
                 yield event
                 if event.get("type") == "exit":
+                    await self._drain_control_tasks()
                     return
 
     async def _handle_control_request(self, message: Mapping[str, Any]) -> None:
@@ -216,49 +241,134 @@ class ClaudeCompatibilitySession:
         request = message.get("request")
         if request_id is None or not isinstance(request, Mapping):
             return
-        if request.get("subtype") != "can_use_tool":
-            await self._send_control_response(
-                request_id,
-                {"behavior": "deny", "message": "unsupported_permission_request"},
-            )
-            return
         try:
-            intent = self._intent_from_request(request, request_id)
-        except CommandSyntaxError, ValueError:
-            intent = None
-        if intent is None or self.approval_manager is None:
-            await self._send_control_response(
-                request_id,
-                {"behavior": "deny", "message": "approval_unavailable"},
-            )
-            return
-        record = await self.approval_manager.request(
-            intent, approval_timeout_seconds=self.approval_timeout_seconds
-        )
-        observed = record
-        if record.status is ApprovalState.PENDING:
-            if self.on_approval_pending is not None:
-                await self.on_approval_pending(record)
-            observed = await self.approval_manager.wait_for_terminal(intent)
-        if observed.status is ApprovalState.APPROVED:
+            if request.get("subtype") != "can_use_tool":
+                await self._send_control_response(
+                    request_id,
+                    {
+                        "behavior": "deny",
+                        "message": "unsupported_permission_request",
+                    },
+                )
+                return
             try:
-                await self.approval_manager.consume(intent)
-            except Exception:
+                intent = self._intent_from_request(request, request_id)
+            except CommandSyntaxError, ValueError:
+                intent = None
+            if intent is None or self.approval_manager is None:
                 await self._send_control_response(
                     request_id,
                     {"behavior": "deny", "message": "approval_unavailable"},
                 )
                 return
+            record = await self.approval_manager.request(
+                intent, approval_timeout_seconds=self.approval_timeout_seconds
+            )
+            self._pending_control_intents[request_id] = intent
+            if request_id in self._cancelled_control_requests:
+                self._cancelled_control_requests.discard(request_id)
+                observed = await self._cancel_intent(intent)
+            else:
+                observed = record
+                if record.status is ApprovalState.PENDING:
+                    if self.on_approval_pending is not None:
+                        await self.on_approval_pending(record)
+                    observed = await self.approval_manager.wait_for_terminal(intent)
+            if observed.status is ApprovalState.APPROVED:
+                try:
+                    await self.approval_manager.consume(intent)
+                except Exception:
+                    await self._send_control_response(
+                        request_id,
+                        {"behavior": "deny", "message": "approval_unavailable"},
+                    )
+                    return
+                tool_input = request.get("input")
+                updated_input = (
+                    dict(tool_input) if isinstance(tool_input, Mapping) else {}
+                )
+                await self._send_control_response(
+                    request_id,
+                    {
+                        "behavior": "allow",
+                        "updatedInput": updated_input,
+                        "toolUseID": intent.call_id,
+                    },
+                )
+                return
+            if observed.status is ApprovalState.CANCELLED:
+                await self._send_control_error(request_id, "approval_cancelled")
+                return
+            reason = observed.reason or observed.status.value
             await self._send_control_response(
                 request_id,
-                {"behavior": "allow", "toolUseID": intent.call_id},
+                {"behavior": "deny", "message": reason, "toolUseID": intent.call_id},
+            )
+        finally:
+            self._pending_control_intents.pop(request_id, None)
+            self._cancelled_control_requests.discard(request_id)
+            task = self._control_tasks.get(request_id)
+            if task is asyncio.current_task():
+                self._control_tasks.pop(request_id, None)
+
+    async def _handle_control_cancel(self, message: Mapping[str, Any]) -> None:
+        request_id = _text(message.get("request_id"))
+        if request_id is None:
+            return
+        self._cancelled_control_requests.add(request_id)
+        intent = self._pending_control_intents.get(request_id)
+        if intent is not None:
+            await self._cancel_intent(intent)
+        task = self._control_tasks.get(request_id)
+        if task is not None and task is not asyncio.current_task():
+            with contextlib.suppress(Exception):
+                await task
+
+    async def _cancel_intent(self, intent: CommandIntent) -> ApprovalRecord:
+        if self.approval_manager is None:
+            raise ClaudeCompatibilityError("approval manager is unavailable")
+        try:
+            return await self.approval_manager.cancel(
+                provider=intent.provider,
+                session_id=intent.session_id,
+                call_id=intent.call_id,
+                command_hash=intent.command_hash,
+            )
+        except Exception:
+            return await self.approval_manager.get(
+                provider=intent.provider,
+                session_id=intent.session_id,
+                call_id=intent.call_id,
+            )
+
+    async def _drain_control_tasks(self) -> None:
+        tasks = tuple(self._control_tasks.values())
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _finish_control_tasks(self) -> None:
+        """Complete or cancel outstanding approvals before process teardown."""
+        if not self._control_tasks:
+            return
+        # A well-behaved provider waits for the permission response. Give a
+        # response already being approved a short chance to finish before
+        # treating an early provider result as cancellation.
+        drain_task = asyncio.create_task(self._drain_control_tasks())
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(drain_task),
+                timeout=self._CONTROL_DRAIN_TIMEOUT_SECONDS,
             )
             return
-        reason = observed.reason or observed.status.value
-        await self._send_control_response(
-            request_id,
-            {"behavior": "deny", "message": reason, "toolUseID": intent.call_id},
-        )
+        except TimeoutError:
+            pass
+        # The provider exited first. Cancel only the still-pending grants, then
+        # drain their response tasks while the transport remains open.
+        for intent in tuple(self._pending_control_intents.values()):
+            with contextlib.suppress(Exception):
+                await self._cancel_intent(intent)
+        with contextlib.suppress(Exception):
+            await drain_task
 
     async def _send_control_response(
         self, request_id: str, response: Mapping[str, Any]
@@ -270,6 +380,18 @@ class ClaudeCompatibilitySession:
                     "subtype": "success",
                     "request_id": request_id,
                     "response": dict(response),
+                },
+            }
+        )
+
+    async def _send_control_error(self, request_id: str, error: str) -> None:
+        await self._send(
+            {
+                "type": "control_response",
+                "response": {
+                    "subtype": "error",
+                    "request_id": request_id,
+                    "error": error,
                 },
             }
         )
@@ -302,7 +424,9 @@ class ClaudeCompatibilitySession:
             return CommandIntent.create(
                 provider="claude_cli",
                 session_id=session_id,
+                thread_id=session_id,
                 turn_id=self.current_turn_id,
+                item_id=call_id,
                 call_id=call_id,
                 command=command,
                 cwd=cwd,
@@ -323,7 +447,9 @@ class ClaudeCompatibilitySession:
             return CommandIntent.create(
                 provider="claude_cli",
                 session_id=session_id,
+                thread_id=session_id,
                 turn_id=self.current_turn_id,
+                item_id=call_id,
                 call_id=call_id,
                 argv=argv,
                 cwd=cwd,
@@ -340,7 +466,9 @@ class ClaudeCompatibilitySession:
             return CommandIntent.create(
                 provider="claude_cli",
                 session_id=session_id,
+                thread_id=session_id,
                 turn_id=self.current_turn_id,
+                item_id=call_id,
                 call_id=call_id,
                 argv=("claude-file-change", lowered, str(resolved)),
                 cwd=cwd,
@@ -357,7 +485,9 @@ class ClaudeCompatibilitySession:
             return CommandIntent.create(
                 provider="claude_cli",
                 session_id=session_id,
+                thread_id=session_id,
                 turn_id=self.current_turn_id,
+                item_id=call_id,
                 call_id=call_id,
                 argv=("claude-network", host.lower()),
                 cwd=cwd,
@@ -369,7 +499,9 @@ class ClaudeCompatibilitySession:
         return CommandIntent.create(
             provider="claude_cli",
             session_id=session_id,
+            thread_id=session_id,
             turn_id=self.current_turn_id,
+            item_id=call_id,
             call_id=call_id,
             argv=("claude-tool", lowered),
             cwd=cwd,

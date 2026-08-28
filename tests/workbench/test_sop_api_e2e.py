@@ -12,11 +12,75 @@ from httpx import ASGITransport, AsyncClient
 from workbench.backend.domain.models import (
     AcceptanceCriteria,
     ExecutionMode,
+    Goal,
     SopDefinition,
     StageDefinition,
     StepDefinition,
 )
-from workbench.backend.main import app, service
+from workbench.backend.main import app
+from workbench.backend.runtime.workspace import WorkspacePolicy
+from workbench.backend.agents.fake_runner import FakeSubagentRunner
+from workbench.backend.validation.always_accept import AlwaysAcceptValidator
+from workbench.backend.artifacts.store import FileArtifactStore
+from workbench.backend.persistence.store import JsonWorkflowStore
+from workbench.backend.workflow.engine import WorkflowEngine
+from workbench.backend.workflow.orchestrator import AutoOrchestrator
+from workbench.backend.workflow.context_builder import ContextPackageBuilder
+
+
+@pytest.fixture
+def isolated_sop_components(tmp_path):
+    """Create isolated SOP workflow components for each test.
+
+    This fixture replaces the global service's SOP components with
+    isolated instances to prevent test interference.
+    """
+    from workbench.backend.main import service
+
+    # Save original components
+    original_store = service.workflow_store
+    original_artifact_store = service.artifact_store
+    original_engine = service.workflow_engine
+    original_context_builder = service.context_builder
+    original_orchestrator = service.orchestrator
+    original_definitions = service.sop_definitions
+
+    # Create isolated workspace
+    sop_workspace = tmp_path / "sop"
+    sop_workspace.mkdir(parents=True, exist_ok=True)
+
+    # Replace with isolated components
+    service.workflow_store = JsonWorkflowStore(
+        state_path=sop_workspace / "workflow_state.json",
+        event_path=sop_workspace / "workflow_events.jsonl",
+    )
+    service.artifact_store = FileArtifactStore(root=sop_workspace / "artifacts")
+
+    runner = FakeSubagentRunner()
+    validator = AlwaysAcceptValidator()
+
+    service.workflow_engine = WorkflowEngine(
+        store=service.workflow_store,
+        runner=runner,
+        validator=validator,
+        artifact_store=service.artifact_store,
+    )
+    service.context_builder = ContextPackageBuilder(
+        store=service.workflow_store,
+        artifact_store=service.artifact_store,
+    )
+    service.orchestrator = AutoOrchestrator(service.workflow_engine)
+    service.sop_definitions = {}
+
+    yield service
+
+    # Restore original components
+    service.workflow_store = original_store
+    service.artifact_store = original_artifact_store
+    service.workflow_engine = original_engine
+    service.context_builder = original_context_builder
+    service.orchestrator = original_orchestrator
+    service.sop_definitions = original_definitions
 
 
 @pytest.fixture
@@ -77,10 +141,10 @@ def sop_definition():
 
 
 @pytest.mark.asyncio
-async def test_sop_api_start_and_query(sop_definition: SopDefinition):
+async def test_sop_api_start_and_query(sop_definition: SopDefinition, isolated_sop_components):
     """Test starting a SOP run via API and querying its state."""
     # Register SOP definition
-    service.sop_definitions[sop_definition.id] = sop_definition
+    isolated_sop_components.sop_definitions[sop_definition.id] = sop_definition
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -149,10 +213,10 @@ async def test_sop_api_start_and_query(sop_definition: SopDefinition):
 
 
 @pytest.mark.asyncio
-async def test_sop_api_full_execution(sop_definition: SopDefinition):
+async def test_sop_api_full_execution(sop_definition: SopDefinition, isolated_sop_components):
     """Test full SOP execution via Orchestrator and verify API queries."""
     # Register SOP definition
-    service.sop_definitions[sop_definition.id] = sop_definition
+    isolated_sop_components.sop_definitions[sop_definition.id] = sop_definition
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -172,8 +236,8 @@ async def test_sop_api_full_execution(sop_definition: SopDefinition):
         from workbench.backend.domain.models import Goal, GoalStatus, SubagentAssignment
 
         # Get the actual goal and sop_run from store
-        sop_run_data = service.workflow_store.get_entity("sop_runs", sop_run_id)
-        goal = service.workflow_store.get_entity("goals", sop_run_data["goal_id"])
+        sop_run_data = isolated_sop_components.workflow_store.get_entity("sop_runs", sop_run_id)
+        goal = isolated_sop_components.workflow_store.get_entity("goals", sop_run_data["goal_id"])
         goal_obj = Goal.model_validate(goal)
 
         def resolve_assignment(task, step):
@@ -186,12 +250,12 @@ async def test_sop_api_full_execution(sop_definition: SopDefinition):
             )
 
         def build_context(task, step):
-            return service.context_builder.build_for_task(
+            return isolated_sop_components.context_builder.build_for_task(
                 task=task, step=step, goal=goal_obj, sop=sop_definition
             )
 
         # Run orchestrator
-        results = await service.orchestrator.run_until_gate(
+        results = await isolated_sop_components.orchestrator.run_until_gate(
             sop_run_id,
             resolve_assignment=resolve_assignment,
             build_context=build_context,
@@ -256,7 +320,7 @@ async def test_sop_api_full_execution(sop_definition: SopDefinition):
 
 
 @pytest.mark.asyncio
-async def test_sop_api_404_errors():
+async def test_sop_api_404_errors(isolated_sop_components):
     """Test API error handling."""
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -276,9 +340,9 @@ async def test_sop_api_404_errors():
 
 
 @pytest.mark.asyncio
-async def test_sop_events_pagination():
+async def test_sop_events_pagination(isolated_sop_components):
     """Test event pagination with after parameter."""
-    service.sop_definitions["test-sop-1"] = SopDefinition(
+    isolated_sop_components.sop_definitions["test-sop-1"] = SopDefinition(
         id="test-sop-1",
         name="Test",
         version="1.0",

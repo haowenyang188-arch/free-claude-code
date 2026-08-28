@@ -366,6 +366,10 @@ async def test_codex_native_approval_event_contains_exact_one_shot_identity(
         "provider": "codex_cli",
         "session_id": "thread-1",
         "call_id": "call-1",
+        "one_shot_id": record.one_shot_id,
+        "thread_id": record.thread_id,
+        "item_id": record.item_id,
+        "approval_id": record.approval_id,
         "turn_id": None,
         "normalized_command": intent.normalized_command,
         "argv": list(intent.argv),
@@ -378,6 +382,49 @@ async def test_codex_native_approval_event_contains_exact_one_shot_identity(
         "risk": "level_b",
         "status": "pending",
     }
+
+
+@pytest.mark.asyncio
+async def test_claude_compatibility_approval_event_contains_patch_identity(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.runtime.approval import ApprovalManager, CommandIntent
+
+    adapter = ClaudeCodeAdapter(
+        "agent-claude",
+        use_compatibility_bridge=True,
+        approval_manager=ApprovalManager(),
+    )
+    adapter.current_run_id = "run-claude"
+    intent = CommandIntent.create(
+        provider="claude_cli",
+        session_id="claude-thread-1",
+        thread_id="claude-thread-1",
+        turn_id="claude-turn-1",
+        item_id="claude-item-1",
+        call_id="claude-call-1",
+        argv=("claude-file-change", "edit", str(tmp_path / "src.py")),
+        cwd=tmp_path,
+        requested_permission="filesystem",
+        workspace_target=tmp_path,
+        permission_scope=f"filesystem:write:{tmp_path / 'src.py'}",
+        patch_identity='{"file_path":"src.py","new_string":"ok"}',
+    )
+    approval_manager = adapter.approval_manager
+    assert approval_manager is not None
+    record = await approval_manager.request(intent)
+    observed: list[Event] = []
+
+    async def callback(event: Event) -> None:
+        observed.append(event)
+
+    adapter.set_event_callback(callback)
+    await adapter._on_approval_pending(record)
+
+    approval = observed[0].data["approval"]
+    assert approval["provider"] == "claude_cli"
+    assert approval["one_shot_id"] == record.one_shot_id
+    assert approval["patch_identity"] == record.patch_identity
 
 
 @pytest.mark.asyncio

@@ -109,6 +109,7 @@ class CodexAdapter(BaseAgentAdapter):
                 ):
                     await self.app_server_session.stop()
                     self.app_server_session = None
+                    self.session_id = None
                 if self.app_server_session is None:
                     self.app_server_session = CodexAppServerSession(
                         workspace_path=workspace_path,
@@ -150,10 +151,11 @@ class CodexAdapter(BaseAgentAdapter):
         identity = RuntimeIdentity(
             provider=record.provider,
             session_id=record.session_id,
-            thread_id=record.session_id,
+            thread_id=record.thread_id or record.session_id,
+            item_id=record.item_id,
+            approval_id=record.approval_id,
             turn_id=record.turn_id,
-            approval_id=record.call_id,
-            one_shot_id=record.call_id,
+            one_shot_id=record.one_shot_id,
             call_id=record.call_id,
         )
         await self.emit_event(
@@ -165,6 +167,10 @@ class CodexAdapter(BaseAgentAdapter):
                     "provider": record.provider,
                     "session_id": record.session_id,
                     "call_id": record.call_id,
+                    "one_shot_id": record.one_shot_id,
+                    "thread_id": record.thread_id,
+                    "item_id": record.item_id,
+                    "approval_id": record.approval_id,
                     "turn_id": record.turn_id,
                     "normalized_command": record.normalized_command,
                     "argv": list(record.argv),
