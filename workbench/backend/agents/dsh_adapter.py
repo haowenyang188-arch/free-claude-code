@@ -14,6 +14,7 @@ from harness.bridge import DeepSeekHarnessBridge
 from harness.config import HarnessConfig
 from harness.events import safe_log_context
 from providers.common.identity import RuntimeIdentity
+from .dsh_transport import DshClient, DshTransportError, discover_dsh_desktop_endpoint
 
 from ..models import AgentStatus, AgentType, EventType
 from .base import BaseAgentAdapter
@@ -28,7 +29,14 @@ def _dsh_event_identity(
     session_id: str,
     generation: str,
 ) -> RuntimeIdentity:
-    """Project event IDs while pinning provenance to the Workbench host."""
+    """Project event IDs while pinning provenance to the Workbench host.
+
+    DSH notifications are untrusted runtime data.  Agent/session/run/generation
+    identify the host-owned execution and therefore cannot be supplied by a
+    plugin payload.  Tool/item/call/approval/one-shot IDs are intentionally
+    copied per notification as metadata only; this adapter never uses a
+    runtime one-shot ID as an authorization token.
+    """
     runtime = RuntimeIdentity.from_mapping(notification)
     return RuntimeIdentity(
         provider=provider,
@@ -59,6 +67,9 @@ class DeepSeekHarnessAdapter(BaseAgentAdapter):
     ) -> None:
         super().__init__(agent_id, AgentType.DEEPSEEK_HARNESS)
         self.config = config or HarnessConfig.from_env()
+        # LEGACY/DEPRECATED (S0-R): the sidecar harness bridge is kept for
+        # compatibility only; the real Desktop path uses DshTransport below.
+        # Removal is a separate decision after the Desktop path is accepted.
         self.bridge = DeepSeekHarnessBridge(
             self.config,
             api_key=os.environ.get("DEEPSEEK_API_KEY"),
@@ -66,6 +77,29 @@ class DeepSeekHarnessAdapter(BaseAgentAdapter):
         )
         self.session_id: str | None = None
         self.generation: str | None = None
+        self._dsh_client: DshClient | None = None
+
+    @property
+    def dsh_client(self) -> DshClient | None:
+        """Lazily built DSH Desktop client (FIRST_PARTY_INTERNAL_PROTOCOL).
+
+        All Typert/WebSocket wire details stay inside dsh_transport.py; the
+        adapter only ever deals with endpoints and session ids.
+        """
+        if self._dsh_client is None:
+            self._dsh_client = DshClient(discover=discover_dsh_desktop_endpoint)
+        return self._dsh_client
+
+    async def desktop_available(self) -> bool:
+        """True when the real DSH Desktop v2.0.3 API is reachable."""
+        client = self.dsh_client
+        if client is None:
+            return False
+        try:
+            await asyncio.to_thread(client.list_sessions)
+            return True
+        except DshTransportError:
+            return False
 
     async def check_availability(self) -> bool:
         """Return whether DSH is explicitly enabled and locally valid."""

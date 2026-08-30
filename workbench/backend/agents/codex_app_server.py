@@ -12,6 +12,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import signal
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
@@ -25,6 +26,7 @@ from cli.runtime_registry import RuntimeBackend
 from ..runtime.approval import (
     ApprovalManager,
     ApprovalRecord,
+    ApprovalScope,
     ApprovalState,
     CommandIntent,
     CommandSyntaxError,
@@ -33,6 +35,50 @@ from ..runtime.codex_home import CodexHomeError, prepare_codex_home
 
 ApprovalPendingCallback = Callable[[ApprovalRecord], Awaitable[None]]
 _STREAM_LIMIT_BYTES = 4 * 1024 * 1024
+
+# Error-notification observability (hotfix).
+#
+# The app-server reports provider / HTTP / retry failures through a JSON-RPC
+# ``error`` notification. Emitting only a generic message made it impossible to
+# tell an EXTERNAL provider outage from a CODE or PROTOCOL defect, which is
+# exactly what a Health Gate has to distinguish. We now preserve a small
+# whitelist of diagnostic fields — never the whole ``params`` envelope — and
+# scrub anything that looks like a credential along the way.
+#
+# Fault CLASSIFICATION is deliberately NOT done here: the caller decides
+# BLOCKED_EXTERNAL vs CODE_FAILURE from http status, codexErrorInfo, the
+# provider error category and the terminal event. No brittle string matching
+# against localised provider messages belongs in this module.
+_ERROR_GENERIC_MESSAGE = "Codex app-server error"
+_ERROR_DIAGNOSTIC_KEYS: dict[str, str] = {
+    "message": "upstream_message",
+    "codexErrorInfo": "upstream_error_info",
+    "additionalDetails": "additional_details",
+}
+# Substring match, case-insensitive, applied to every key at every depth.
+_ERROR_SENSITIVE_KEY_TOKENS: tuple[str, ...] = (
+    "authorization",
+    "api_key",
+    "apikey",
+    "token",
+    "cookie",
+    "secret",
+    "password",
+    "credential",
+)
+# Free-form diagnostic text carries credentials as *values* (e.g. the app-server
+# echoing a request URL or headers), which key-name filtering cannot catch.
+# Matched on a key<sep>value shape so ordinary wording is not destroyed.
+_ERROR_SECRET_PAIR_PATTERN = re.compile(
+    r"(?P<prefix>(?:" + "|".join(_ERROR_SENSITIVE_KEY_TOKENS) + r")"
+    r"""[\"']?\s*(?:=|:|":)\s*[\"']?)"""
+    # An optional scheme prefix (e.g. ``Authorization: Bearer sk-...``) is part
+    # of the secret, not the value boundary.
+    r"(?:Bearer\s+|Basic\s+|Token\s+)?"
+    r"(?P<secret>[^\s,;&}\)\"']+)",
+    re.IGNORECASE,
+)
+_ERROR_BEARER_PATTERN = re.compile(r"Bearer\s+\S+", re.IGNORECASE)
 
 
 class CodexAppServerError(RuntimeError):
@@ -55,6 +101,7 @@ class CodexAppServerSession:
         on_approval_pending: ApprovalPendingCallback | None = None,
         approval_timeout_seconds: float = 300.0,
         codex_home: str | Path | None = None,
+        approval_scope: str = ApprovalScope.NORMAL,
     ) -> None:
         workspace = Path(workspace_path).expanduser().resolve(strict=True)
         if not workspace.is_dir():
@@ -63,9 +110,20 @@ class CodexAppServerSession:
             raise ValueError("sandbox_mode must be read-only or workspace-write")
         if approval_timeout_seconds < 0:
             raise ValueError("approval_timeout_seconds must be non-negative")
+        if approval_scope not in (ApprovalScope.NORMAL, ApprovalScope.DENY_ONLY):
+            raise ValueError("approval_scope must be 'normal' or 'deny_only'")
+        if approval_scope is ApprovalScope.DENY_ONLY and sandbox_mode != "read-only":
+            # F-2: a DENY_ONLY principal (Codex Reviewer) is FORCED read-only.
+            # Thread-level sandbox is the protocol authority (turn/start has no
+            # sandbox override), so this guard closes the only escalation path.
+            raise ValueError(
+                "reviewer session (approval_scope=deny_only) must use "
+                "sandbox_mode='read-only'"
+            )
         self.workspace = workspace
         self.codex_bin = codex_bin
         self.sandbox_mode = sandbox_mode
+        self.approval_scope = approval_scope
         self.model = model
         self.approval_manager = approval_manager
         self.on_approval_pending = on_approval_pending
@@ -476,6 +534,7 @@ class CodexAppServerSession:
             turn_id=turn_id,
             workspace_target=self.workspace,
             permission_scope=_permission_scope_for_permissions(permissions, canonical),
+            approval_scope=self.approval_scope,
         )
         record = await self.approval_manager.request(
             intent, approval_timeout_seconds=self.approval_timeout_seconds
@@ -530,6 +589,7 @@ class CodexAppServerSession:
                 turn_id=turn_id,
                 workspace_target=self.workspace,
                 permission_scope=self._permission_scope(params),
+                approval_scope=self.approval_scope,
             )
         if method in {"item/fileChange/requestApproval", "applyPatchApproval"}:
             patch_identity = self._file_change_identity(
@@ -550,6 +610,7 @@ class CodexAppServerSession:
                 turn_id=turn_id,
                 workspace_target=self.workspace,
                 permission_scope=f"filesystem:write:{self.workspace}",
+                approval_scope=self.approval_scope,
                 patch_identity=patch_identity,
             )
         if not isinstance(command, str):
@@ -571,6 +632,7 @@ class CodexAppServerSession:
                 turn_id=turn_id,
                 workspace_target=self.workspace,
                 permission_scope=self._permission_scope(params),
+                approval_scope=self.approval_scope,
             )
         except CommandSyntaxError, ValueError:
             return None
@@ -748,10 +810,34 @@ class CodexAppServerSession:
                 params,
                 fallback_thread_id=self.current_session_id,
             )
-            event = {"type": "error", "error": {"message": "Codex app-server error"}}
+            event = {"type": "error", "error": _error_detail(params)}
             event.update(identity)
             return event
         return None
+
+    async def interrupt_turn(self) -> bool:
+        """Native turn-level interrupt (codex 'turn/interrupt').
+
+        Cancels the CURRENT turn only; the app-server process and the thread
+        survive, so a new turn can run afterwards.  Never SIGTERMs the process.
+        Returns False when no turn is running or the request cannot be sent.
+        Must NOT acquire ``self._lock``: ``start_task`` holds it while the
+        turn loop is consuming messages; this method only writes to stdin.
+        """
+        thread_id = self.current_session_id
+        turn_id = self.current_turn_id
+        if not thread_id or not turn_id:
+            return False
+        if self.process is None or self.process.returncode is not None:
+            return False
+        try:
+            await self._send_request(
+                "turn/interrupt",
+                {"threadId": thread_id, "turnId": turn_id},
+            )
+            return True
+        except CodexAppServerError:
+            return False
 
     async def stop(self) -> bool:
         process = self.process
@@ -891,6 +977,80 @@ def _path_stays_in_workspace(value: str, workspace: Path) -> bool:
     except OSError, ValueError:
         return False
     return True
+
+
+def _scrub_error_text(value: str) -> str:
+    """Redact ``token=abc`` / ``Authorization: Bearer abc`` / ``"api_key": "abc"``
+    style pairs embedded in free-form diagnostic text.
+
+    Deliberately keyed on a *key=value* shape rather than the bare word, so
+    ordinary wording such as "token bucket exhausted" survives intact.
+    """
+    redacted = _ERROR_SECRET_PAIR_PATTERN.sub(
+        lambda match: f"{match.group('prefix')}[redacted]", value
+    )
+    return _ERROR_BEARER_PATTERN.sub("Bearer [redacted]", redacted)
+
+
+def _error_key_is_sensitive(key: Any) -> bool:
+    """True when a key name looks like it carries a credential."""
+    if not isinstance(key, str):
+        return False
+    lowered = key.lower()
+    return any(token in lowered for token in _ERROR_SENSITIVE_KEY_TOKENS)
+
+
+def _error_json_safe(value: Any) -> Any:
+    """Reduce an arbitrary diagnostic value to JSON-safe data, scrubbing secrets.
+
+    Always returns a value that ``json.dumps`` accepts. Unknown object types
+    degrade to their ``repr`` rather than raising: a missing diagnostic field
+    must never turn a provider outage into a secondary crash.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        safe: dict[str, Any] = {}
+        for key, item in value.items():
+            if _error_key_is_sensitive(key):
+                continue
+            safe[str(key)] = _error_json_safe(item)
+        return safe
+    if isinstance(value, (list, tuple)):
+        return [_error_json_safe(item) for item in value]
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return repr(value)
+    return value
+
+
+def _error_detail(params: Any) -> dict[str, Any]:
+    """Build the ``error`` payload for an app-server error notification.
+
+    The generic message is preserved verbatim for backwards compatibility;
+    diagnostic fields are added alongside it from a strict whitelist. Only
+    ``params.error`` is inspected — never the whole envelope — and every value
+    passes through :func:`_error_json_safe`.
+    """
+    detail: dict[str, Any] = {"message": _ERROR_GENERIC_MESSAGE}
+    error = params.get("error") if isinstance(params, Mapping) else None
+    if not isinstance(error, Mapping):
+        return detail
+    for source_key, target_key in _ERROR_DIAGNOSTIC_KEYS.items():
+        if source_key not in error:
+            continue
+        safe = _error_json_safe(error[source_key])
+        if safe is None:
+            continue
+        if isinstance(safe, str):
+            # Free-form text: credentials travel as values here, not keys.
+            safe = _scrub_error_text(safe)
+        detail[target_key] = safe
+    # Retry hints live on the notification itself, not on the error object.
+    if isinstance(params, Mapping) and "willRetry" in params:
+        detail["retryable"] = bool(params["willRetry"])
+    return detail
 
 
 _CODEX_IDENTITY_ALIASES: dict[str, tuple[str, ...]] = {

@@ -91,6 +91,7 @@ class ArtifactType(StrEnum):
     FILE = "file"
     DIFF = "diff"
     JSON = "json"
+    PLAN = "plan"
 
 
 class ValidationStatus(StrEnum):
@@ -112,6 +113,20 @@ class HandoffStatus(StrEnum):
     READY = "ready"
     ACCEPTED = "accepted"
     REJECTED = "rejected"
+
+class HandoffMessageType(StrEnum):
+    """Communication intent carried by a Handoff.
+    Distinguishes *what* is being handed over; EventEnvelope stays
+    responsible only for *what happened*.
+    """
+    HANDOFF = "handoff"
+    PLAN_READY = "plan_ready"
+    REVIEW_REQUEST = "review_request"
+    REWORK = "rework"
+    REWORK_COMPLETED = "rework_completed"
+    PLAN_INVALID = "plan_invalid"
+    PLAN_BLOCKED = "plan_blocked"
+    PASS = "pass"
 
 
 class Project(BaseModel):
@@ -348,6 +363,9 @@ class Handoff(BaseModel):
     brief: str = ""
     status: HandoffStatus = HandoffStatus.DRAFT
     accepted_at: datetime | None = None
+    message_type: HandoffMessageType = HandoffMessageType.HANDOFF
+    reply_to_handoff_id: str | None = None
+    correlation_id: str | None = None
 
 
 class EventRecord(BaseModel):

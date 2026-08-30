@@ -44,6 +44,20 @@ class CommandRisk(StrEnum):
     LEVEL_C = "level_c"
 
 
+class ApprovalScope(StrEnum):
+    """Role-level authorization scope for an approval request.
+
+    ``NORMAL``  — the caller is subject to the standard risk policy
+                  (LEVEL_A auto-approve, LEVEL_B one-shot, LEVEL_C deny).
+    ``DENY_ONLY`` — the caller may never receive an automatic approval
+                  (Codex Reviewer).  Evaluated BEFORE the risk policy; the
+                  decision is an audited REJECTED, never an approval.
+    """
+
+    NORMAL = "normal"
+    DENY_ONLY = "deny_only"
+
+
 _SHELL_SYNTAX = re.compile(r"(?:&&|\|\||[;|&`()<>]|\$\(|\$\{|\n|\r)")
 _DANGEROUS_EXECUTABLES = frozenset(
     {
@@ -243,6 +257,7 @@ def _command_hash(
     workspace_target: Path,
     permission_scope: str | None,
     patch_identity: str | None,
+    approval_scope: str = ApprovalScope.NORMAL,
 ) -> str:
     # ``one_shot_id`` is a server-side lookup nonce, not command content.  It
     # must remain separate so the same normalized intent can be bound to one
@@ -255,6 +270,7 @@ def _command_hash(
         "item_id": item_id,
         "normalized_command": normalized_command,
         "patch_identity": patch_identity,
+        "approval_scope": approval_scope,
         "permission_scope": permission_scope,
         "provider": provider,
         "requested_permission": requested_permission,
@@ -869,6 +885,7 @@ class CommandIntent:
     workspace_target: Path | None = None
     permission_scope: str | None = None
     patch_identity: str | None = None
+    approval_scope: str = ApprovalScope.NORMAL
 
     @classmethod
     def create(
@@ -888,6 +905,7 @@ class CommandIntent:
         workspace_target: str | Path | None = None,
         permission_scope: str | None = None,
         patch_identity: str | None = None,
+        approval_scope: str = ApprovalScope.NORMAL,
     ) -> CommandIntent:
         if command is None and argv is None:
             raise CommandSyntaxError("command or argv is required")
@@ -916,6 +934,9 @@ class CommandIntent:
             )
         normalized_scope = _optional_text(permission_scope, "permission_scope")
         normalized_patch = _optional_text(patch_identity, "patch_identity")
+        if approval_scope not in (ApprovalScope.NORMAL, ApprovalScope.DENY_ONLY):
+            raise ValueError("approval_scope must be 'normal' or 'deny_only'")
+        normalized_approval_scope = str(approval_scope)
         target_value = (
             resolved_cwd if workspace_target is None else Path(workspace_target)
         )
@@ -972,6 +993,7 @@ class CommandIntent:
                 workspace_target=resolved_target,
                 permission_scope=normalized_scope,
                 patch_identity=normalized_patch,
+                approval_scope=normalized_approval_scope,
             ),
             risk=risk,
             provider=normalized_provider,
@@ -983,6 +1005,7 @@ class CommandIntent:
             workspace_target=resolved_target,
             permission_scope=normalized_scope,
             patch_identity=normalized_patch,
+            approval_scope=normalized_approval_scope,
         )
         intent.verify_integrity()
         return intent
@@ -1072,6 +1095,7 @@ def _command_hash_for_intent(
         workspace_target=intent.workspace_target or intent.cwd,
         permission_scope=intent.permission_scope,
         patch_identity=intent.patch_identity,
+        approval_scope=intent.approval_scope,
     )
 
 
@@ -1172,6 +1196,7 @@ class ApprovalRecord:
     workspace_target: Path | None = None
     permission_scope: str | None = None
     patch_identity: str | None = None
+    approval_scope: str = ApprovalScope.NORMAL
 
     @property
     def intent(self) -> CommandIntent:
@@ -1193,6 +1218,7 @@ class ApprovalRecord:
             workspace_target=self.workspace_target,
             permission_scope=self.permission_scope,
             patch_identity=self.patch_identity,
+            approval_scope=self.approval_scope,
         )
         intent.verify_integrity(require_bound=True)
         return intent
@@ -1278,7 +1304,17 @@ class ApprovalManager:
             bound_intent = _bind_one_shot(intent, one_shot_id)
             now = datetime.now(UTC)
             expires_at = now + timedelta(seconds=approval_timeout_seconds)
-            if bound_intent.risk is CommandRisk.LEVEL_A:
+            if bound_intent.approval_scope == ApprovalScope.DENY_ONLY:
+                # ROLE AUTHORITY precedes RISK POLICY: a DENY_ONLY principal
+                # (Codex Reviewer) may never receive an automatic approval,
+                # even for a LEVEL_A command.  The record is still created and
+                # audited (approval_id/thread_id/turn_id/item_id/call_id/
+                # request/reason/decision all preserved); the decision is a
+                # plain REJECTED.  No force-accept/force-reject bypass exists.
+                status = ApprovalState.REJECTED
+                approved_at = None
+                reason = "reviewer_role_policy_deny_only"
+            elif bound_intent.risk is CommandRisk.LEVEL_A:
                 status = ApprovalState.APPROVED
                 approved_at: datetime | None = now
                 reason = "level_a_policy"
@@ -1318,6 +1354,7 @@ class ApprovalManager:
                 workspace_target=bound_intent.workspace_target,
                 permission_scope=bound_intent.permission_scope,
                 patch_identity=bound_intent.patch_identity,
+                approval_scope=bound_intent.approval_scope,
             )
             if intent.risk is CommandRisk.LEVEL_B and self._reusable_grant_locked(
                 bound_intent
