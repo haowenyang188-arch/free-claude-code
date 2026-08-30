@@ -33,9 +33,20 @@ if __package__:
     from .agents.claude_adapter import ClaudeCodeAdapter
     from .agents.codex_adapter import CodexAdapter
     from .agents.dsh_adapter import DeepSeekHarnessAdapter
-    from .agents.fake_runner import FakeSubagentRunner
-    from .artifacts.store import FileArtifactStore
-    from .domain.models import Goal, GoalStatus, SopDefinition
+    from .artifacts.store import ArtifactStoreError, FileArtifactStore
+    from .domain.models import (
+        Artifact,
+        Goal,
+        GoalStatus,
+        SopDefinition,
+        SopRun,
+        SopRunStatus,
+        StepDefinition,
+        SubagentAssignment,
+    )
+    from .domain.models import (
+        Task as SopTask,
+    )
     from .models import (
         Agent,
         AgentStatus,
@@ -66,6 +77,7 @@ if __package__:
     from .sop_models import (
         ArtifactResponse,
         HandoffResponse,
+        SopControlRequest,
         SopEventResponse,
         SopRunStatusResponse,
         StartSopRunRequest,
@@ -77,6 +89,7 @@ if __package__:
     from .workflow.context_builder import ContextPackageBuilder
     from .workflow.engine import WorkflowEngine
     from .workflow.orchestrator import AutoOrchestrator
+    from .workflow.runner_factory import create_runners
 else:  # Support ``python workbench/backend/main.py`` as a local entry point.
     import sys
 
@@ -85,6 +98,20 @@ else:  # Support ``python workbench/backend/main.py`` as a local entry point.
     from workbench.backend.agents.claude_adapter import ClaudeCodeAdapter
     from workbench.backend.agents.codex_adapter import CodexAdapter
     from workbench.backend.agents.dsh_adapter import DeepSeekHarnessAdapter
+    from workbench.backend.artifacts.store import ArtifactStoreError, FileArtifactStore
+    from workbench.backend.domain.models import (
+        Artifact,
+        Goal,
+        GoalStatus,
+        SopDefinition,
+        SopRun,
+        SopRunStatus,
+        StepDefinition,
+        SubagentAssignment,
+    )
+    from workbench.backend.domain.models import (
+        Task as SopTask,
+    )
     from workbench.backend.models import (
         Agent,
         AgentStatus,
@@ -98,6 +125,7 @@ else:  # Support ``python workbench/backend/main.py`` as a local entry point.
         Task,
         TaskStatus,
     )
+    from workbench.backend.persistence.store import JsonWorkflowStore
     from workbench.backend.runtime.approval import (
         ApprovalIntegrityError,
         ApprovalManager,
@@ -119,6 +147,22 @@ else:  # Support ``python workbench/backend/main.py`` as a local entry point.
         WorkspacePolicy,
         WorkspacePolicyError,
     )
+    from workbench.backend.sop_models import (
+        ArtifactResponse,
+        HandoffResponse,
+        SopControlRequest,
+        SopEventResponse,
+        SopRunStatusResponse,
+        StartSopRunRequest,
+        StartSopRunResponse,
+        StepRunResponse,
+        TaskResponse,
+    )
+    from workbench.backend.validation.always_accept import AlwaysAcceptValidator
+    from workbench.backend.workflow.context_builder import ContextPackageBuilder
+    from workbench.backend.workflow.engine import WorkflowEngine
+    from workbench.backend.workflow.orchestrator import AutoOrchestrator
+    from workbench.backend.workflow.runner_factory import create_runners
 
 
 class _SessionAwareAdapter(Protocol):
@@ -259,13 +303,17 @@ class WorkbenchService:
             root=sop_workspace / "artifacts",
         )
 
-        # Use FakeSubagentRunner by default (can be replaced with real runners)
-        runner = FakeSubagentRunner()
+        # Runtime adapters from RUNTIME_MODE (default fake; real fails closed)
+        runners = create_runners(
+            store=self.workflow_store,
+            artifact_store=self.artifact_store,
+            workspace_path=str(sop_workspace),
+        )
         validator = AlwaysAcceptValidator()
 
         self.workflow_engine = WorkflowEngine(
             store=self.workflow_store,
-            runner=runner,
+            runners=runners,
             validator=validator,
             artifact_store=self.artifact_store,
         )
@@ -277,6 +325,9 @@ class WorkbenchService:
 
         # SOP definitions cache (will be loaded from storage)
         self.sop_definitions: dict[str, SopDefinition] = {}
+
+        # Background SOP execution tasks
+        self._background_sop_tasks: dict[str, asyncio.Task] = {}
 
     def _restore_state(self) -> None:
         try:
@@ -294,6 +345,71 @@ class WorkbenchService:
                 self._persist_state_sync()
         except (StateStoreError, ValueError, TypeError) as exc:
             raise StateStoreError("workbench state snapshot failed validation") from exc
+
+    def _default_assignment_resolver(
+        self, task: SopTask, step: StepDefinition
+    ) -> SubagentAssignment:
+        """Default assignment resolver: bind role to its runtime id.
+
+        Role -> runtime mapping mirrors the RoleBinding contract
+        (planner -> Claude, executor -> DSH, reviewer -> Codex).
+        """
+        runtime_by_role = {
+            "claude": "claude",
+            "dsh": "dsh",
+            "codex": "codex",
+            "planner": "claude",
+            "executor": "dsh",
+            "reviewer": "codex",
+        }
+        return SubagentAssignment(
+            id=str(uuid.uuid4()),
+            task_id=task.id,
+            role_id=step.role_id,
+            agent_instance_id="fake-agent",
+            runtime_id=runtime_by_role.get(step.role_id, "default"),
+        )
+
+    async def _execute_sop_run_background(
+        self, sop_run_id: str, goal: Goal, sop: SopDefinition
+    ) -> None:
+        """Execute SOP run in background with exception handling."""
+        try:
+            # Build context using the existing builder
+            def build_context(task: SopTask, step: StepDefinition):
+                return self.context_builder.build_for_task(
+                    task=task, step=step, goal=goal, sop=sop
+                )
+
+            # Execute until gate (review or terminal state)
+            await self.orchestrator.run_until_gate(
+                sop_run_id,
+                resolve_assignment=self._default_assignment_resolver,
+                build_context=build_context,
+            )
+
+        except Exception as exc:
+            # Persist execution failure to SopRun status
+            try:
+                run = self.workflow_store.get_entity("sop_runs", sop_run_id)
+                run["status"] = SopRunStatus.FAILED.value
+                run["metadata"] = run.get("metadata", {})
+                run["metadata"]["error"] = str(exc)
+                run["metadata"]["error_type"] = type(exc).__name__
+                self.workflow_store.save_entity("sop_runs", run)
+
+                # Emit failure event
+                self.workflow_store.append_event(
+                    stream_id=sop_run_id,
+                    event_type="sop_failed",
+                    payload={"error": str(exc), "error_type": type(exc).__name__},
+                )
+            except Exception:
+                # Swallow persistence errors to avoid breaking background task cleanup
+                pass
+        finally:
+            # Cleanup background task reference
+            self._background_sop_tasks.pop(sop_run_id, None)
 
     def _mark_interrupted_runs_stale(self) -> bool:
         """Mark in-flight runs as paused after a process restart.
@@ -1457,9 +1573,110 @@ async def control_run(run_id: str, request: ControlRequest):
 # ============================================================================
 
 
+@app.get("/api/sop-definitions")
+async def list_sop_definitions():
+    """List registered SOP definitions (WebUI: pick one to dispatch)."""
+    return [
+        {
+            "id": sop.id,
+            "name": sop.name,
+            "version": sop.version,
+            "description": sop.description,
+            "step_count": sum(len(stage.steps) for stage in sop.stages),
+            "stages": [{"id": stage.id, "name": stage.name} for stage in sop.stages],
+            "steps": [step.id for stage in sop.stages for step in stage.steps],
+        }
+        for sop in service.sop_definitions.values()
+    ]
+
+
+@app.post("/api/sop-definitions")
+async def register_sop_definition(sop: SopDefinition):
+    """Register a SOP definition so it can be dispatched at runtime.
+
+    Additive: the engine is untouched; the definition is only held in the
+    service registry that ``POST /api/sop-runs`` already reads from.
+    """
+    service.sop_definitions[sop.id] = sop
+    return {"id": sop.id, "name": sop.name, "version": sop.version}
+
+
+@app.get("/api/sop-runs")
+async def list_sop_runs():
+    """List SOP runs (WebUI: run picker — no such endpoint existed before)."""
+    rows = service.workflow_store.list_entities("sop_runs")
+    runs = []
+    for row in rows:
+        try:
+            run = SopRun.model_validate(row)
+        except Exception:
+            continue
+        runs.append(
+            {
+                "sop_run_id": run.id,
+                "sop_definition_id": run.sop_definition_id,
+                "sop_version": run.sop_version,
+                "status": run.status.value,
+                "current_step_id": run.current_step_id,
+                "started_at": run.started_at,
+                "completed_at": run.completed_at,
+            }
+        )
+    runs.sort(key=lambda item: str(item["started_at"] or ""), reverse=True)
+    return runs
+
+
+@app.post("/api/sop-runs/{run_id}/control")
+async def control_sop_run(run_id: str, request: SopControlRequest):
+    """Pause / resume / cancel a SOP run.
+
+    Implemented at the service layer by moving the persisted SopRun status —
+    the frozen WorkflowEngine is not modified.
+    """
+    action = (request.action or "").strip().lower()
+    if action not in {"pause", "resume", "cancel"}:
+        raise HTTPException(status_code=400, detail=f"unsupported action: {action!r}")
+
+    try:
+        # get_entity RAISES KeyError when missing (it does not return None).
+        row = service.workflow_store.get_entity("sop_runs", run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="sop run not found") from exc
+    run = SopRun.model_validate(row)
+
+    if run.status in (SopRunStatus.COMPLETED, SopRunStatus.CANCELLED):
+        raise HTTPException(
+            status_code=409, detail=f"sop run already terminal: {run.status.value}"
+        )
+
+    transitions = {
+        "pause": SopRunStatus.PAUSED,
+        "resume": SopRunStatus.RUNNING,
+        "cancel": SopRunStatus.CANCELLED,
+    }
+    if action == "resume" and run.status is not SopRunStatus.PAUSED:
+        raise HTTPException(
+            status_code=409, detail=f"cannot resume from {run.status.value}"
+        )
+
+    run.status = transitions[action]
+    if action == "cancel":
+        run.completed_at = datetime.now()
+    service.workflow_store.save_entity("sop_runs", run)
+    return {
+        "sop_run_id": run.id,
+        "action": action,
+        "status": run.status.value,
+        "reason": request.reason,
+    }
+
+
 @app.post("/api/sop-runs", response_model=StartSopRunResponse)
 async def start_sop_run(request: StartSopRunRequest):
-    """Start a new SOP run."""
+    """Start a new SOP run (creates state only by default).
+
+    Set auto_execute=True to automatically trigger orchestration after creation.
+    """
     if request.sop_definition_id not in service.sop_definitions:
         raise HTTPException(status_code=404, detail="SOP definition not found")
 
@@ -1476,12 +1693,65 @@ async def start_sop_run(request: StartSopRunRequest):
 
     sop_run = service.workflow_engine.start_sop_run(goal=goal, sop=sop)
 
+    # Optionally trigger automatic execution
+    if request.auto_execute:
+        task = asyncio.create_task(
+            service._execute_sop_run_background(sop_run.id, goal, sop)
+        )
+        service._background_sop_tasks[sop_run.id] = task
+
     return StartSopRunResponse(
         sop_run_id=sop_run.id,
         goal_id=goal.id,
         status=sop_run.status.value,
         started_at=sop_run.started_at or goal.created_at,
     )
+
+
+@app.post("/api/sop-runs/{run_id}/execute")
+async def execute_sop_run(run_id: str):
+    """Execute a SOP run (triggers orchestration in background).
+
+    This endpoint starts the orchestration process for a previously created SOP run.
+    Execution happens asynchronously - use GET /api/sop-runs/{run_id} to check status.
+    """
+    try:
+        run_data = service.workflow_store.get_entity("sop_runs", run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="SOP run not found") from exc
+
+    run = SopRun.model_validate(run_data)
+
+    # Check if already executing or terminal
+    if run_id in service._background_sop_tasks:
+        return {"status": "already_executing", "run_id": run_id}
+
+    if run.status in (
+        SopRunStatus.COMPLETED,
+        SopRunStatus.CANCELLED,
+        SopRunStatus.FAILED,
+    ):
+        raise HTTPException(
+            status_code=409, detail=f"Cannot execute terminal run: {run.status.value}"
+        )
+
+    # Retrieve goal and sop definition
+    goal_data = service.workflow_store.get_entity("goals", run.goal_id)
+    goal = Goal.model_validate(goal_data)
+
+    if run.sop_definition_id not in service.sop_definitions:
+        raise HTTPException(status_code=404, detail="SOP definition not found")
+    sop = service.sop_definitions[run.sop_definition_id]
+
+    # Trigger background execution
+    task = asyncio.create_task(service._execute_sop_run_background(run_id, goal, sop))
+    service._background_sop_tasks[run_id] = task
+
+    return {
+        "status": "executing",
+        "run_id": run_id,
+        "message": "Orchestration started in background",
+    }
 
 
 @app.get("/api/sop-runs/{run_id}", response_model=SopRunStatusResponse)
@@ -1600,9 +1870,46 @@ async def get_sop_artifacts(run_id: str):
             sha256=item.get("sha256"),
             accepted=item.get("accepted", False),
             created_at=item["created_at"],
+            # Phase 5A: Attempt lineage
+            attempt_id=item.get("attempt_id"),
+            step_run_id=item.get("step_run_id"),
+            role=item.get("role"),
         )
         for item in artifacts
     ]
+
+
+@app.get("/api/artifacts/{artifact_id}/content")
+async def get_artifact_content(artifact_id: str):
+    """Read-only artifact payload (WebUI: view PLAN / Diff / Test / Review).
+
+    Additive and read-only: it only reads what FileArtifactStore already owns
+    and re-verifies the stored sha256. No adapter / engine / handoff /
+    approval layer is touched (Backend Core remains frozen).
+    """
+    row = next(
+        (
+            item
+            for item in service.workflow_store.list_entities("artifacts")
+            if item.get("id") == artifact_id
+        ),
+        None,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    artifact = Artifact.model_validate(row)
+    if not artifact.uri or not artifact.sha256:
+        raise HTTPException(status_code=404, detail="artifact has no persisted payload")
+    try:
+        payload = service.artifact_store.get(artifact)
+    except ArtifactStoreError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "id": artifact.id,
+        "type": str(artifact.type),
+        "sha256": artifact.sha256,
+        "content": payload.decode("utf-8", errors="replace"),
+    }
 
 
 @app.get("/api/sop-runs/{run_id}/handoffs", response_model=list[HandoffResponse])

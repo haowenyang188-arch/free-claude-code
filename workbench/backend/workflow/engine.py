@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, datetime
-
 from abc import ABC, abstractmethod
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from ..artifacts.store import FileArtifactStore
@@ -97,15 +96,19 @@ class WorkflowEngine:
         self,
         *,
         store: Any,
-        runner: SubagentRunner,
+        runner: SubagentRunner | None = None,
+        runners: dict[str, Any] | None = None,
         validator: AcceptanceValidator,
         artifact_store: FileArtifactStore | None = None,
         max_rework_attempts: int = 3,
     ) -> None:
         if max_rework_attempts < 1:
             raise ValueError("max_rework_attempts must be at least 1")
+        if runner is None and not runners:
+            raise ValueError("must provide either 'runner' or 'runners'")
         self.store = store
         self.runner = runner
+        self._runners: dict[str, Any] = dict(runners or {})
         self.validator = validator
         self.artifact_store = artifact_store
         self.max_rework_attempts = max_rework_attempts
@@ -195,6 +198,31 @@ class WorkflowEngine:
                 return None
             attempt = self._ensure_attempt_for_task(reviewed_task)
             return attempt.id
+        return None
+
+    def _adapter_for(self, assignment: SubagentAssignment) -> Any | None:
+        """Resolve the ExecutionAdapter for an assignment (contract v2).
+
+        Resolution order: assignment.runtime_id -> runners dict; then
+        RoleBinding (role_id -> runtime_id) -> runners dict; else None
+        (legacy single-runner path).
+        """
+        if not self._runners:
+            return None
+        if assignment.runtime_id in self._runners:
+            return self._runners[assignment.runtime_id]
+        try:
+            bindings = [
+                item
+                for item in self.store.list_entities("role_bindings")
+                if item.get("role_id") == assignment.role_id
+            ]
+        except (KeyError, AttributeError):
+            bindings = []
+        for binding in bindings:
+            runtime_id = binding.get("runtime_id")
+            if runtime_id in self._runners:
+                return self._runners[runtime_id]
         return None
 
     def start_sop_run(self, *, goal: Goal, sop: SopDefinition) -> SopRun:
@@ -345,31 +373,65 @@ class WorkflowEngine:
             {"task_id": task.id, "attempt": attempt.sequence},
         )
 
+        adapter = self._adapter_for(assignment)
         try:
-            artifact = await self.runner.execute(
-                task=task, assignment=assignment, context=context
-            )
+            if adapter is not None:
+                result = await adapter.execute(
+                    task=task, assignment=assignment, context=context
+                )
+                artifacts = [
+                    item.model_copy(
+                        update={
+                            "task_id": task.id,
+                            "producer_step_run_id": step_run.id,
+                            "attempt_id": attempt.id,
+                            "schema_version": 2,
+                            "accepted": False,
+                        }
+                    )
+                    for item in result.artifacts
+                ]
+                if result.session_id:
+                    attempt.session_id = result.session_id
+                    self.store.save_entity("attempts", attempt)
+            else:
+                if self.runner is None:
+                    raise WorkflowEngineError(
+                        "no runner configured for runtime "
+                        f"{assignment.runtime_id!r}"
+                    )
+                single = await self.runner.execute(
+                    task=task, assignment=assignment, context=context
+                )
+                artifacts = [
+                    single.model_copy(
+                        update={
+                            "task_id": task.id,
+                            "producer_step_run_id": step_run.id,
+                            "attempt_id": attempt.id,
+                            "schema_version": 2,
+                            "accepted": False,
+                        }
+                    )
+                ]
         except Exception:
             attempt.status = TaskStatus.FAILED
             attempt.completed_at = datetime.now(UTC)
             self.store.save_entity("attempts", attempt)
             raise
-        artifact = artifact.model_copy(
-            update={
-                "task_id": task.id,
-                "producer_step_run_id": step_run.id,
-                "attempt_id": attempt.id,
-                "schema_version": 2,
-                "accepted": False,
-            }
-        )
         if self.artifact_store is not None:
-            content = artifact.content or artifact.summary or ""
-            artifact = self.artifact_store.put(artifact, content)
-        self.store.save_entity("artifacts", artifact)
-        task.output_artifact_ids = [artifact.id]
-        if artifact.id not in step_run.output_artifact_ids:
-            step_run.output_artifact_ids.append(artifact.id)
+            stored: list[Artifact] = []
+            for item in artifacts:
+                content = item.content or item.summary or ""
+                stored.append(self.artifact_store.put(item, content))
+            artifacts = stored
+        for item in artifacts:
+            self.store.save_entity("artifacts", item)
+        task.output_artifact_ids = [item.id for item in artifacts]
+        for item in artifacts:
+            if item.id not in step_run.output_artifact_ids:
+                step_run.output_artifact_ids.append(item.id)
+        artifact = artifacts[0]
         self._set_status(task, "tasks", TaskStatus.VALIDATING)
         self._set_status(step_run, "step_runs", StepStatus.VALIDATING)
         self.store.save_entity("tasks", task)
