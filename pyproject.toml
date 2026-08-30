@@ -115,7 +115,7 @@ skip-magic-trailing-comma = false
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-addopts = "-n auto"
+addopts = ""
 testpaths = ["tests"]
 markers = [
     "live: opt-in local smoke tests that can touch real services",
@@ -127,6 +127,8 @@ markers = [
     "voice: voice transcription checks",
     "contract: deterministic feature contract checks",
     "smoke_target(name): route a smoke test behind FCC_SMOKE_TARGETS",
+    "real_e2e: Full automation loop with real providers (opt-in only)",
+    "integration: Cross-component integration tests (may use mocks)",
 ]
 
 [tool.ty.environment]
