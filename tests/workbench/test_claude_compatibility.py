@@ -182,6 +182,68 @@ async def test_claude_compatibility_session_waits_for_level_b_allow_once(
 
 
 @pytest.mark.asyncio
+async def test_claude_duplicate_control_request_id_denies_once_and_keeps_first_intent(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.agents.claude_compatibility import ClaudeCompatibilitySession
+    from workbench.backend.runtime.approval import ApprovalManager
+
+    process = _FakeProcess(
+        [
+            _init_message(),
+            {
+                "type": "control_request",
+                "request_id": "duplicate-request",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "Bash",
+                    "input": {"command": "python first.py"},
+                    "tool_use_id": "tool-first",
+                },
+            },
+            {
+                "type": "control_request",
+                "request_id": "duplicate-request",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "Bash",
+                    "input": {"command": "git status"},
+                    "tool_use_id": "tool-second",
+                },
+            },
+            _result_message(),
+        ]
+    )
+    approvals = ApprovalManager()
+    pending: list[Any] = []
+
+    async def on_pending(record: Any) -> None:
+        pending.append(record)
+
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
+        spawn.return_value = process
+        session = ClaudeCompatibilitySession(
+            tmp_path,
+            approval_manager=approvals,
+            on_approval_pending=on_pending,
+            approval_timeout_seconds=0.05,
+        )
+        await _collect_events(session, "duplicate")
+
+    responses = [
+        item for item in process.stdin.writes if item.get("type") == "control_response"
+    ]
+    assert len(responses) == 1
+    response = responses[0]["response"]
+    if response["subtype"] == "success":
+        assert response["response"]["behavior"] == "deny"
+    else:
+        assert response["subtype"] == "error"
+    assert pending
+    assert pending[0].call_id == "tool-first"
+
+
+@pytest.mark.asyncio
 async def test_claude_compatibility_session_denies_level_c_without_workbench_prompt(
     tmp_path: Path,
 ) -> None:
@@ -540,6 +602,7 @@ async def test_claude_compatibility_cancel_request_cancels_pending_approval(
         provider="claude_cli",
         session_id=pending[0].session_id,
         call_id=pending[0].call_id,
+        command_hash=pending[0].command_hash,
     )
     assert record.status is ApprovalState.CANCELLED
     assert events[-1]["type"] == "exit"
@@ -591,7 +654,7 @@ async def test_claude_compatibility_allow_response_preserves_updated_input(
     assert inner["updatedInput"] == tool_input
 
 
-def test_claude_compatibility_command_uses_auto_mode_and_stdio_prompt(
+def test_claude_compatibility_command_uses_manual_mode_and_stdio_prompt(
     tmp_path: Path,
 ) -> None:
     from workbench.backend.agents.claude_compatibility import (
@@ -601,7 +664,7 @@ def test_claude_compatibility_command_uses_auto_mode_and_stdio_prompt(
     command = ClaudeCompatibilitySession(tmp_path).build_command(session_id="session-1")
 
     assert "--permission-mode" in command
-    assert command[command.index("--permission-mode") + 1] == "auto"
+    assert command[command.index("--permission-mode") + 1] == "manual"
     assert "--permission-prompt-tool" in command
     assert command[command.index("--permission-prompt-tool") + 1] == "stdio"
     assert "--setting-sources" in command

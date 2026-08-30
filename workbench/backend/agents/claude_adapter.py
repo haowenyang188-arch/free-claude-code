@@ -54,6 +54,7 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
         self.approval_manager = approval_manager
         self.compatibility_session: ClaudeCompatibilitySession | None = None
         self.hook_installed = hook_installed
+        self._runtime_generation_required = False
         self._approval_health = {
             "hook_installed": hook_installed,
             "hook_trust": "unverified" if hook_installed else "disabled",
@@ -88,6 +89,7 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
         try:
             generation = uuid.uuid4().hex
             self.generation = generation
+            self._runtime_generation_required = True
             self._reset_approval_health()
             await self.emit_event(
                 EventType.RUN_STARTED,
@@ -133,6 +135,9 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
                 "--strict-mcp-config",
                 "--permission-mode",
                 "plan",
+                # S0-R P3: HARD whitelist — removes Bash/Write/Edit/NotebookEdit
+                # from the tool schema. permission-mode plan is NOT the boundary.
+                "--tools=Read,Grep,Glob",
                 task_description,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -218,6 +223,10 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
                 generation=generation,
             ):
                 event_type = event.get("type")
+                # A compatibility monitor may outlive a cancelled/restarted
+                # run.  Never let its delayed stream mutate the new run.
+                if self.generation != generation:
+                    return
                 if event_type == "session_info":
                     value = event.get("session_id")
                     if isinstance(value, str) and value:
@@ -279,19 +288,21 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
                             {"error": f"Process exited with code {code}"},
                             run_id=run_id,
                         )
-            self.status = AgentStatus.ONLINE
-            self.current_run_id = None
-            self._cancel_requested = False
+            if self.generation == generation:
+                self.status = AgentStatus.ONLINE
+                self.current_run_id = None
+                self._cancel_requested = False
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await self.emit_event(
-                EventType.RUN_FAILED,
-                {"error": str(exc)},
-                run_id=run_id,
-            )
-            self.status = AgentStatus.ERROR
-            self.current_run_id = None
+            if self.generation == generation:
+                await self.emit_event(
+                    EventType.RUN_FAILED,
+                    {"error": str(exc)},
+                    run_id=run_id,
+                )
+                self.status = AgentStatus.ERROR
+                self.current_run_id = None
 
     async def _monitor_output(self):
         """监听Claude Code输出"""
@@ -523,12 +534,15 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
         generation = self.generation
         if not generation or event.get("generation") != generation:
             return
+        self._runtime_generation_required = True
         if event.get("backend") != "claude":
             return
         if event.get("event") not in self._HOOK_EVENTS:
             return
         decision = event.get("decision")
         if decision not in self._HOOK_DECISIONS:
+            return
+        if self._approval_health.get("runtime_result") in self._RUNTIME_STATUS:
             return
         self._approval_health.update(
             {
@@ -538,8 +552,15 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
             }
         )
 
-    def record_hook_runtime_result(self, result: str) -> None:
-        """Record an explicit hook probe outcome without claiming activity."""
+    def record_hook_runtime_result(
+        self, result: str, *, generation: str | None = None
+    ) -> bool:
+        """Record a probe outcome only for the adapter generation it belongs to.
+
+        A result received while a run is active must carry that run's
+        generation.  Calls made before the first run remain supported for
+        startup diagnostics, where there is no generation to bind.
+        """
         normalized = result.strip().lower().replace("-", "_").replace(" ", "_")
         if normalized not in self._RUNTIME_RESULTS:
             allowed = ", ".join(sorted(self._RUNTIME_RESULTS))
@@ -547,11 +568,29 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
                 f"unsupported Claude hook runtime result: {result!r}; "
                 f"expected one of {allowed}"
             )
+        current_generation = self.generation
+        if current_generation is not None:
+            self._runtime_generation_required = True
+            if generation != current_generation:
+                return False
+        elif self._runtime_generation_required or generation is not None:
+            # Once a run has existed, an unbound late result is stale by
+            # definition and must not alter the next/idle health snapshot.
+            return False
         self._approval_health["runtime_result"] = normalized
+        # Explicit timeout/failure evidence supersedes any earlier activity.
+        if normalized in self._RUNTIME_STATUS:
+            self._approval_health["hook_active"] = False
+            self._approval_health["hook_trust"] = (
+                "unverified" if self.hook_installed else "disabled"
+            )
+        return True
 
-    def set_hook_runtime_result(self, result: str) -> None:
+    def set_hook_runtime_result(
+        self, result: str, *, generation: str | None = None
+    ) -> bool:
         """Compatibility alias for callers that use setter terminology."""
-        self.record_hook_runtime_result(result)
+        return self.record_hook_runtime_result(result, generation=generation)
 
     def _reset_approval_health(self) -> None:
         self._approval_health.update(
@@ -565,13 +604,13 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
 
     @classmethod
     def _approval_health_status(cls, health: Mapping[str, Any]) -> str:
-        if health.get("hook_active") is True:
-            return "ACTIVE"
         if health.get("hook_installed") is not True:
             return "DISABLED"
         runtime_result = health.get("runtime_result")
         if runtime_result in cls._RUNTIME_STATUS:
             return cls._RUNTIME_STATUS[runtime_result]
+        if health.get("hook_active") is True:
+            return "ACTIVE"
         return "HOOK_REGISTERED_BUT_NOT_ACTIVE"
 
     async def cleanup(self) -> None:
@@ -584,3 +623,6 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
             self.compatibility_session = None
         if process and process.pid and generation is not None:
             unregister_process(process.pid, generation=generation)
+        self.generation = None
+        self.session_id = None
+        self._reset_approval_health()

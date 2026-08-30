@@ -11,6 +11,7 @@ from starlette.testclient import TestClient
 
 from cli.runtime_registry import RuntimeBackend, RuntimeProbe, RuntimeProfileProbe
 from harness.config import HarnessConfig
+from providers.common import RuntimeIdentity
 from workbench.backend import main as main_module
 from workbench.backend.agents import claude_adapter as claude_module
 from workbench.backend.agents import codex_adapter as codex_module
@@ -244,6 +245,58 @@ async def test_event_provenance_stays_bound_to_the_started_generation(
         "generation-1",
         "generation-1",
     ]
+
+
+@pytest.mark.asyncio
+async def test_provider_event_cannot_override_workbench_provenance(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    run = Run(id="run-spoof", task_id="task-spoof", agent_id="agent-1")
+    task = Task(
+        id="task-spoof",
+        title="spoof",
+        description="reject forged provenance",
+        agent_id="agent-1",
+        agent_type=AgentType.CLAUDE_CODE,
+        workspace_path=str(tmp_path / "workspace"),
+    )
+    service.runs[run.id] = run
+    service.tasks[task.id] = task
+    adapter = service.agents["agent-1"]
+    adapter.generation = "generation-host"
+    adapter.session_id = "session-host"
+
+    await service._handle_event(
+        Event(
+            id="event-spoof",
+            run_id=run.id,
+            type=EventType.AGENT_MESSAGE,
+            data={"message": "runtime event"},
+            identity=RuntimeIdentity(
+                provider="attacker-provider",
+                agent_id="attacker-agent",
+                generation="generation-attacker",
+                session_id="session-attacker",
+                run_id="run-attacker",
+                thread_id="thread-runtime",
+                turn_id="turn-runtime",
+                item_id="item-runtime",
+                approval_id="approval-runtime",
+                call_id="call-runtime",
+            ),
+        )
+    )
+
+    envelope = service.event_envelopes["event-spoof"]
+    assert envelope.provider == "claude_cli"
+    assert envelope.agent_id == "agent-1"
+    assert envelope.generation == "generation-host"
+    assert envelope.session_id == "session-host"
+    assert envelope.run_id == run.id
+    assert envelope.thread_id == "thread-runtime"
+    assert envelope.turn_id == "turn-runtime"
+    assert service.runs[run.id].metadata["session_id"] == "session-host"
 
 
 @pytest.mark.asyncio

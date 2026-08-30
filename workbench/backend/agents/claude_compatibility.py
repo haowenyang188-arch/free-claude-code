@@ -76,6 +76,12 @@ class ClaudeCompatibilitySession:
         self._control_tasks: dict[str, asyncio.Task[None]] = {}
         self._pending_control_intents: dict[str, CommandIntent] = {}
         self._cancelled_control_requests: set[str] = set()
+        # Control request ids are scoped to one Claude generation.  Reusing an
+        # id is a protocol violation: keep the first task/intent authoritative
+        # and fail closed instead of replacing it with attacker-controlled data.
+        self._seen_control_request_ids: set[str] = set()
+        self._duplicate_control_requests: set[str] = set()
+        self._control_response_sent: set[str] = set()
 
     @property
     def is_busy(self) -> bool:
@@ -101,7 +107,7 @@ class ClaudeCompatibilitySession:
                 "stream-json",
                 "--verbose",
                 "--permission-mode",
-                "auto",
+                "manual",
                 "--permission-prompt-tool",
                 "stdio",
                 "--setting-sources",
@@ -129,6 +135,12 @@ class ClaudeCompatibilitySession:
             self.generation = generation or uuid.uuid4().hex
             self.current_turn_id = uuid.uuid4().hex
             self._terminal_seen = False
+            self._control_tasks.clear()
+            self._pending_control_intents.clear()
+            self._cancelled_control_requests.clear()
+            self._seen_control_request_ids.clear()
+            self._duplicate_control_requests.clear()
+            self._control_response_sent.clear()
             process: asyncio.subprocess.Process | None = None
             try:
                 process = await asyncio.create_subprocess_exec(
@@ -218,6 +230,10 @@ class ClaudeCompatibilitySession:
             if message.get("type") == "control_request":
                 request_id = _text(message.get("request_id"))
                 if request_id is not None:
+                    if request_id in self._seen_control_request_ids:
+                        await self._handle_duplicate_control_request(request_id)
+                        continue
+                    self._seen_control_request_ids.add(request_id)
                     task = asyncio.create_task(
                         self._handle_control_request(message),
                         name=f"claude-control-{request_id}",
@@ -236,14 +252,29 @@ class ClaudeCompatibilitySession:
                     await self._drain_control_tasks()
                     return
 
+    async def _handle_duplicate_control_request(self, request_id: str) -> None:
+        """Reject a reused request id without replacing the original task."""
+        self._duplicate_control_requests.add(request_id)
+        # Mark the response before yielding so the original task cannot race
+        # this one and emit a second response for the same protocol id.
+        await self._send_control_error_once(
+            request_id, "duplicate_request_id", force=True
+        )
+        intent = self._pending_control_intents.get(request_id)
+        if intent is not None:
+            with contextlib.suppress(Exception):
+                await self._cancel_intent(intent)
+
     async def _handle_control_request(self, message: Mapping[str, Any]) -> None:
         request_id = _text(message.get("request_id"))
         request = message.get("request")
         if request_id is None or not isinstance(request, Mapping):
             return
+        if request_id in self._duplicate_control_requests:
+            return
         try:
             if request.get("subtype") != "can_use_tool":
-                await self._send_control_response(
+                await self._send_control_response_once(
                     request_id,
                     {
                         "behavior": "deny",
@@ -256,7 +287,7 @@ class ClaudeCompatibilitySession:
             except CommandSyntaxError, ValueError:
                 intent = None
             if intent is None or self.approval_manager is None:
-                await self._send_control_response(
+                await self._send_control_response_once(
                     request_id,
                     {"behavior": "deny", "message": "approval_unavailable"},
                 )
@@ -264,21 +295,32 @@ class ClaudeCompatibilitySession:
             record = await self.approval_manager.request(
                 intent, approval_timeout_seconds=self.approval_timeout_seconds
             )
-            self._pending_control_intents[request_id] = intent
+            bound_intent = record.intent
+            if request_id in self._duplicate_control_requests:
+                with contextlib.suppress(Exception):
+                    await self._cancel_intent(bound_intent)
+                return
+            self._pending_control_intents[request_id] = bound_intent
             if request_id in self._cancelled_control_requests:
                 self._cancelled_control_requests.discard(request_id)
-                observed = await self._cancel_intent(intent)
+                observed = await self._cancel_intent(bound_intent)
             else:
                 observed = record
                 if record.status is ApprovalState.PENDING:
                     if self.on_approval_pending is not None:
                         await self.on_approval_pending(record)
-                    observed = await self.approval_manager.wait_for_terminal(intent)
+                    if request_id in self._duplicate_control_requests:
+                        with contextlib.suppress(Exception):
+                            await self._cancel_intent(bound_intent)
+                        return
+                    observed = await self.approval_manager.wait_for_terminal(
+                        bound_intent
+                    )
             if observed.status is ApprovalState.APPROVED:
                 try:
-                    await self.approval_manager.consume(intent)
+                    await self.approval_manager.consume(bound_intent)
                 except Exception:
-                    await self._send_control_response(
+                    await self._send_control_response_once(
                         request_id,
                         {"behavior": "deny", "message": "approval_unavailable"},
                     )
@@ -287,7 +329,7 @@ class ClaudeCompatibilitySession:
                 updated_input = (
                     dict(tool_input) if isinstance(tool_input, Mapping) else {}
                 )
-                await self._send_control_response(
+                await self._send_control_response_once(
                     request_id,
                     {
                         "behavior": "allow",
@@ -297,10 +339,10 @@ class ClaudeCompatibilitySession:
                 )
                 return
             if observed.status is ApprovalState.CANCELLED:
-                await self._send_control_error(request_id, "approval_cancelled")
+                await self._send_control_error_once(request_id, "approval_cancelled")
                 return
             reason = observed.reason or observed.status.value
-            await self._send_control_response(
+            await self._send_control_response_once(
                 request_id,
                 {"behavior": "deny", "message": reason, "toolUseID": intent.call_id},
             )
@@ -339,6 +381,7 @@ class ClaudeCompatibilitySession:
                 provider=intent.provider,
                 session_id=intent.session_id,
                 call_id=intent.call_id,
+                command_hash=intent.command_hash,
             )
 
     async def _drain_control_tasks(self) -> None:
@@ -384,6 +427,17 @@ class ClaudeCompatibilitySession:
             }
         )
 
+    async def _send_control_response_once(
+        self, request_id: str, response: Mapping[str, Any]
+    ) -> bool:
+        if request_id in self._duplicate_control_requests:
+            return False
+        if request_id in self._control_response_sent:
+            return False
+        self._control_response_sent.add(request_id)
+        await self._send_control_response(request_id, response)
+        return True
+
     async def _send_control_error(self, request_id: str, error: str) -> None:
         await self._send(
             {
@@ -395,6 +449,17 @@ class ClaudeCompatibilitySession:
                 },
             }
         )
+
+    async def _send_control_error_once(
+        self, request_id: str, error: str, *, force: bool = False
+    ) -> bool:
+        if request_id in self._control_response_sent:
+            return False
+        if request_id in self._duplicate_control_requests and not force:
+            return False
+        self._control_response_sent.add(request_id)
+        await self._send_control_error(request_id, error)
+        return True
 
     def _intent_from_request(
         self, request: Mapping[str, Any], request_id: str
@@ -533,11 +598,35 @@ class ClaudeCompatibilitySession:
     async def stop(self) -> bool:
         process = self.process
         if process is None:
+            self.current_session_id = None
+            self.current_turn_id = None
+            self.generation = None
+            self._is_busy = False
+            self._control_tasks.clear()
+            self._pending_control_intents.clear()
+            self._cancelled_control_requests.clear()
+            self._seen_control_request_ids.clear()
+            self._duplicate_control_requests.clear()
+            self._control_response_sent.clear()
             return False
+        for intent in tuple(self._pending_control_intents.values()):
+            with contextlib.suppress(Exception):
+                await self._cancel_intent(intent)
+        with contextlib.suppress(Exception):
+            await self._drain_control_tasks()
         await self._terminate_process(process)
         self._release_process(process)
         self.process = None
         self.current_session_id = None
+        self.current_turn_id = None
+        self.generation = None
+        self._control_tasks.clear()
+        self._pending_control_intents.clear()
+        self._cancelled_control_requests.clear()
+        self._seen_control_request_ids.clear()
+        self._duplicate_control_requests.clear()
+        self._control_response_sent.clear()
+        self._is_busy = False
         return True
 
     async def pause(self) -> bool:

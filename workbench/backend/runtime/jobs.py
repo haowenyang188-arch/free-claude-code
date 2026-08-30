@@ -269,7 +269,7 @@ class ApprovalExecutor:
         job_wait_timeout_seconds: float = 5.0,
         process_timeout_seconds: float | None = None,
     ) -> JobRecord:
-        intent.verify_integrity()
+        intent.verify_integrity(require_bound=True)
         _validate_start_options(
             background=background,
             port=port,

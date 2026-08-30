@@ -188,6 +188,7 @@ async def test_app_server_session_uses_native_sandbox_and_normalizes_events(
     assert events[2]["stderr"] is None
     assert spawn.await_args is not None
     assert spawn.await_args.args[:3] == ("codex", "app-server", "--stdio")
+    assert spawn.await_args.kwargs["limit"] == 4 * 1024 * 1024
     methods = [message.get("method") for message in process.stdin.writes]
     assert methods == ["initialize", "initialized", "thread/start", "turn/start"]
     thread_params = process.stdin.writes[2]["params"]
@@ -516,6 +517,8 @@ async def test_native_permission_request_grants_only_requested_turn_scope(
         on_approval_pending=on_pending,
         approval_timeout_seconds=5,
     )
+    session.current_session_id = "thread-1"
+    session.current_turn_id = "turn-1"
     params = {
         "threadId": "thread-1",
         "turnId": "turn-1",
@@ -544,6 +547,190 @@ async def test_native_permission_request_grants_only_requested_turn_scope(
         "network": {"enabled": True},
         "fileSystem": {"entries": [{"path": str(tmp_path)}]},
     }
+
+
+def test_native_identity_projection_keeps_call_id_alias(tmp_path: Path) -> None:
+    from workbench.backend.agents.codex_app_server import CodexAppServerSession
+
+    session = CodexAppServerSession(tmp_path)
+    event = asyncio.run(
+        session._notification_event(
+            {
+                "method": "item/commandExecution/outputDelta",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                    "callId": "call-1",
+                    "delta": "ok",
+                },
+            }
+        )
+    )
+
+    assert event is not None
+    assert event["call_id"] == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_native_approval_rejects_request_for_another_active_turn(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.agents.codex_app_server import CodexAppServerSession
+    from workbench.backend.runtime.approval import ApprovalManager
+
+    approvals = ApprovalManager()
+    session = CodexAppServerSession(tmp_path, approval_manager=approvals)
+    session.current_session_id = "thread-1"
+    session.current_turn_id = "turn-2"
+
+    decision = await session._approval_decision(
+        "item/commandExecution/requestApproval",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "command": "python task.py",
+            "cwd": str(tmp_path),
+        },
+    )
+
+    assert decision == "decline"
+
+
+@pytest.mark.asyncio
+async def test_native_completion_rejects_a_different_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from workbench.backend.agents.codex_app_server import (
+        CodexAppServerError,
+        CodexAppServerSession,
+    )
+
+    session = CodexAppServerSession(tmp_path)
+    session.current_session_id = "thread-1"
+    monkeypatch.setattr(session, "_send_request", AsyncMock(return_value=1))
+    monkeypatch.setattr(
+        session,
+        "_read_message",
+        AsyncMock(
+            side_effect=[
+                {"id": 1, "result": {"turn": {"id": "turn-1"}}},
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-2", "status": "completed"},
+                    },
+                },
+            ]
+        ),
+    )
+
+    with pytest.raises(CodexAppServerError, match="different turn"):
+        _ = [event async for event in session._run_turn("inspect")]
+
+
+@pytest.mark.asyncio
+async def test_native_completion_rejects_a_different_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from workbench.backend.agents.codex_app_server import (
+        CodexAppServerError,
+        CodexAppServerSession,
+    )
+
+    session = CodexAppServerSession(tmp_path)
+    session.current_session_id = "thread-1"
+    monkeypatch.setattr(session, "_send_request", AsyncMock(return_value=1))
+    monkeypatch.setattr(
+        session,
+        "_read_message",
+        AsyncMock(
+            side_effect=[
+                {"id": 1, "result": {"turn": {"id": "turn-1"}}},
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-2",
+                        "turn": {"id": "turn-1", "status": "completed"},
+                    },
+                },
+            ]
+        ),
+    )
+
+    with pytest.raises(CodexAppServerError, match="different thread"):
+        _ = [event async for event in session._run_turn("inspect")]
+
+
+def test_native_file_change_cache_isolated_by_turn(tmp_path: Path) -> None:
+    from workbench.backend.agents.codex_app_server import CodexAppServerSession
+
+    session = CodexAppServerSession(tmp_path)
+    session.current_session_id = "thread-1"
+    session.current_turn_id = "turn-1"
+    asyncio.run(
+        session._notification_event(
+            {
+                "method": "item/fileChange/patchUpdated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                    "changes": [{"path": "new.txt", "kind": {"type": "add"}}],
+                },
+            }
+        )
+    )
+
+    session.current_turn_id = "turn-2"
+    intent = session._intent_from_approval(
+        "item/fileChange/requestApproval",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-2",
+            "itemId": "item-1",
+            "cwd": str(tmp_path),
+        },
+    )
+
+    assert intent is None
+
+
+@pytest.mark.asyncio
+async def test_native_resume_rejects_a_different_thread_id(tmp_path: Path) -> None:
+    from unittest.mock import AsyncMock
+
+    from workbench.backend.agents.codex_app_server import (
+        CodexAppServerError,
+        CodexAppServerSession,
+    )
+
+    session = CodexAppServerSession(tmp_path)
+    session._request = AsyncMock(return_value={"thread": {"id": "other-thread"}})
+
+    with pytest.raises(CodexAppServerError, match="different thread"):
+        await session._open_thread("requested-thread", fork_session=False)
+
+
+@pytest.mark.asyncio
+async def test_native_stop_clears_stale_thread_and_turn_identity(
+    tmp_path: Path,
+) -> None:
+    from workbench.backend.agents.codex_app_server import CodexAppServerSession
+
+    session = CodexAppServerSession(tmp_path)
+    session.current_session_id = "thread-1"
+    session.current_turn_id = "turn-1"
+
+    assert await session.stop() is False
+    assert session.current_session_id is None
+    assert session.current_turn_id is None
 
 
 @pytest.mark.asyncio

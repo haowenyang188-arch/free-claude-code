@@ -220,6 +220,138 @@ def test_session_event_projects_nested_runtime_identity_without_content_ids() ->
     assert "payload" not in context
 
 
+def test_host_identity_fields_override_runtime_projection() -> None:
+    envelope = project_notification(
+        "session.event",
+        {
+            "provider": "runtime-provider",
+            "sessionId": "runtime-session",
+            "generation": "runtime-generation",
+            "event": {
+                "type": "tool/call",
+                "agentId": "runtime-agent",
+                "runId": "runtime-run",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "toolId": "tool-1",
+                "callId": "call-1",
+                "oneShotId": "runtime-one-shot",
+            },
+        },
+        provider="host-provider",
+        session_id="host-session",
+        identity=RuntimeIdentity(
+            provider="host-provider",
+            session_id="host-session",
+            generation="host-generation",
+            agent_id="host-agent",
+            run_id="host-run",
+        ),
+    )
+
+    assert envelope["provider"] == "host-provider"
+    assert envelope["session_id"] == "host-session"
+    assert envelope["generation"] == "host-generation"
+    assert envelope["agent_id"] == "host-agent"
+    assert envelope["run_id"] == "host-run"
+    assert envelope["runtime_session_id"] == "runtime-session"
+    assert envelope["turn_id"] == "turn-1"
+    assert envelope["item_id"] == "item-1"
+    assert envelope["tool_id"] == "tool-1"
+    assert envelope["call_id"] == "call-1"
+    assert envelope["one_shot_id"] == "runtime-one-shot"
+
+
+def test_runtime_event_ids_are_not_reused_from_a_previous_event() -> None:
+    first = project_notification(
+        "session.event",
+        {
+            "sessionId": "runtime-session",
+            "event": {
+                "type": "tool/call",
+                "itemId": "item-1",
+                "toolId": "tool-1",
+                "callId": "call-1",
+                "oneShotId": "one-shot-1",
+            },
+        },
+        provider="host-provider",
+        session_id="host-session",
+        identity=RuntimeIdentity(
+            provider="host-provider", session_id="host-session", run_id="host-run"
+        ),
+    )
+    second = project_notification(
+        "session.event",
+        {
+            "sessionId": "runtime-session",
+            "event": {
+                "type": "tool/call",
+                "itemId": "item-2",
+                "toolId": "tool-2",
+                "callId": "call-2",
+                "oneShotId": "one-shot-2",
+            },
+        },
+        provider="host-provider",
+        session_id="host-session",
+        identity=RuntimeIdentity(
+            provider="host-provider", session_id="host-session", run_id="host-run"
+        ),
+    )
+
+    assert (
+        first["item_id"],
+        first["tool_id"],
+        first["call_id"],
+        first["one_shot_id"],
+    ) == (
+        "item-1",
+        "tool-1",
+        "call-1",
+        "one-shot-1",
+    )
+    assert (
+        second["item_id"],
+        second["tool_id"],
+        second["call_id"],
+        second["one_shot_id"],
+    ) == (
+        "item-2",
+        "tool-2",
+        "call-2",
+        "one-shot-2",
+    )
+
+
+def test_subagent_projection_keeps_host_identity_authoritative() -> None:
+    envelope = project_notification(
+        "subagent.finished",
+        {
+            "provider": "runtime-provider",
+            "agentId": "runtime-agent",
+            "parentSessionId": "host-session",
+            "childSessionId": "child-session",
+            "status": "ok",
+        },
+        provider="host-provider",
+        session_id="host-session",
+        identity=RuntimeIdentity(
+            provider="host-provider",
+            session_id="host-session",
+            generation="host-generation",
+            agent_id="host-agent",
+            run_id="host-run",
+        ),
+    )
+
+    assert envelope["provider"] == "host-provider"
+    assert envelope["agent_id"] == "host-agent"
+    assert envelope["session_id"] == "host-session"
+    assert envelope["runtime_session_id"] == "child-session"
+    assert envelope["run_id"] == "host-run"
+
+
 def test_project_sse_emits_one_safe_custom_frame_without_fake_anthropic_turn() -> None:
     envelope = project_notification(
         "session.status", {"sessionId": "root", "status": "idle"}

@@ -417,9 +417,14 @@ async def test_turn_identity_is_stable_and_one_shot_is_not_reused(
         assert turn.notifications
         assert all(item["run_id"] == turn.run_id for item in turn.notifications)
         assert all(item["message_id"] == turn.message_id for item in turn.notifications)
-        assert all(
-            item["one_shot_id"] == turn.one_shot_id for item in turn.notifications
-        )
+        # Event-scoped IDs are not copied from the first notification into
+        # later events.  The second assistant event intentionally carries a
+        # distinct runtime one-shot value; the turn object still retains the
+        # first observed value for summary metadata only.
+        one_shot_ids = [item.get("one_shot_id") for item in turn.notifications]
+        assert turn.one_shot_id in one_shot_ids
+        assert "runtime-conflict" in one_shot_ids
+        assert any(item.get("item_id") is None for item in turn.notifications)
     await bridge.close()
 
 

@@ -59,10 +59,11 @@ async def test_one_shot_approval_binds_the_full_command_identity(
     with pytest.raises(ApprovalIntegrityError, match="approval_integrity_mismatch"):
         await approvals.consume(changed)
 
-    consumed = await approvals.consume(intent)
+    bound_intent = pending.intent
+    consumed = await approvals.consume(bound_intent)
     assert consumed.status is ApprovalState.CONSUMED
     with pytest.raises(ApprovalIntegrityError, match="approval_unavailable"):
-        await approvals.consume(intent)
+        await approvals.consume(bound_intent)
 
 
 @pytest.mark.asyncio
@@ -271,7 +272,7 @@ async def test_cancelling_approved_unconsumed_grant_revokes_same_turn_reuse(
         workspace_target=tmp_path,
         permission_scope=f"filesystem:write:{tmp_path}",
     )
-    await approvals.request(intent)
+    pending = await approvals.request(intent)
     approved = await approvals.approve(
         provider="claude_cli",
         session_id=intent.session_id,
@@ -283,7 +284,7 @@ async def test_cancelling_approved_unconsumed_grant_revokes_same_turn_reuse(
 
     assert cancelled.status is ApprovalState.CANCELLED
     with pytest.raises(ApprovalIntegrityError, match="cancelled"):
-        await approvals.consume(intent)
+        await approvals.consume(pending.intent)
 
     same_turn = CommandIntent.create(
         provider="claude_cli",
@@ -413,6 +414,7 @@ async def test_approval_records_are_isolated_by_provider(
         provider="claude_cli",
         session_id=claude.session_id,
         call_id=claude.call_id,
+        command_hash=claude.command_hash,
     )
     assert codex_record.provider == "codex_cli"
     assert claude_record.provider == "claude_cli"
@@ -476,7 +478,11 @@ async def test_reject_and_cancel_after_expiry_preserve_approval_timeout(
                 command_hash=intent.command_hash,
             )
         assert (
-            await approvals.get(session_id=intent.session_id, call_id=intent.call_id)
+            await approvals.get(
+                session_id=intent.session_id,
+                call_id=intent.call_id,
+                command_hash=intent.command_hash,
+            )
         ).status.value == "approval_timeout"
 
 
@@ -525,7 +531,7 @@ async def test_native_approval_waiter_is_released_by_matching_http_decision(
     )
     approvals = ApprovalManager()
     pending = await approvals.request(intent)
-    waiter = asyncio.create_task(approvals.wait_for_terminal(intent))
+    waiter = asyncio.create_task(approvals.wait_for_terminal(pending.intent))
     await asyncio.sleep(0)
 
     decided = await approvals.approve(
@@ -558,9 +564,9 @@ async def test_native_approval_waiter_expires_without_starting_a_process(
         requested_permission="process_spawn",
     )
     approvals = ApprovalManager()
-    await approvals.request(intent, approval_timeout_seconds=10)
+    pending = await approvals.request(intent, approval_timeout_seconds=10)
 
-    observed = await approvals.wait_for_terminal(intent, timeout_seconds=0.01)
+    observed = await approvals.wait_for_terminal(pending.intent, timeout_seconds=0.01)
 
     assert observed.status is ApprovalState.APPROVAL_TIMEOUT
 
@@ -734,7 +740,7 @@ async def test_background_job_is_not_killed_when_readiness_wait_ends(
         requested_permission="background_service",
     )
     approvals = ApprovalManager()
-    await approvals.request(intent)
+    pending = await approvals.request(intent)
     await approvals.approve(
         session_id=intent.session_id,
         call_id=intent.call_id,
@@ -744,7 +750,7 @@ async def test_background_job_is_not_killed_when_readiness_wait_ends(
     executor = ApprovalExecutor(approvals, jobs)
 
     job = await executor.execute(
-        intent,
+        pending.intent,
         background=True,
         port=port,
         health_url=f"http://127.0.0.1:{port}/health",
@@ -830,7 +836,7 @@ async def test_missing_executable_reports_process_failed_without_a_job(
         requested_permission="process_spawn",
     )
     approvals = ApprovalManager()
-    await approvals.request(intent)
+    pending = await approvals.request(intent)
     await approvals.approve(
         session_id=intent.session_id,
         call_id=intent.call_id,
@@ -839,7 +845,7 @@ async def test_missing_executable_reports_process_failed_without_a_job(
 
     with pytest.raises(JobRuntimeError, match="process_failed"):
         await ApprovalExecutor(approvals, JobRuntime()).execute(
-            intent, background=False
+            pending.intent, background=False
         )
 
 
@@ -861,29 +867,33 @@ async def test_invalid_readiness_options_do_not_consume_approval(
         requested_permission="process_spawn",
     )
     approvals = ApprovalManager()
-    await approvals.request(intent)
+    pending = await approvals.request(intent)
     jobs = JobRuntime()
     executor = ApprovalExecutor(approvals, jobs)
 
     with pytest.raises(ValueError, match="loopback"):
         await executor.execute(
-            intent,
+            pending.intent,
             background=True,
             health_url="http://example.invalid/health",
         )
 
     with pytest.raises(ValueError, match="foreground"):
         await executor.execute(
-            intent,
+            pending.intent,
             background=True,
             process_timeout_seconds=1,
         )
 
     with pytest.raises(ValueError, match="readiness"):
-        await executor.execute(intent, background=True)
+        await executor.execute(pending.intent, background=True)
 
     assert (
-        await approvals.get(session_id=intent.session_id, call_id=intent.call_id)
+        await approvals.get(
+            session_id=intent.session_id,
+            call_id=intent.call_id,
+            command_hash=intent.command_hash,
+        )
     ).status.value == "approved"
 
 
@@ -930,7 +940,7 @@ async def test_foreground_process_timeout_terminates_only_owned_process(
         requested_permission="foreground_task",
     )
     approvals = ApprovalManager()
-    await approvals.request(intent)
+    pending = await approvals.request(intent)
     await approvals.approve(
         session_id=intent.session_id,
         call_id=intent.call_id,
@@ -939,7 +949,7 @@ async def test_foreground_process_timeout_terminates_only_owned_process(
     jobs = JobRuntime()
 
     job = await ApprovalExecutor(approvals, jobs).execute(
-        intent,
+        pending.intent,
         background=False,
         process_timeout_seconds=0.1,
     )
@@ -971,7 +981,12 @@ async def test_workbench_approval_api_enforces_one_shot_and_integrity(
     main_module.auth = WorkbenchAuth("test-token")
     headers = {"Authorization": "Bearer test-token"}
     request_body = {
+        "provider": "codex_cli",
         "session_id": "api-session",
+        "thread_id": "api-thread",
+        "turn_id": "api-turn",
+        "item_id": "api-item",
+        "approval_id": "api-approval",
         "call_id": "api-call",
         "argv": [sys.executable, str(script)],
         "cwd": str(tmp_path),
@@ -988,13 +1003,64 @@ async def test_workbench_approval_api_enforces_one_shot_and_integrity(
             approval = requested.json()
             approved = await client.post(
                 "/api/approvals/api-session/api-call/approve",
-                json={"command_hash": approval["command_hash"]},
+                json={
+                    "provider": request_body["provider"],
+                    "thread_id": request_body["thread_id"],
+                    "turn_id": request_body["turn_id"],
+                    "item_id": request_body["item_id"],
+                    "approval_id": request_body["approval_id"],
+                    "command_hash": approval["command_hash"],
+                    "one_shot_id": approval["one_shot_id"],
+                },
+                headers=headers,
+            )
+            legacy_execute = await client.post(
+                "/api/approvals/api-session/api-call/execute",
+                json={
+                    **request_body,
+                    "command_hash": approval["command_hash"],
+                    "background": False,
+                    "process_timeout_seconds": 2,
+                },
+                headers=headers,
+            )
+            tampered_execute: dict[str, object] = {}
+            for field, value in {
+                "provider": "claude_cli",
+                "thread_id": "different-thread",
+                "turn_id": "different-turn",
+                "item_id": "different-item",
+                "approval_id": "different-approval",
+            }.items():
+                response = await client.post(
+                    "/api/approvals/api-session/api-call/execute",
+                    json={
+                        **request_body,
+                        "command_hash": approval["command_hash"],
+                        "one_shot_id": approval["one_shot_id"],
+                        "background": False,
+                        field: value,
+                    },
+                    headers=headers,
+                )
+                tampered_execute[field] = response
+            background_tamper = await client.post(
+                "/api/approvals/api-session/api-call/execute",
+                json={
+                    **request_body,
+                    "command_hash": approval["command_hash"],
+                    "one_shot_id": approval["one_shot_id"],
+                    "background": True,
+                    "port": _free_port(),
+                },
                 headers=headers,
             )
             executed = await client.post(
                 "/api/approvals/api-session/api-call/execute",
                 json={
                     **request_body,
+                    "command_hash": approval["command_hash"],
+                    "one_shot_id": approval["one_shot_id"],
                     "background": False,
                     "process_timeout_seconds": 2,
                 },
@@ -1002,7 +1068,12 @@ async def test_workbench_approval_api_enforces_one_shot_and_integrity(
             )
             second_execute = await client.post(
                 "/api/approvals/api-session/api-call/execute",
-                json={**request_body, "background": False},
+                json={
+                    **request_body,
+                    "command_hash": approval["command_hash"],
+                    "one_shot_id": approval["one_shot_id"],
+                    "background": False,
+                },
                 headers=headers,
             )
     finally:
@@ -1014,8 +1085,17 @@ async def test_workbench_approval_api_enforces_one_shot_and_integrity(
     assert approval["status"] == "pending"
     assert approved.status_code == 200
     assert approved.json()["status"] == "approved"
+    assert legacy_execute.status_code == 409
+    assert legacy_execute.json()["error"]["code"] == "approval_integrity_mismatch"
     assert executed.status_code == 200
     assert executed.json()["status"] == "job_completed"
+    assert all(response.status_code == 409 for response in tampered_execute.values())
+    assert all(
+        response.json().get("error", {}).get("code") == "approval_integrity_mismatch"
+        for response in tampered_execute.values()
+    )
+    assert background_tamper.status_code == 409
+    assert background_tamper.json()["error"]["code"] == "approval_integrity_mismatch"
     assert second_execute.status_code == 409
     assert second_execute.json()["error"]["code"] == "approval_unavailable"
 
@@ -1139,9 +1219,16 @@ async def test_workbench_approval_api_blocks_integrity_mismatch_and_timeout(
                 json={**body("timeout-call"), "approval_timeout_seconds": 0},
                 headers=headers,
             )
+            timeout_approval = timeout_request.json()
             timeout_execute = await client.post(
                 "/api/approvals/api-session/timeout-call/execute",
-                json=body("timeout-call"),
+                json={
+                    "provider": "codex_cli",
+                    "session_id": "api-session",
+                    "call_id": "timeout-call",
+                    "one_shot_id": timeout_approval["one_shot_id"],
+                    "command_hash": timeout_approval["command_hash"],
+                },
                 headers=headers,
             )
             mismatch_request = await client.post(
@@ -1156,8 +1243,12 @@ async def test_workbench_approval_api_blocks_integrity_mismatch_and_timeout(
             mismatch_execute = await client.post(
                 "/api/approvals/api-session/mismatch-call/execute",
                 json={
-                    **body("mismatch-call"),
-                    "argv": [sys.executable, str(tmp_path / "other.py")],
+                    "provider": "codex_cli",
+                    "session_id": "api-session",
+                    "call_id": "mismatch-call",
+                    "one_shot_id": mismatch_request.json()["one_shot_id"],
+                    "command_hash": mismatch_hash,
+                    "thread_id": "forged-thread",
                 },
                 headers=headers,
             )
@@ -1235,11 +1326,22 @@ async def test_workbench_approval_api_isolates_provider_identity(
             codex = codex_request.json()
             claude = claude_request.json()
             codex_get = await client.get(
-                "/api/approvals/shared-session/shared-call?provider=codex_cli",
+                "/api/approvals/shared-session/shared-call"
+                f"?provider=codex_cli&command_hash={codex['command_hash']}",
                 headers=headers,
             )
             claude_get = await client.get(
-                "/api/approvals/shared-session/shared-call?provider=claude_cli",
+                "/api/approvals/shared-session/shared-call"
+                f"?provider=claude_cli&command_hash={claude['command_hash']}",
+                headers=headers,
+            )
+            missing_hash_get = await client.get(
+                "/api/approvals/shared-session/shared-call?provider=codex_cli",
+                headers=headers,
+            )
+            mismatched_hash_get = await client.get(
+                "/api/approvals/shared-session/shared-call"
+                f"?provider=codex_cli&command_hash={'0' * 64}",
                 headers=headers,
             )
             claude_approved = await client.post(
@@ -1251,7 +1353,8 @@ async def test_workbench_approval_api_isolates_provider_identity(
                 headers=headers,
             )
             codex_after_claude = await client.get(
-                "/api/approvals/shared-session/shared-call?provider=codex_cli",
+                "/api/approvals/shared-session/shared-call"
+                f"?provider=codex_cli&command_hash={codex['command_hash']}",
                 headers=headers,
             )
             invalid_provider = await client.get(
@@ -1273,12 +1376,78 @@ async def test_workbench_approval_api_isolates_provider_identity(
     assert codex["patch_identity"] == "codex_cli-patch"
     assert codex_get.status_code == 200
     assert claude_get.status_code == 200
+    assert missing_hash_get.status_code == 409
+    assert missing_hash_get.json()["error"]["code"] == "approval_integrity_mismatch"
+    assert mismatched_hash_get.status_code == 409
+    assert mismatched_hash_get.json()["error"]["code"] == "approval_integrity_mismatch"
     assert codex_get.json()["provider"] == "codex_cli"
     assert claude_get.json()["provider"] == "claude_cli"
     assert claude_approved.status_code == 200
     assert claude_approved.json()["status"] == "approved"
     assert codex_after_claude.json()["status"] == "pending"
     assert invalid_provider.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_workbench_legacy_get_fails_closed_for_ambiguous_identity(
+    tmp_path: Path,
+) -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    from workbench.backend import main as main_module
+    from workbench.backend.main import WorkbenchService
+    from workbench.backend.runtime.auth import WorkbenchAuth
+
+    script = tmp_path / "task.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    service = WorkbenchService(
+        workspace_root=tmp_path,
+        event_log_path=tmp_path / "events.jsonl",
+        state_path=tmp_path / "state.json",
+    )
+    previous_service = main_module.service
+    previous_auth = main_module.auth
+    main_module.service = service
+    main_module.auth = WorkbenchAuth("test-token")
+    headers = {"Authorization": "Bearer test-token"}
+
+    def body(turn_id: str, mode: str) -> dict[str, object]:
+        return {
+            "provider": "codex_cli",
+            "session_id": "ambiguous-session",
+            "call_id": "ambiguous-call",
+            "thread_id": "ambiguous-thread",
+            "turn_id": turn_id,
+            "item_id": f"item-{turn_id}",
+            "argv": [sys.executable, str(script), mode],
+            "cwd": str(tmp_path),
+            "requested_permission": "project_write",
+        }
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=main_module.app), base_url="http://test"
+        ) as client:
+            first_request = await client.post(
+                "/api/approvals", json=body("turn-1", "first"), headers=headers
+            )
+            second_request = await client.post(
+                "/api/approvals", json=body("turn-2", "second"), headers=headers
+            )
+            ambiguous_get = await client.get(
+                "/api/approvals/ambiguous-session/ambiguous-call"
+                f"?provider=codex_cli&command_hash={first_request.json()['command_hash']}",
+                headers=headers,
+            )
+    finally:
+        main_module.service = previous_service
+        main_module.auth = previous_auth
+
+    assert first_request.status_code == 200
+    assert second_request.status_code == 200
+    assert first_request.json()["one_shot_id"] != second_request.json()["one_shot_id"]
+    assert ambiguous_get.status_code == 409
+    assert ambiguous_get.json()["error"]["code"] == "approval_unavailable"
 
 
 @pytest.mark.asyncio
@@ -1335,7 +1504,11 @@ async def test_workbench_job_api_keeps_background_service_running_until_stopped(
             executed = await client.post(
                 "/api/approvals/api-job-session/api-job-call/execute",
                 json={
-                    **body,
+                    "provider": "codex_cli",
+                    "session_id": body["session_id"],
+                    "call_id": body["call_id"],
+                    "one_shot_id": approval["one_shot_id"],
+                    "command_hash": approval["command_hash"],
                     "background": True,
                     "port": port,
                     "health_url": f"http://127.0.0.1:{port}/health",

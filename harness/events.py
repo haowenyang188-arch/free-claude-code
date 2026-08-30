@@ -135,7 +135,14 @@ def project_notification(
     fallback_session_id = _identifier(session_id)
     raw_payload = _clone_json(params)
     payload_session_id = _payload_session_id(params)
-    default_session_id = payload_session_id or fallback_session_id
+    explicit_session_id = (
+        _identifier(identity.session_id)
+        if isinstance(identity, RuntimeIdentity)
+        else None
+    )
+    default_session_id = (
+        explicit_session_id or fallback_session_id or payload_session_id
+    )
     normalized_identity = _notification_identity(
         params,
         provider=provider,
@@ -247,9 +254,13 @@ def _project_session_event(
         return envelope
 
     runtime_session_id = _identifier(params.get("sessionId", params.get("session_id")))
-    target = runtime_session_id or fallback_session_id
+    host_session_id = _identifier(envelope.get("session_id"))
+    target = host_session_id or runtime_session_id or fallback_session_id
     envelope["session_id"] = target
-    envelope["runtime_session_id"] = target
+    if runtime_session_id is not None:
+        envelope["runtime_session_id"] = runtime_session_id
+    elif envelope.get("runtime_session_id") is None:
+        envelope["runtime_session_id"] = target
     if envelope.get("runtime_id") is None:
         envelope["runtime_id"] = _identifier(
             params.get("runtimeId", params.get("runtime_id"))
@@ -283,9 +294,13 @@ def _project_session_status(
         return envelope
 
     runtime_session_id = _identifier(params.get("sessionId", params.get("session_id")))
-    target = runtime_session_id or fallback_session_id
+    host_session_id = _identifier(envelope.get("session_id"))
+    target = host_session_id or runtime_session_id or fallback_session_id
     envelope["session_id"] = target
-    envelope["runtime_session_id"] = target
+    if runtime_session_id is not None:
+        envelope["runtime_session_id"] = runtime_session_id
+    elif envelope.get("runtime_session_id") is None:
+        envelope["runtime_session_id"] = target
     status = _identifier(params.get("status"))
     envelope["status"] = status if status in _VALID_SESSION_STATUSES else None
     return envelope
@@ -299,10 +314,12 @@ def _project_subagent_started(
     envelope["type"] = "subagent_started"
     parent, child = _subagent_ids(params)
     target_parent = parent or fallback_session_id
+    host_session_id = _identifier(envelope.get("session_id"))
+    existing_runtime_session_id = _identifier(envelope.get("runtime_session_id"))
     envelope.update(
         {
-            "session_id": target_parent,
-            "runtime_session_id": child or target_parent,
+            "session_id": host_session_id or target_parent,
+            "runtime_session_id": child or existing_runtime_session_id or target_parent,
             "parent_session_id": parent,
             "child_session_id": child,
         }
@@ -319,14 +336,14 @@ def _project_subagent_finished(
 ) -> HarnessEventEnvelope:
     envelope["type"] = "subagent_finished"
     if not isinstance(params, Mapping):
+        host_session_id = _identifier(envelope.get("session_id"))
         envelope.update(
             {
-                "session_id": fallback_session_id,
-                "runtime_session_id": fallback_session_id,
+                "session_id": host_session_id or fallback_session_id,
+                "runtime_session_id": envelope.get("runtime_session_id")
+                or fallback_session_id,
                 "parent_session_id": None,
                 "child_session_id": None,
-                "provider": None,
-                "agent_id": None,
                 "status": None,
                 "stop_reason": None,
                 "last_assistant_message": None,
@@ -336,6 +353,8 @@ def _project_subagent_finished(
 
     parent, child = _subagent_ids(params)
     target_parent = parent or fallback_session_id
+    host_session_id = _identifier(envelope.get("session_id"))
+    existing_runtime_session_id = _identifier(envelope.get("runtime_session_id"))
     status = _identifier(params.get("status"))
     stop_reason = params.get("stopReason", params.get("stop_reason"))
     if isinstance(stop_reason, Mapping):
@@ -356,17 +375,23 @@ def _project_subagent_finished(
 
     envelope.update(
         {
-            "session_id": target_parent,
-            "runtime_session_id": child or target_parent,
+            "session_id": host_session_id or target_parent,
+            "runtime_session_id": child or existing_runtime_session_id or target_parent,
             "parent_session_id": parent,
             "child_session_id": child,
-            "provider": _identifier(params.get("provider")),
-            "agent_id": _identifier(params.get("agentId", params.get("agent_id"))),
             "status": status if status in _VALID_SUBAGENT_STATUSES else None,
             "stop_reason": normalized_stop_reason,
             "last_assistant_message": normalized_assistant_message,
         }
     )
+    # Runtime provider/agent labels are useful metadata only.  Preserve a
+    # host-supplied value when one was already attached to the envelope.
+    if envelope.get("provider") is None:
+        envelope["provider"] = _identifier(params.get("provider"))
+    if envelope.get("agent_id") is None:
+        envelope["agent_id"] = _identifier(
+            params.get("agentId", params.get("agent_id"))
+        )
     if envelope.get("runtime_id") is None:
         envelope["runtime_id"] = child
     return envelope
@@ -420,14 +445,23 @@ def _notification_identity(
     input can become part of this contract.
     """
     explicit = fallback or RuntimeIdentity()
-    trusted = RuntimeIdentity(
-        provider=_identifier(provider),
-        session_id=session_id,
-    )
-    result = explicit.merge(trusted)
+    runtime_identity = RuntimeIdentity()
     for mapping in _identity_mappings(params):
-        result = result.merge(_identity_from_mapping(mapping))
-    return result
+        runtime_identity = runtime_identity.merge(_identity_from_mapping(mapping))
+
+    # Explicit identity is authoritative for all fields (callers use it for
+    # host-owned turn metadata).  The provider/session arguments are an even
+    # narrower trusted boundary and therefore override any conflicting
+    # explicit or runtime value.
+    result = explicit.merge(runtime_identity)
+    values = result.to_mapping()
+    trusted_provider = _identifier(provider)
+    trusted_session = _identifier(session_id)
+    if trusted_provider is not None:
+        values["provider"] = trusted_provider
+    if trusted_session is not None:
+        values["session_id"] = trusted_session
+    return RuntimeIdentity(**values)
 
 
 def _identity_mappings(value: Any, *, depth: int = 0) -> list[Mapping[str, Any]]:

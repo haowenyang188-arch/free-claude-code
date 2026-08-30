@@ -15,6 +15,7 @@ FRONTEND_PID_FILE="$RUNTIME_DIR/frontend.pid"
 BACKEND_LOG="$RUNTIME_DIR/backend.log"
 FRONTEND_LOG="$RUNTIME_DIR/frontend.log"
 TOKEN_FILE="$RUNTIME_DIR/auth.token"
+CODEX_HOME_DIR="$RUNTIME_DIR/codex-home"
 STATE_FILE="${WORKBENCH_STATE:-$STATE_DIR/state.json}"
 EVENT_LOG="${WORKBENCH_EVENT_LOG:-$STATE_DIR/events.jsonl}"
 UV_BIN="${UV_BIN:-$(command -v uv || true)}"
@@ -118,7 +119,8 @@ status() {
 
 start() {
   require_commands
-  mkdir -p "$RUNTIME_DIR" "$STATE_DIR"
+  mkdir -p "$RUNTIME_DIR" "$STATE_DIR" "$CODEX_HOME_DIR"
+  chmod 700 "$CODEX_HOME_DIR"
 
   if managed_alive "$BACKEND_PID_FILE" || managed_alive "$FRONTEND_PID_FILE"; then
     if managed_alive "$BACKEND_PID_FILE" && managed_alive "$FRONTEND_PID_FILE"; then
@@ -156,6 +158,7 @@ start() {
     WORKBENCH_STATE="$STATE_FILE" \
     WORKBENCH_EVENT_LOG="$EVENT_LOG" \
     WORKBENCH_WORKSPACE_ROOT="$PROJECT_DIR" \
+    WORKBENCH_CODEX_HOME="$CODEX_HOME_DIR" \
     WORKBENCH_ALLOWED_ORIGINS="http://$BACKEND_HOST:$FRONTEND_PORT" \
     "$UV_BIN" run uvicorn workbench.backend.main:app \
       --host "$BACKEND_HOST" --port "$BACKEND_PORT" --log-level warning \

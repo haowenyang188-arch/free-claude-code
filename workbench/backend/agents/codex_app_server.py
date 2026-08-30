@@ -29,8 +29,10 @@ from ..runtime.approval import (
     CommandIntent,
     CommandSyntaxError,
 )
+from ..runtime.codex_home import CodexHomeError, prepare_codex_home
 
 ApprovalPendingCallback = Callable[[ApprovalRecord], Awaitable[None]]
+_STREAM_LIMIT_BYTES = 4 * 1024 * 1024
 
 
 class CodexAppServerError(RuntimeError):
@@ -52,6 +54,7 @@ class CodexAppServerSession:
         approval_manager: ApprovalManager | None = None,
         on_approval_pending: ApprovalPendingCallback | None = None,
         approval_timeout_seconds: float = 300.0,
+        codex_home: str | Path | None = None,
     ) -> None:
         workspace = Path(workspace_path).expanduser().resolve(strict=True)
         if not workspace.is_dir():
@@ -67,6 +70,10 @@ class CodexAppServerSession:
         self.approval_manager = approval_manager
         self.on_approval_pending = on_approval_pending
         self.approval_timeout_seconds = approval_timeout_seconds
+        configured_codex_home = codex_home or os.environ.get("WORKBENCH_CODEX_HOME")
+        self.codex_home = (
+            Path(configured_codex_home).expanduser() if configured_codex_home else None
+        )
         self.process: asyncio.subprocess.Process | None = None
         self._process_generation: str | None = None
         self.current_session_id: str | None = None
@@ -76,7 +83,8 @@ class CodexAppServerSession:
         self._is_busy = False
         self._lock = asyncio.Lock()
         self._early_notifications: list[dict[str, Any]] = []
-        self._file_change_patches: dict[tuple[str, str], str] = {}
+        self.current_turn_id: str | None = None
+        self._file_change_patches: dict[tuple[str, str, str], str] = {}
 
     @property
     def is_busy(self) -> bool:
@@ -140,6 +148,15 @@ class CodexAppServerSession:
                     await self.stop()
                     raise
             return
+        environment = build_cli_environment(RuntimeBackend.CODEX)
+        if self.codex_home is not None:
+            try:
+                prepared_home = prepare_codex_home(self.codex_home)
+            except CodexHomeError as exc:
+                raise CodexAppServerError(
+                    "Workbench Codex state home is unavailable"
+                ) from exc
+            environment["CODEX_HOME"] = str(prepared_home)
         process = await asyncio.create_subprocess_exec(
             self.codex_bin,
             "app-server",
@@ -148,8 +165,9 @@ class CodexAppServerSession:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             cwd=str(self.workspace),
-            env=build_cli_environment(RuntimeBackend.CODEX),
+            env=environment,
             start_new_session=os.name == "posix",
+            limit=_STREAM_LIMIT_BYTES,
         )
         if process.pid:
             process_generation = self.generation or uuid.uuid4().hex
@@ -211,7 +229,10 @@ class CodexAppServerSession:
         thread_id = thread.get("id") if isinstance(thread, Mapping) else None
         if not isinstance(thread_id, str) or not thread_id:
             raise CodexAppServerError("app-server thread response has no thread id")
+        if session_id and not fork_session and thread_id != session_id:
+            raise CodexAppServerError("app-server resumed a different thread")
         self.current_session_id = thread_id
+        self.current_turn_id = None
         self._early_notifications.clear()
 
     async def _run_turn(self, prompt: str) -> AsyncGenerator[dict[str, Any]]:
@@ -233,6 +254,18 @@ class CodexAppServerSession:
             if message.get("id") == request_id:
                 if "error" in message:
                     raise CodexAppServerError("app-server turn/start failed")
+                result = message.get("result")
+                turn = result.get("turn") if isinstance(result, Mapping) else None
+                turn_id = (
+                    _text(result.get("turnId")) if isinstance(result, Mapping) else None
+                )
+                if turn_id is None and isinstance(turn, Mapping):
+                    turn_id = _text(turn.get("id"))
+                if not isinstance(turn_id, str) or not turn_id:
+                    raise CodexAppServerError(
+                        "app-server turn/start response has no turn id"
+                    )
+                self.current_turn_id = turn_id
                 turn_response_seen = True
                 continue
             if "id" in message and "method" in message:
@@ -242,17 +275,29 @@ class CodexAppServerSession:
                 continue
             event = await self._notification_event(message)
             if event is not None:
-                if (
-                    event.get("type") == "exit"
-                    and self.approval_manager is not None
-                    and isinstance(event.get("turn_id"), str)
-                ):
-                    await self.approval_manager.clear_turn(
-                        provider="codex_cli",
-                        session_id=thread_id,
-                        thread_id=thread_id,
-                        turn_id=event["turn_id"],
-                    )
+                if event.get("type") == "exit":
+                    event_turn_id = event.get("turn_id")
+                    if not isinstance(event_turn_id, str):
+                        raise CodexAppServerError(
+                            "app-server completion has no turn id"
+                        )
+                    event_thread_id = event.get("thread_id")
+                    if event_thread_id is not None and event_thread_id != thread_id:
+                        raise CodexAppServerError(
+                            "app-server completion belongs to a different thread"
+                        )
+                    if self.current_turn_id != event_turn_id:
+                        raise CodexAppServerError(
+                            "app-server completion belongs to a different turn"
+                        )
+                    if self.approval_manager is not None:
+                        await self.approval_manager.clear_turn(
+                            provider="codex_cli",
+                            session_id=thread_id,
+                            thread_id=thread_id,
+                            turn_id=event_turn_id,
+                        )
+                    self._clear_turn_patch_cache(thread_id, event_turn_id)
                 yield event
                 if event.get("type") == "exit":
                     return
@@ -364,20 +409,23 @@ class CodexAppServerSession:
         await self._send(message)
 
     async def _approval_decision(self, method: str, params: Mapping[str, Any]) -> str:
+        if not self._active_identity_matches(params, require_known=True):
+            return "decline"
         intent = self._intent_from_approval(method, params)
         if intent is None or self.approval_manager is None:
             return "decline"
         record = await self.approval_manager.request(
             intent, approval_timeout_seconds=self.approval_timeout_seconds
         )
+        bound_intent = record.intent
         observed = record
         if record.status is ApprovalState.PENDING:
             if self.on_approval_pending is not None:
                 await self.on_approval_pending(record)
-            observed = await self.approval_manager.wait_for_terminal(intent)
+            observed = await self.approval_manager.wait_for_terminal(bound_intent)
         if observed.status is ApprovalState.APPROVED:
             try:
-                await self.approval_manager.consume(intent)
+                await self.approval_manager.consume(bound_intent)
             except Exception:
                 return "decline"
             return "accept"
@@ -392,9 +440,18 @@ class CodexAppServerSession:
         if not isinstance(permissions, Mapping):
             return {}, "decline"
         thread_id = _text(params.get("threadId")) or self.current_session_id
+        turn_id = _text(params.get("turnId"))
         item_id = _text(params.get("itemId"))
         cwd = self._resolve_cwd(params.get("cwd"))
-        if not thread_id or not item_id or cwd is None or self.approval_manager is None:
+        if (
+            not thread_id
+            or not item_id
+            or cwd is None
+            or self.approval_manager is None
+            or not self._active_identity_matches(
+                {"threadId": thread_id, "turnId": turn_id}, require_known=True
+            )
+        ):
             return {}, "decline"
         try:
             canonical = _canonical_json(permissions)
@@ -416,21 +473,22 @@ class CodexAppServerSession:
             cwd=cwd,
             requested_permission=_permission_label("sandbox_escalation", canonical),
             provider="codex_cli",
-            turn_id=_text(params.get("turnId")),
+            turn_id=turn_id,
             workspace_target=self.workspace,
             permission_scope=_permission_scope_for_permissions(permissions, canonical),
         )
         record = await self.approval_manager.request(
             intent, approval_timeout_seconds=self.approval_timeout_seconds
         )
+        bound_intent = record.intent
         observed = record
         if record.status is ApprovalState.PENDING:
             if self.on_approval_pending is not None:
                 await self.on_approval_pending(record)
-            observed = await self.approval_manager.wait_for_terminal(intent)
+            observed = await self.approval_manager.wait_for_terminal(bound_intent)
         if observed.status is ApprovalState.APPROVED:
             try:
-                await self.approval_manager.consume(intent)
+                await self.approval_manager.consume(bound_intent)
             except Exception:
                 return {}, "decline"
             return requested, "accept"
@@ -564,7 +622,31 @@ class CodexAppServerSession:
                 return None
         if item_id is None:
             return None
-        return self._file_change_patches.get((thread_id, item_id))
+        turn_id = _text(params.get("turnId"))
+        if turn_id is None:
+            return None
+        return self._file_change_patches.get((thread_id, turn_id, item_id))
+
+    def _active_identity_matches(
+        self, params: Mapping[str, Any], *, require_known: bool = False
+    ) -> bool:
+        """Require provider approval callbacks to belong to the active turn."""
+        thread_id = _text(params.get("threadId")) or _text(params.get("conversationId"))
+        turn_id = _text(params.get("turnId"))
+        if require_known and (
+            self.current_session_id is None or self.current_turn_id is None
+        ):
+            return False
+        if self.current_session_id is not None and thread_id != self.current_session_id:
+            return False
+        if self.current_turn_id is not None and turn_id != self.current_turn_id:
+            return False
+        return thread_id is not None and turn_id is not None
+
+    def _clear_turn_patch_cache(self, thread_id: str, turn_id: str) -> None:
+        for key in tuple(self._file_change_patches):
+            if key[:2] == (thread_id, turn_id):
+                self._file_change_patches.pop(key, None)
 
     def _resolve_cwd(self, value: Any) -> Path | None:
         candidate = (
@@ -608,6 +690,7 @@ class CodexAppServerSession:
             return _tool_result_event(item_id, delta, identity=identity)
         if method == "item/fileChange/patchUpdated":
             thread_id = _text(params.get("threadId")) or self.current_session_id
+            turn_id = _text(params.get("turnId"))
             item_id = _text(params.get("itemId"))
             identity = _codex_identity(
                 params,
@@ -616,14 +699,16 @@ class CodexAppServerSession:
             changes = params.get("changes")
             if (
                 thread_id
+                and turn_id
                 and item_id
                 and isinstance(changes, list)
                 and changes
                 and _patch_paths_stay_in_workspace(changes, self.workspace)
+                and self._active_identity_matches(params)
             ):
                 with contextlib.suppress(TypeError, ValueError):
-                    self._file_change_patches[(thread_id, item_id)] = _canonical_json(
-                        changes
+                    self._file_change_patches[(thread_id, turn_id, item_id)] = (
+                        _canonical_json(changes)
                     )
             event = {"type": "file_change", "item": dict(params)}
             event.update(identity)
@@ -671,6 +756,11 @@ class CodexAppServerSession:
     async def stop(self) -> bool:
         process = self.process
         if process is None:
+            self.current_session_id = None
+            self.current_turn_id = None
+            self._initialized = False
+            self._early_notifications.clear()
+            self._file_change_patches.clear()
             return False
         try:
             await self._terminate_process(process)
@@ -680,6 +770,7 @@ class CodexAppServerSession:
             self.process = None
             self._process_generation = None
             self.current_session_id = None
+            self.current_turn_id = None
             self._initialized = False
             self._early_notifications.clear()
             self._file_change_patches.clear()
@@ -807,6 +898,7 @@ _CODEX_IDENTITY_ALIASES: dict[str, tuple[str, ...]] = {
     "turn_id": ("turnId", "turn_id"),
     "item_id": ("itemId", "item_id"),
     "approval_id": ("approvalId", "approval_id"),
+    "call_id": ("callId", "call_id"),
 }
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import uuid
 from collections.abc import Mapping
 from contextlib import suppress
 from typing import Any
@@ -18,9 +19,33 @@ from ..models import AgentStatus, AgentType, EventType
 from .base import BaseAgentAdapter
 
 
-def _dsh_event_identity(notification: Mapping[str, Any]) -> RuntimeIdentity:
-    """Project bridge-owned lifecycle ids without copying notification payloads."""
-    return RuntimeIdentity.from_mapping(notification)
+def _dsh_event_identity(
+    notification: Mapping[str, Any],
+    *,
+    provider: str,
+    agent_id: str,
+    run_id: str,
+    session_id: str,
+    generation: str,
+) -> RuntimeIdentity:
+    """Project event IDs while pinning provenance to the Workbench host."""
+    runtime = RuntimeIdentity.from_mapping(notification)
+    return RuntimeIdentity(
+        provider=provider,
+        runtime_id=runtime.runtime_id,
+        session_id=session_id,
+        generation=generation,
+        thread_id=runtime.thread_id,
+        turn_id=runtime.turn_id,
+        item_id=runtime.item_id,
+        approval_id=runtime.approval_id,
+        one_shot_id=runtime.one_shot_id,
+        agent_id=agent_id,
+        tool_id=runtime.tool_id,
+        call_id=runtime.call_id,
+        message_id=runtime.message_id,
+        run_id=run_id,
+    )
 
 
 class DeepSeekHarnessAdapter(BaseAgentAdapter):
@@ -39,6 +64,8 @@ class DeepSeekHarnessAdapter(BaseAgentAdapter):
             api_key=os.environ.get("DEEPSEEK_API_KEY"),
             base_url=os.environ.get("DEEPSEEK_BASE_URL"),
         )
+        self.session_id: str | None = None
+        self.generation: str | None = None
 
     async def check_availability(self) -> bool:
         """Return whether DSH is explicitly enabled and locally valid."""
@@ -56,9 +83,13 @@ class DeepSeekHarnessAdapter(BaseAgentAdapter):
         task_description: str,
         workspace_path: str,
     ) -> bool:
+        previous_run_id = self.last_run_id
         self.current_run_id = run_id
         self.last_run_id = run_id
         self.workspace_path = workspace_path
+        if previous_run_id != run_id:
+            self.session_id = None
+        self.generation = uuid.uuid4().hex
         self.status = AgentStatus.BUSY
         self._cancel_requested = False
         self._terminal_event_emitted = False
@@ -68,6 +99,13 @@ class DeepSeekHarnessAdapter(BaseAgentAdapter):
                 "message": f"Starting DeepSeek Harness task: {task_description}",
                 "workspace": workspace_path,
             },
+            run_id=run_id,
+            identity=RuntimeIdentity(
+                provider=self.bridge.runtime_provider,
+                agent_id=self.agent_id,
+                generation=self.generation,
+                run_id=run_id,
+            ),
         )
         self.monitor_task = asyncio.create_task(
             self._run_task(run_id, task_description, workspace_path)
@@ -80,28 +118,59 @@ class DeepSeekHarnessAdapter(BaseAgentAdapter):
         task_description: str,
         workspace_path: str,
     ) -> None:
-        turn_identity = RuntimeIdentity()
+        host_identity = RuntimeIdentity(
+            provider=self.bridge.runtime_provider,
+            agent_id=self.agent_id,
+            generation=self.generation,
+            run_id=run_id,
+            session_id=self.session_id,
+        )
         try:
             turn = await self.bridge.run(
                 [{"type": "text", "text": task_description}],
                 session_id=run_id,
                 cwd=workspace_path,
             )
+            runtime_session_id = getattr(turn, "session_id", None)
+            if not isinstance(runtime_session_id, str) or not runtime_session_id:
+                runtime_session_id = self.session_id or run_id
+            self.session_id = runtime_session_id
+            host_session_id = runtime_session_id
+            generation = self.generation
+            if generation is None:
+                raise RuntimeError("DeepSeek Harness generation is unavailable")
             for notification in turn.notifications:
-                identity = _dsh_event_identity(notification)
-                turn_identity = turn_identity.merge(identity)
+                identity = _dsh_event_identity(
+                    notification,
+                    provider=self.bridge.runtime_provider,
+                    agent_id=self.agent_id,
+                    run_id=run_id,
+                    session_id=host_session_id,
+                    generation=generation,
+                )
+                context = safe_log_context(notification)
+                context.update(identity.to_mapping(include_unknown=False))
                 await self.emit_event(
                     self._event_type(notification),
-                    {"notification": safe_log_context(notification)},
+                    {"notification": context},
                     run_id=run_id,
                     identity=identity,
                 )
             if not self._terminal_event_emitted and not self._cancel_requested:
+                terminal_identity = RuntimeIdentity(
+                    provider=self.bridge.runtime_provider,
+                    agent_id=self.agent_id,
+                    generation=self.generation,
+                    run_id=run_id,
+                    session_id=host_session_id,
+                    turn_id=getattr(turn, "turn_id", None),
+                    message_id=getattr(turn, "message_id", None),
+                )
                 await self.emit_event(
                     EventType.RUN_FINISHED,
                     {"message": "DeepSeek Harness task completed"},
                     run_id=run_id,
-                    identity=turn_identity,
+                    identity=terminal_identity,
                 )
         except asyncio.CancelledError:
             raise
@@ -111,7 +180,7 @@ class DeepSeekHarnessAdapter(BaseAgentAdapter):
                     EventType.RUN_FAILED,
                     {"error": str(exc)},
                     run_id=run_id,
-                    identity=turn_identity,
+                    identity=host_identity,
                 )
                 self.status = AgentStatus.ERROR
         finally:
@@ -143,10 +212,18 @@ class DeepSeekHarnessAdapter(BaseAgentAdapter):
         self.status = AgentStatus.BUSY
         self._cancel_requested = False
         self._terminal_event_emitted = False
+        self.generation = uuid.uuid4().hex
         await self.emit_event(
             EventType.RUN_STARTED,
             {"message": "Starting DeepSeek Harness follow-up"},
             run_id=run_id,
+            identity=RuntimeIdentity(
+                provider=self.bridge.runtime_provider,
+                session_id=self.session_id,
+                agent_id=self.agent_id,
+                generation=self.generation,
+                run_id=run_id,
+            ),
         )
         self.monitor_task = asyncio.create_task(
             self._run_task(run_id, message, workspace)

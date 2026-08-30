@@ -1433,7 +1433,7 @@ class ApprovalManager:
         self, intent: CommandIntent, *, timeout_seconds: float | None = None
     ) -> ApprovalRecord:
         """Wait for an external decision on this exact one-shot grant."""
-        intent.verify_integrity()
+        intent.verify_integrity(require_bound=True)
         if timeout_seconds is not None and timeout_seconds < 0:
             raise ValueError("timeout_seconds must be non-negative")
         async with self._lock:
@@ -1475,7 +1475,7 @@ class ApprovalManager:
                     self._waiters.pop(one_shot_id, None)
 
     async def consume(self, intent: CommandIntent) -> ApprovalRecord:
-        intent.verify_integrity()
+        intent.verify_integrity(require_bound=True)
         async with self._lock:
             key, record = self._require_matching_intent(intent)
             record = self._expire_if_needed(record)
@@ -1512,7 +1512,6 @@ class ApprovalManager:
                 call_id=call_id,
                 command_hash=command_hash,
                 provider=provider or "workbench",
-                allow_missing_hash=True,
             )
             key, record = self._require_matching(reference)
             updated = self._expire_if_needed(record)
@@ -1553,7 +1552,6 @@ class ApprovalManager:
         call_id: str | None,
         command_hash: str | None,
         provider: str,
-        allow_missing_hash: bool = False,
     ) -> ApprovalReference:
         """Resolve legacy identity arguments without weakening the binding.
 
@@ -1581,7 +1579,7 @@ class ApprovalManager:
         if len(matches) != 1:
             raise ApprovalIntegrityError("approval_unavailable")
         record = matches[0]
-        if command_hash is None and not allow_missing_hash:
+        if command_hash is None:
             raise ApprovalIntegrityError("approval_integrity_mismatch")
         if command_hash is not None and not hmac.compare_digest(
             record.command_hash, command_hash.lower()
@@ -1604,14 +1602,7 @@ class ApprovalManager:
         ApprovalRecord,
     ]:
         if intent.one_shot_id is None:
-            key = self._record_key(intent)
-            record = self._records.get(key)
-            if record is None:
-                raise ApprovalIntegrityError("approval_unavailable")
-            expected_hash = _command_hash_for_intent(record.intent, one_shot_id=None)
-            if not hmac.compare_digest(expected_hash, intent.command_hash):
-                raise ApprovalIntegrityError("approval_integrity_mismatch")
-            return key, record
+            raise ApprovalIntegrityError("approval_integrity_mismatch")
         key, record = self._require_matching(intent.reference)
         if record.intent != intent:
             raise ApprovalIntegrityError("approval_integrity_mismatch")

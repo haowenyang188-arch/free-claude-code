@@ -126,11 +126,8 @@ class BaseAgentAdapter(ABC):
     def _event_identity(
         self, run_id: str, identity: RuntimeIdentity | None = None
     ) -> RuntimeIdentity:
-        """Attach adapter-owned provenance without trusting arbitrary payloads."""
+        """Attach adapter-owned provenance without trusting runtime metadata."""
         explicit = identity or RuntimeIdentity()
-        if explicit.session_id is None and explicit.thread_id is not None:
-            explicit = RuntimeIdentity(session_id=explicit.thread_id).merge(explicit)
-
         generation = getattr(self, "generation", None)
         if not isinstance(generation, str) or not generation.strip():
             session = getattr(self, "session", None)
@@ -141,17 +138,36 @@ class BaseAgentAdapter(ABC):
             session_id = getattr(session, "current_session_id", None)
             if not isinstance(session_id, str) or not session_id.strip():
                 session_id = getattr(session, "session_id", None)
+        agent_type = getattr(self.agent_type, "value", self.agent_type)
+        provider = {
+            "codex": "codex_cli",
+            "claude_code": "claude_cli",
+            "deepseek_harness": "deepseek-official",
+        }.get(str(agent_type).lower(), str(agent_type).lower())
+        lifecycle = RuntimeIdentity(
+            runtime_id=explicit.runtime_id,
+            thread_id=explicit.thread_id,
+            turn_id=explicit.turn_id,
+            item_id=explicit.item_id,
+            approval_id=explicit.approval_id,
+            one_shot_id=explicit.one_shot_id,
+            tool_id=explicit.tool_id,
+            call_id=explicit.call_id,
+            message_id=explicit.message_id,
+        )
         fallback = RuntimeIdentity(
-            provider=self.agent_type.value,
+            provider=provider,
             agent_id=self.agent_id,
             run_id=run_id,
             generation=generation if isinstance(generation, str) else None,
             session_id=session_id if isinstance(session_id, str) else None,
         )
-        merged = explicit.merge(fallback)
+        merged = lifecycle.merge(fallback)
         values = merged.to_mapping()
-        # The Workbench event stream is authoritative for its run key.  A
-        # provider cannot redirect an event into another run via metadata.
+        values["provider"] = fallback.provider
+        values["agent_id"] = fallback.agent_id
+        values["generation"] = fallback.generation
+        values["session_id"] = fallback.session_id
         values["run_id"] = run_id
         return RuntimeIdentity(**values)
 

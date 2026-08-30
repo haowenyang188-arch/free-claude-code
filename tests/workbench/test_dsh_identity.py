@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 
@@ -21,12 +21,16 @@ async def test_dsh_adapter_preserves_provider_agent_tool_call_identity(
     )
 
     class FakeTurn:
-        notifications = [
+        session_id = "host-runtime-session"
+        turn_id = "turn-1"
+        message_id = "message-1"
+        notifications: ClassVar[list[dict[str, Any]]] = [
             {
                 "type": "session_event",
                 "event_type": "tool/call",
-                "provider": "deepseek-official",
-                "session_id": "runtime-session",
+                "provider": "runtime-provider-must-not-win",
+                "session_id": "runtime-session-must-not-win",
+                "generation": "runtime-generation-must-not-win",
                 "thread_id": "thread-1",
                 "turn_id": "turn-1",
                 "item_id": "item-1",
@@ -61,26 +65,33 @@ async def test_dsh_adapter_preserves_provider_agent_tool_call_identity(
     assert notification.identity is not None
     identity = notification.identity
     assert identity.provider == "deepseek-official"
-    assert identity.session_id == "runtime-session"
+    assert identity.session_id == "host-runtime-session"
+    assert identity.generation == adapter.generation
+    assert identity.generation != "runtime-generation-must-not-win"
     assert identity.thread_id == "thread-1"
     assert identity.turn_id == "turn-1"
     assert identity.item_id == "item-1"
     assert identity.approval_id == "approval-1"
     assert identity.one_shot_id == "one-shot-1"
-    assert identity.agent_id == "agent-1"
+    assert identity.agent_id == "dsh-identity"
     assert identity.tool_id == "tool-1"
     assert identity.call_id == "call-1"
     assert identity.message_id == "message-1"
     assert identity.run_id == "host-run"
     assert notification.data["notification"]["call_id"] == "call-1"
+    assert notification.data["notification"]["provider"] == "deepseek-official"
+    assert notification.data["notification"]["session_id"] == "host-runtime-session"
+    assert notification.data["notification"]["run_id"] == "host-run"
     assert "payload" not in notification.data["notification"]
 
     finished = events[-1]
     assert finished.type is EventType.RUN_FINISHED
     assert finished.run_id == "host-run"
     assert finished.identity is not None
-    assert finished.identity.one_shot_id == "one-shot-1"
-    assert finished.identity.call_id == "call-1"
+    assert finished.identity.one_shot_id is None
+    assert finished.identity.call_id is None
+    assert finished.identity.turn_id == "turn-1"
+    assert finished.identity.message_id == "message-1"
 
     await adapter.cleanup()
 

@@ -626,12 +626,6 @@ class DeepSeekHarnessBridge:
             provider=self.runtime_provider,
             session_id=turn.session_id,
             run_id=turn.run_id,
-            turn_id=turn.turn_id,
-            item_id=turn.item_id,
-            one_shot_id=turn.one_shot_id,
-            agent_id=turn.agent_id,
-            tool_id=turn.tool_id,
-            call_id=turn.call_id,
             message_id=turn.message_id or None,
         )
 

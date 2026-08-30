@@ -20,6 +20,8 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -30,7 +32,6 @@ if __package__:
     from .agents.base import BaseAgentAdapter
     from .agents.claude_adapter import ClaudeCodeAdapter
     from .agents.codex_adapter import CodexAdapter
-    from .agents.codex_runner import CodexSubagentRunner
     from .agents.dsh_adapter import DeepSeekHarnessAdapter
     from .agents.fake_runner import FakeSubagentRunner
     from .artifacts.store import FileArtifactStore
@@ -65,7 +66,6 @@ if __package__:
     from .sop_models import (
         ArtifactResponse,
         HandoffResponse,
-        SopControlRequest,
         SopEventResponse,
         SopRunStatusResponse,
         StartSopRunRequest,
@@ -125,6 +125,21 @@ class _SessionAwareAdapter(Protocol):
     session_id: str | None
 
 
+_WORKBENCH_PROVIDER_BY_RUNTIME: dict[str, str] = {
+    "codex": "codex_cli",
+    "claude_code": "claude_cli",
+    "deepseek_harness": "deepseek-official",
+}
+
+
+def _canonical_workbench_provider(runtime_kind: str | None) -> str:
+    """Map an adapter kind to its host-owned provider route."""
+    if not isinstance(runtime_kind, str) or not runtime_kind.strip():
+        return "workbench"
+    normalized = runtime_kind.strip().lower()
+    return _WORKBENCH_PROVIDER_BY_RUNTIME.get(normalized, normalized)
+
+
 def _event_identity_for_workbench(
     identity: RuntimeIdentity | None,
     *,
@@ -134,18 +149,33 @@ def _event_identity_for_workbench(
     generation: str | None,
     session_id: str | None,
 ) -> RuntimeIdentity:
-    """Merge provider lifecycle ids with immutable Workbench run provenance."""
+    """Keep host provenance authoritative while retaining runtime IDs."""
     explicit = identity if isinstance(identity, RuntimeIdentity) else RuntimeIdentity()
+    lifecycle = RuntimeIdentity(
+        runtime_id=explicit.runtime_id,
+        thread_id=explicit.thread_id,
+        turn_id=explicit.turn_id,
+        item_id=explicit.item_id,
+        approval_id=explicit.approval_id,
+        one_shot_id=explicit.one_shot_id,
+        tool_id=explicit.tool_id,
+        call_id=explicit.call_id,
+        message_id=explicit.message_id,
+    )
     fallback = RuntimeIdentity(
-        provider=provider,
+        provider=_canonical_workbench_provider(provider),
         agent_id=agent_id,
         generation=generation,
         session_id=session_id,
         run_id=run_id,
     )
-    merged = explicit.merge(fallback)
+    merged = lifecycle.merge(fallback)
     values = merged.to_mapping()
-    # A provider event must never redirect persistence to another Workbench run.
+    # Provider payloads cannot redirect host-owned provenance.
+    values["provider"] = fallback.provider
+    values["agent_id"] = fallback.agent_id
+    values["generation"] = fallback.generation
+    values["session_id"] = fallback.session_id
     values["run_id"] = run_id
     return RuntimeIdentity(**values)
 
@@ -420,12 +450,6 @@ class WorkbenchService:
             generation=generation,
             session_id=session_id,
         )
-        if event_identity.session_id is not None:
-            session_id = event_identity.session_id
-            run = self.runs.get(event.run_id)
-            if run is not None:
-                run.metadata["session_id"] = session_id
-
         envelope = await asyncio.to_thread(
             self.event_log.append,
             run_id=event.run_id,
@@ -852,10 +876,14 @@ class WorkbenchService:
         call_id: str,
         *,
         provider: str = "codex_cli",
+        command_hash: str | None = None,
     ) -> ApprovalRecord:
+        if command_hash is None:
+            raise ApprovalIntegrityError("approval_integrity_mismatch")
         return await self.approvals.get(
             session_id=session_id,
             call_id=call_id,
+            command_hash=command_hash,
             provider=provider,
         )
 
@@ -907,9 +935,29 @@ class WorkbenchService:
         call_id: str,
         payload: ApprovalExecuteRequest,
     ) -> JobRecord:
-        intent = self._approval_intent(payload, session_id=session_id, call_id=call_id)
+        if (
+            payload.one_shot_id is None
+            or payload.command_hash is None
+            or payload.session_id != session_id
+            or payload.call_id != call_id
+        ):
+            raise ApprovalIntegrityError("approval_integrity_mismatch")
+        reference = ApprovalReference.create(
+            provider=payload.provider,
+            session_id=payload.session_id,
+            thread_id=payload.thread_id,
+            turn_id=payload.turn_id,
+            item_id=payload.item_id,
+            approval_id=payload.approval_id,
+            call_id=payload.call_id,
+            one_shot_id=payload.one_shot_id,
+            command_hash=payload.command_hash,
+        )
+        record = await self.approvals.get(reference)
+        if payload.background and record.requested_permission != "background_service":
+            raise ApprovalIntegrityError("approval_integrity_mismatch")
         return await self.executor.execute(
-            intent,
+            record.intent,
             background=payload.background,
             port=payload.port,
             health_url=payload.health_url,
@@ -959,8 +1007,22 @@ class ApprovalDecisionRequest(BaseModel):
     approval_id: str | None = Field(default=None, max_length=256)
 
 
-class ApprovalExecuteRequest(ApprovalCommandRequest):
-    """Execution parameters; command identity must match the approved record."""
+class ApprovalExecuteRequest(BaseModel):
+    """Full immutable approval reference plus process execution options."""
+
+    provider: str = Field(default="codex_cli", pattern=r"^(?:codex_cli|claude_cli)$")
+    session_id: str = Field(min_length=1, max_length=256)
+    call_id: str = Field(min_length=1, max_length=256)
+    thread_id: str | None = Field(default=None, max_length=256)
+    turn_id: str | None = Field(default=None, max_length=256)
+    item_id: str | None = Field(default=None, max_length=256)
+    approval_id: str | None = Field(default=None, max_length=256)
+    one_shot_id: str = Field(min_length=1, max_length=128)
+    command_hash: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
 
     background: bool = False
     port: int | None = Field(default=None, ge=1, le=65535)
@@ -1101,6 +1163,30 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_error_handler(
+    request: Request, exc: RequestValidationError
+) -> Response:
+    """Keep missing or malformed approval references fail-closed and uniform."""
+    path = request.url.path.rstrip("/")
+    identity_fields = {"one_shot_id", "command_hash"}
+    if path.endswith("/execute") and any(
+        error.get("loc", ()) and error["loc"][-1] in identity_fields
+        for error in exc.errors()
+    ):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "approval_integrity_mismatch",
+                    "message": "approval_integrity_mismatch",
+                }
+            },
+        )
+    return await request_validation_exception_handler(request, exc)
+
+
 # CORS中间件
 app.add_middleware(
     CORSMiddleware,
@@ -1180,12 +1266,19 @@ async def get_approval(
         default="codex_cli",
         pattern=r"^(?:codex_cli|claude_cli)$",
     ),
+    command_hash: str | None = Query(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    ),
 ):
     try:
         record = await service.get_approval(
             session_id,
             call_id,
             provider=provider,
+            command_hash=command_hash,
         )
     except (ApprovalIntegrityError, ValueError) as exc:
         return _approval_error_response(exc)
@@ -1387,7 +1480,7 @@ async def start_sop_run(request: StartSopRunRequest):
         sop_run_id=sop_run.id,
         goal_id=goal.id,
         status=sop_run.status.value,
-        started_at=sop_run.started_at,
+        started_at=sop_run.started_at or goal.created_at,
     )
 
 
