@@ -106,6 +106,7 @@ class ReviewStatus(StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     CHANGES_REQUESTED = "changes_requested"
+    POLICY_BLOCKED = "policy_blocked"  # Engine policy gate (e.g. evidence) rejected the outcome
 
 
 class HandoffStatus(StrEnum):
@@ -390,6 +391,13 @@ class Review(BaseModel):
     reviewed_task_id: str | None = None
     reviewed_artifact_id: str | None = None
     reviewed_attempt_id: str | None = None  # schema v2: Attempt that was reviewed
+    # schema v3 (evidence gate): the artifacts this review actually validated
+    reviewed_artifact_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    # Reviewer outcome vs Engine policy decision are kept SEPARATE so a policy
+    # rejection never rewrites what the Reviewer actually said.
+    reviewer_output: str | None = None
+    policy_decision: str | None = None
     review_request_handoff_id: str | None = None
     correlation_id: str | None = None
     created_at: datetime = Field(default_factory=_now)

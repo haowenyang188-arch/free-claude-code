@@ -33,9 +33,9 @@ from workbench.backend.domain.models import (
     ValidationStatus,
 )
 from workbench.backend.persistence.store import JsonWorkflowStore
+from workbench.backend.workflow.adapter import RuntimeExecutionResult
 from workbench.backend.workflow.engine import (
     AcceptanceValidator,
-    SubagentRunner,
     WorkflowEngine,
 )
 from workbench.backend.workflow.orchestrator import AutoOrchestrator
@@ -52,75 +52,116 @@ class AcceptAll(AcceptanceValidator):
         )
 
 
-class PassRunner(SubagentRunner):
-    """Deterministic runner: plan -> implementation -> PASS review report."""
+class PassRunner:
+    """Deterministic adapter: plan -> DIFF+TEST_REPORT -> PASS review report."""
 
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def execute(self, *, task, assignment, context) -> Artifact:
+    async def execute(self, *, task, assignment, context) -> RuntimeExecutionResult:
         self.calls.append(task.role_id)
         if task.role_id == "claude":
-            return Artifact(
-                id=f"a-{task.id}",
-                task_id=task.id,
-                type=ArtifactType.PLAN,
-                content="plan",
+            return RuntimeExecutionResult(
+                artifacts=[
+                    Artifact(
+                        id=f"a-{task.id}",
+                        task_id=task.id,
+                        type=ArtifactType.PLAN,
+                        content="plan",
+                    )
+                ]
             )
         if task.role_id == "dsh":
-            return Artifact(
-                id=f"a-{task.id}",
-                task_id=task.id,
-                type=ArtifactType.IMPLEMENTATION,
-                content="implementation",
+            return RuntimeExecutionResult(
+                artifacts=[
+                    Artifact(
+                        id=f"diff-{task.id}",
+                        task_id=task.id,
+                        type=ArtifactType.DIFF,
+                        content="+feature",
+                    ),
+                    Artifact(
+                        id=f"test-{task.id}",
+                        task_id=task.id,
+                        type=ArtifactType.TEST_REPORT,
+                        content="PASS (5/5)",
+                    ),
+                ]
             )
-        return Artifact(
-            id=f"a-{task.id}",
-            task_id=task.id,
-            type=ArtifactType.REVIEW_REPORT,
-            content=json.dumps(
-                {
-                    "result": "PASS",
-                    "blocking": [],
-                    "non_blocking": [],
-                    "evidence": ["deterministic test"],
-                }
-            ),
+        return RuntimeExecutionResult(
+            artifacts=[
+                Artifact(
+                    id=f"a-{task.id}",
+                    task_id=task.id,
+                    type=ArtifactType.REVIEW_REPORT,
+                    content=json.dumps(
+                        {
+                            "result": "PASS",
+                            "blocking": [],
+                            "non_blocking": [],
+                            "evidence": ["deterministic test"],
+                        }
+                    ),
+                )
+            ]
         )
 
 
-class ReworkRunner(SubagentRunner):
-    """First review REWORK, second review PASS."""
+class ReworkRunner:
+    """First review REWORK, second review PASS (contract v2)."""
 
     def __init__(self) -> None:
         self._review_count = 0
 
-    async def execute(self, *, task, assignment, context) -> Artifact:
+    async def execute(self, *, task, assignment, context) -> RuntimeExecutionResult:
         if task.role_id == "claude":
-            return Artifact(
-                id=f"a-{task.id}", task_id=task.id, type=ArtifactType.PLAN, content="plan"
+            return RuntimeExecutionResult(
+                artifacts=[
+                    Artifact(
+                        id=f"a-{task.id}",
+                        task_id=task.id,
+                        type=ArtifactType.PLAN,
+                        content="plan",
+                    )
+                ]
             )
         if task.role_id == "dsh":
-            return Artifact(
-                id=f"a-{task.id}",
-                task_id=task.id,
-                type=ArtifactType.IMPLEMENTATION,
-                content="implementation",
+            return RuntimeExecutionResult(
+                artifacts=[
+                    Artifact(
+                        id=f"diff-{task.id}",
+                        task_id=task.id,
+                        type=ArtifactType.DIFF,
+                        content="+feature",
+                    ),
+                    Artifact(
+                        id=f"test-{task.id}",
+                        task_id=task.id,
+                        type=ArtifactType.TEST_REPORT,
+                        content="PASS (5/5)",
+                    ),
+                ]
             )
         self._review_count += 1
         result = "REWORK" if self._review_count == 1 else "PASS"
-        return Artifact(
-            id=f"a-{task.id}",
-            task_id=task.id,
-            type=ArtifactType.REVIEW_REPORT,
-            content=json.dumps(
-                {
-                    "result": result,
-                    "blocking": ["fix the edge case"] if result != "PASS" else [],
-                    "non_blocking": [],
-                    "evidence": ["deterministic test"],
-                }
-            ),
+        return RuntimeExecutionResult(
+            artifacts=[
+                Artifact(
+                    id=f"a-{task.id}",
+                    task_id=task.id,
+                    type=ArtifactType.REVIEW_REPORT,
+                    content=json.dumps(
+                        {
+                            "result": result,
+                            "blocking": ["fix the edge case"]
+                            if result != "PASS"
+                            else [],
+                            "non_blocking": [],
+                            "evidence": ["deterministic test"],
+                        }
+                    ),
+                )
+            ]
         )
 
 
@@ -170,7 +211,7 @@ def _resolvers():
             task_id=task.id,
             role_id=task.role_id,
             agent_instance_id="agent",
-            runtime_id="fake",
+            runtime_id=task.role_id,
         )
 
     def build_context(task, step) -> ContextPackage:
@@ -187,8 +228,11 @@ def _resolvers():
 @pytest.fixture
 def pass_engine(tmp_path):
     store = JsonWorkflowStore(tmp_path / "state.json", tmp_path / "events.jsonl")
+    runner = PassRunner()
     engine = WorkflowEngine(
-        store=store, runner=PassRunner(), validator=AcceptAll()
+        store=store,
+        runners={"claude": runner, "dsh": runner, "codex": runner},
+        validator=AcceptAll(),
     )
     return engine, store
 
@@ -260,7 +304,7 @@ async def test_full_loop_attempt_lineage(pass_engine):
 
     assert len(tasks) == 3
     assert len(attempts) == 3  # one Attempt per new task execution
-    assert len(artifacts) == 3
+    assert len(artifacts) == 4  # PLAN + (DIFF, TEST_REPORT) + REVIEW_REPORT
 
     by_task = {a["task_id"]: a for a in attempts}
     for task_dict in tasks:
@@ -270,6 +314,18 @@ async def test_full_loop_attempt_lineage(pass_engine):
     for art_dict in artifacts:
         assert art_dict["attempt_id"] is not None
         assert art_dict["attempt_id"] == by_task[art_dict["task_id"]]["id"]
+        assert art_dict["schema_version"] == 2
+
+    executor_artifacts = [
+        a
+        for a in artifacts
+        if a["task_id"] in {t["id"] for t in tasks if t["role_id"] == "dsh"}
+    ]
+    assert {a["type"] for a in executor_artifacts} >= {
+        ArtifactType.DIFF.value,
+        ArtifactType.TEST_REPORT.value,
+    }
+    assert len({a["attempt_id"] for a in executor_artifacts}) == 1
 
     assert len(reviews) == 1
     review = Review.model_validate(reviews[0])
@@ -283,7 +339,12 @@ async def test_full_loop_attempt_lineage(pass_engine):
 async def test_rework_links_attempts(tmp_path):
     """REWORK -> retry creates a fresh Attempt linked via previous_attempt_id."""
     store = JsonWorkflowStore(tmp_path / "state.json", tmp_path / "events.jsonl")
-    engine = WorkflowEngine(store=store, runner=ReworkRunner(), validator=AcceptAll())
+    rework_runner = ReworkRunner()
+    engine = WorkflowEngine(
+        store=store,
+        runners={"claude": rework_runner, "dsh": rework_runner, "codex": rework_runner},
+        validator=AcceptAll(),
+    )
     goal, sop = _sop()
     run = engine.start_sop_run(goal=goal, sop=sop)
     orchestrator = AutoOrchestrator(engine)
@@ -317,13 +378,15 @@ async def test_rework_links_attempts(tmp_path):
     assert len(reviews) == 2
     final_review = Review.model_validate(reviews[-1])
     assert final_review.status.value == "approved"
-    # Every NEW review must carry a reviewed_attempt_id bound to an executor
-    # attempt.  Note: the rework path currently feeds the reviewer both the old
-    # and the new artifact (accepted handoff accumulation); pinning the review
-    # to the CURRENT attempt's evidence is enforced by the Phase 3 evidence
-    # gate (reviewed_artifact_ids / evidence_ids), not by Phase 1.
-    assert final_review.reviewed_attempt_id is not None
-    assert final_review.reviewed_attempt_id in {a.id for a in executor_attempts}
+    assert final_review.reviewer_output == "PASS"
+    assert final_review.policy_decision == "APPROVED"
+    # Phase 3 current-attempt binding: the final review must pin the RETRY
+    # attempt's evidence, never the historical one.
+    assert final_review.reviewed_attempt_id == retry_attempt.id
+    assert set(final_review.evidence_ids) == {
+        f"diff-{retry_task['id']}",
+        f"test-{retry_task['id']}",
+    }
     assert retry_attempt.previous_attempt_id == original_attempt.id
 
 

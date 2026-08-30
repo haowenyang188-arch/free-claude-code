@@ -34,7 +34,13 @@ from ..domain.models import (
     ValidationResult,
     ValidationStatus,
 )
-from .role_contract import AgentRole, RouteTarget, apply_status, resolve_route
+from .role_contract import (
+    AgentRole,
+    ReviewVerdict,
+    RouteTarget,
+    apply_status,
+    resolve_route,
+)
 
 
 class WorkflowEngineError(RuntimeError):
@@ -473,8 +479,9 @@ class WorkflowEngine:
             )
             return ExecutionResult(task=task, artifact=artifact, validation=validation)
 
-        artifact.accepted = True
-        self.store.save_entity("artifacts", artifact)
+        for accepted_item in artifacts:
+            accepted_item.accepted = True
+            self.store.save_entity("artifacts", accepted_item)
         handoff: Handoff | None = None
         if step.requires_review and artifact.type is not ArtifactType.REVIEW_REPORT:
             self._set_status(task, "tasks", TaskStatus.ACCEPTED)
@@ -651,6 +658,28 @@ class WorkflowEngine:
             pass
         return review.feedback or "Review requires changes"
 
+    def _evidence_gate(self, review: Review) -> str | None:
+        """Return None when a PASS review's evidence is valid, else an error.
+
+        Only REVIEW_REPORT-based reviews are gateable; legacy review-request
+        reviews (created against the executor artifact before the reviewer
+        produced a report) bypass the gate - their reviewer report flow is
+        gated when it arrives via ensure_review_for_report.
+        """
+        try:
+            artifact = self._get_model("artifacts", review.artifact_id, Artifact)
+        except (KeyError, TypeError, ValueError):
+            return f"review artifact {review.artifact_id} is missing"
+        if artifact.type is not ArtifactType.REVIEW_REPORT:
+            return None
+        from .lineage import LineageError, validate_review_evidence
+
+        try:
+            validate_review_evidence(review=review, store=self.store)
+        except LineageError as exc:
+            return str(exc)
+        return None
+
     def _reviewed_task(self, review: Review) -> Task:
         """Resolve the execution task a review is judging.
 
@@ -743,19 +772,33 @@ class WorkflowEngine:
                     input_artifacts.append(input_artifact)
             except KeyError:
                 continue
-        for input_artifact in sorted(
-            input_artifacts,
-            key=lambda item: {
-                ArtifactType.IMPLEMENTATION: 0,
-                ArtifactType.DIFF: 1,
-                ArtifactType.TEST_REPORT: 2,
-                ArtifactType.PLAN: 3,
-                ArtifactType.REVIEW_REPORT: 4,
-            }.get(item.type, 5),
-        ):
-            reviewed_task_id = input_artifact.task_id
-            reviewed_artifact_id = input_artifact.id
-            break
+        # Bind the review to the CURRENT attempt: group input artifacts by
+        # task, pick the newest task (by its newest artifact), then the
+        # highest-priority artifact type within it.  Never guess the reviewed
+        # object from historical artifacts.
+        by_task: dict[str, list[Artifact]] = {}
+        for item in input_artifacts:
+            by_task.setdefault(item.task_id, []).append(item)
+        if by_task:
+            newest_task_id = max(
+                by_task,
+                key=lambda tid: max(
+                    (a.created_at for a in by_task[tid]), default=datetime.min
+                ),
+            )
+            for input_artifact in sorted(
+                by_task[newest_task_id],
+                key=lambda item: {
+                    ArtifactType.IMPLEMENTATION: 0,
+                    ArtifactType.DIFF: 1,
+                    ArtifactType.TEST_REPORT: 2,
+                    ArtifactType.PLAN: 3,
+                    ArtifactType.REVIEW_REPORT: 4,
+                }.get(item.type, 5),
+            ):
+                reviewed_task_id = input_artifact.task_id
+                reviewed_artifact_id = input_artifact.id
+                break
 
         # Preserve the request/reply chain when the reviewer was reached via a
         # Dispatcher handoff.  Match only accepted handoffs for this run and
@@ -812,6 +855,17 @@ class WorkflowEngine:
             reviewed_task_id=reviewed_task_id,
             reviewed_artifact_id=reviewed_artifact_id,
         )
+        reviewed_artifacts = [
+            item
+            for item in input_artifacts
+            if reviewed_task_id is not None and item.task_id == reviewed_task_id
+        ]
+        reviewed_artifact_ids = [item.id for item in reviewed_artifacts]
+        evidence_ids = [
+            item.id
+            for item in reviewed_artifacts
+            if item.type in {ArtifactType.DIFF, ArtifactType.TEST_REPORT}
+        ]
 
         review = Review(
             id=str(uuid.uuid4()),
@@ -821,6 +875,8 @@ class WorkflowEngine:
             reviewed_task_id=reviewed_task_id,
             reviewed_artifact_id=reviewed_artifact_id,
             reviewed_attempt_id=reviewed_attempt_id,
+            reviewed_artifact_ids=reviewed_artifact_ids,
+            evidence_ids=evidence_ids,
             review_request_handoff_id=review_request_handoff_id,
             correlation_id=correlation_id,
         )
@@ -1085,6 +1141,42 @@ class WorkflowEngine:
                     f"supplied review verdict {normalized!r} does not match "
                     f"artifact result {report_normalized!r}"
                 )
+        # Phase 3: preserve the reviewer's own outcome; the Engine policy
+        # decision is separate and never rewrites what the reviewer said.
+        review.reviewer_output = normalized
+        if normalized == ReviewVerdict.PASS.value:
+            gate_error = self._evidence_gate(review)
+            if gate_error is not None:
+                review.policy_decision = "BLOCKED"
+                review.feedback = (
+                    "Evidence gate failed: " + gate_error
+                    + "\n\nReviewer output: " + normalized
+                    + "\nOriginal feedback: " + (review.feedback or "(none)")
+                )
+                self._set_status(review, "reviews", ReviewStatus.POLICY_BLOCKED)
+                self.store.save_entity("reviews", review)
+                step_run = self._get_model(
+                    "step_runs",
+                    self._reviewed_task(review).step_run_id,
+                    StepRun,
+                )
+                self._emit(
+                    step_run.sop_run_id,
+                    "review_policy_blocked",
+                    {
+                        "review_id": review.id,
+                        "reviewer_output": normalized,
+                        "policy_decision": review.policy_decision,
+                        "reason": gate_error,
+                    },
+                )
+                self._refresh_run_status(step_run.sop_run_id)
+                return ReviewRouteDecision(
+                    step_run=step_run,
+                    route=RouteTarget.HUMAN,
+                    review_id=review.id,
+                )
+        self.store.save_entity("reviews", review)
         route = resolve_route(normalized, actor=AgentRole.SOP_ENGINE)
         feedback = self._extract_review_feedback(review)
         if route is RouteTarget.ADVANCE:
@@ -1099,6 +1191,9 @@ class WorkflowEngine:
                 },
             )
             step_run = self.approve_review(review_id)
+            approved = self._get_model("reviews", review_id, Review)
+            approved.policy_decision = "APPROVED"
+            self.store.save_entity("reviews", approved)
             return ReviewRouteDecision(
                 step_run=step_run, route=route, review_id=review.id
             )

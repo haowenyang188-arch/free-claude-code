@@ -292,6 +292,7 @@ class EngineCondition(str, Enum):
 
     EXECUTION_ERROR = "execution_error"
     PLAN_OBSOLETE = "plan_obsolete"
+    EVIDENCE_INCOMPLETE = "evidence_incomplete"
 
 
 class RouteTarget(str, Enum):
@@ -301,6 +302,7 @@ class RouteTarget(str, Enum):
     RERUN_EXECUTE = "rerun_execute"  # back to the executor with the same plan
     RETURN_TO_PLAN = "return_to_plan"  # back to the planner
     FAIL_RUN = "fail_run"            # terminal, no further routing
+    HUMAN = "human"                  # policy gate needs a human decision
 
 
 #: THE routing table.  Single source of truth: no agent and no test script may
@@ -311,6 +313,7 @@ REVIEW_ROUTING: dict[str, RouteTarget] = {
     ReviewVerdict.PLAN_INVALID.value: RouteTarget.RETURN_TO_PLAN,
     EngineCondition.EXECUTION_ERROR.value: RouteTarget.RERUN_EXECUTE,
     EngineCondition.PLAN_OBSOLETE.value: RouteTarget.RETURN_TO_PLAN,
+    EngineCondition.EVIDENCE_INCOMPLETE.value: RouteTarget.HUMAN,
 }
 
 
@@ -605,7 +608,7 @@ KNOWN_VIOLATIONS: frozenset[ContractViolation] = frozenset(
         ContractViolation(
             rule_id="RC-6",
             path="workbench/backend/main.py",
-            line=597,
+            line=601,
             why_open=f"{_FROZEN}; RUN_FINISHED maps 1:1 to RunStatus/TaskStatus "
             "COMPLETED, bypassing both the Engine and the Reviewer",
             routed_to=SESSION_COMMIT_GATE,
