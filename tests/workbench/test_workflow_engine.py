@@ -172,6 +172,7 @@ async def test_engine_runs_artifact_validation_and_handoff(tmp_path: Path) -> No
         "sop_started",
         "step_started",
         "task_created",
+        "attempt_created",
         "task_started",
         "artifact_created",
         "validation_completed",

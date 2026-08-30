@@ -2,23 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import uuid
-from abc import ABC, abstractmethod
-from typing import Any
+from datetime import UTC, datetime
 
-from .role_contract import (
-    AgentRole,
-    RouteTarget,
-    apply_status,
-    resolve_route,
-)
+from abc import ABC, abstractmethod
+from contextlib import suppress
+from dataclasses import dataclass
+from typing import Any
 
 from ..artifacts.store import FileArtifactStore
 from ..domain.models import (
     Artifact,
+    ArtifactType,
+    Attempt,
     ContextPackage,
     Goal,
     Handoff,
+    HandoffMessageType,
     HandoffStatus,
     Review,
     ReviewStatus,
@@ -34,6 +35,7 @@ from ..domain.models import (
     ValidationResult,
     ValidationStatus,
 )
+from .role_contract import AgentRole, RouteTarget, apply_status, resolve_route
 
 
 class WorkflowEngineError(RuntimeError):
@@ -62,6 +64,23 @@ class AcceptanceValidator(ABC):
         """Return a structured acceptance decision for an artifact."""
 
 
+@dataclass(frozen=True)
+class ReviewRouteDecision:
+    """Engine-owned result of applying one Codex review outcome.
+
+    ``decide_review`` keeps its historical tuple return shape for callers that
+    only need the step and route.  New orchestration code can use this richer
+    record to consume the Engine-authored handoff and audit target metadata.
+    """
+
+    step_run: StepRun
+    route: RouteTarget
+    review_id: str
+    target_step_id: str | None = None
+    handoff_id: str | None = None
+    rework_count: int = 0
+
+
 class WorkflowEngine:
     """Own SOP state transitions; never delegates scheduling decisions to agents."""
 
@@ -81,14 +100,102 @@ class WorkflowEngine:
         runner: SubagentRunner,
         validator: AcceptanceValidator,
         artifact_store: FileArtifactStore | None = None,
+        max_rework_attempts: int = 3,
     ) -> None:
+        if max_rework_attempts < 1:
+            raise ValueError("max_rework_attempts must be at least 1")
         self.store = store
         self.runner = runner
         self.validator = validator
         self.artifact_store = artifact_store
+        self.max_rework_attempts = max_rework_attempts
         self._sops: dict[str, SopDefinition] = {}
         self._goals: dict[str, Goal] = {}
         self._handoffs: dict[str, Handoff] = {}
+
+    def _current_attempt_for_task(self, task_id: str) -> Attempt | None:
+        """Latest Attempt for a task; None for legacy schema-v1 records."""
+        try:
+            attempts = [
+                Attempt.model_validate(item)
+                for item in self.store.list_entities("attempts")
+                if item.get("task_id") == task_id
+            ]
+        except (KeyError, AttributeError):
+            return None
+        if not attempts:
+            return None
+        return max(attempts, key=lambda attempt: attempt.sequence)
+
+    def _ensure_attempt_for_task(self, task: Task) -> Attempt:
+        """Return the current Attempt, creating a synthetic attempt #1 for
+        legacy snapshots that predate schema v2 (execute/read path only)."""
+        existing = self._current_attempt_for_task(task.id)
+        if existing is not None:
+            return existing
+        attempt = Attempt(
+            id=f"attempt_{task.id}_1",
+            task_id=task.id,
+            sequence=1,
+            status=task.status,
+        )
+        self.store.save_entity("attempts", attempt)
+        return attempt
+
+    def _create_attempt_for_task(self, task: Task) -> Attempt:
+        """Create the first Attempt for a newly created Task (schema v2 rule:
+        every new task execution MUST have an Attempt record)."""
+        attempt = Attempt(
+            id=f"attempt_{task.id}_1",
+            task_id=task.id,
+            sequence=1,
+            status=TaskStatus.PENDING,
+        )
+        self.store.save_entity("attempts", attempt)
+        return attempt
+
+    def _resolve_reviewed_attempt_id(
+        self, *, reviewed_task_id: str | None, reviewed_artifact_id: str | None
+    ) -> str | None:
+        """Bind a Review to the exact Attempt that produced the reviewed
+        artifact.  Falls back to the reviewed task's current Attempt; legacy
+        schema-v1 evidence has no attempt linkage (None)."""
+        if reviewed_artifact_id:
+            try:
+                reviewed_artifact = self._get_model(
+                    "artifacts", reviewed_artifact_id, Artifact
+                )
+            except (KeyError, TypeError, ValueError):
+                reviewed_artifact = None
+            if reviewed_artifact is not None and reviewed_artifact.attempt_id:
+                return reviewed_artifact.attempt_id
+        if reviewed_task_id:
+            attempt = self._current_attempt_for_task(reviewed_task_id)
+            if attempt is not None:
+                return attempt.id
+        return None
+
+    def _ensure_reviewed_attempt_id(
+        self, *, reviewed_task_id: str | None, reviewed_artifact_id: str | None
+    ) -> str | None:
+        """Like _resolve_reviewed_attempt_id but guarantees a value for
+        every NEW Review: when the reviewed evidence is legacy (no Attempt
+        record), materialize a synthetic attempt #1 for the reviewed task on
+        the legacy read path so the Review never carries None."""
+        attempt_id = self._resolve_reviewed_attempt_id(
+            reviewed_task_id=reviewed_task_id,
+            reviewed_artifact_id=reviewed_artifact_id,
+        )
+        if attempt_id is not None:
+            return attempt_id
+        if reviewed_task_id:
+            try:
+                reviewed_task = self._get_model("tasks", reviewed_task_id, Task)
+            except (KeyError, TypeError, ValueError):
+                return None
+            attempt = self._ensure_attempt_for_task(reviewed_task)
+            return attempt.id
+        return None
 
     def start_sop_run(self, *, goal: Goal, sop: SopDefinition) -> SopRun:
         steps = self._flatten_steps(sop)
@@ -159,6 +266,15 @@ class WorkflowEngine:
         step = self.step_definition(step_run.sop_run_id, step_run.step_id)
         if role_id != step.role_id:
             raise WorkflowEngineError("task role does not match SOP step role")
+        previous_task_id = step_run.task_id
+        previous_task: Task | None = None
+        if previous_task_id:
+            try:
+                previous_task = self._get_model("tasks", previous_task_id, Task)
+            except KeyError:
+                # Old snapshots may retain a task id without the task record;
+                # creating a fresh attempt remains safe in that case.
+                previous_task = None
         task = Task(
             id=str(uuid.uuid4()),
             step_run_id=step_run.id,
@@ -166,9 +282,15 @@ class WorkflowEngine:
             description=description or step.instructions,
             role_id=role_id,
             acceptance_criteria=list(step.acceptance_criteria),
+            retry_of=previous_task.id if previous_task is not None else None,
         )
         step_run.task_id = task.id
         self.store.save_entity("tasks", task)
+        attempt = self._create_attempt_for_task(task)
+        if previous_task is not None:
+            previous_attempt = self._ensure_attempt_for_task(previous_task)
+            attempt.previous_attempt_id = previous_attempt.id
+            self.store.save_entity("attempts", attempt)
         self.store.save_entity("step_runs", step_run)
         self._emit(
             step_run.sop_run_id,
@@ -179,6 +301,11 @@ class WorkflowEngine:
             step_run.sop_run_id,
             "task_created",
             {"task_id": task.id, "step_id": step_run.step_id},
+        )
+        self._emit(
+            step_run.sop_run_id,
+            "attempt_created",
+            {"attempt_id": attempt.id, "task_id": task.id, "sequence": attempt.sequence},
         )
         return task
 
@@ -201,21 +328,38 @@ class WorkflowEngine:
         task.context_package_id = context.id
         task.input_artifact_ids = list(context.artifact_ids)
         self._set_status(step_run, "step_runs", StepStatus.RUNNING)
+        attempt = self._ensure_attempt_for_task(task)
+        attempt.status = TaskStatus.RUNNING
+        attempt.started_at = datetime.now(UTC)
+        attempt.session_id = assignment.session_id
+        attempt.runtime_id = assignment.runtime_id
+        attempt.agent_instance_id = assignment.agent_instance_id
+        self.store.save_entity("attempts", attempt)
         self.store.save_entity("tasks", task)
         self.store.save_entity("step_runs", step_run)
         self.store.save_entity("contexts", context)
         self.store.save_entity("assignments", assignment)
         self._emit(
-            step_run.sop_run_id, "task_started", {"task_id": task.id, "attempt": 1}
+            step_run.sop_run_id,
+            "task_started",
+            {"task_id": task.id, "attempt": attempt.sequence},
         )
 
-        artifact = await self.runner.execute(
-            task=task, assignment=assignment, context=context
-        )
+        try:
+            artifact = await self.runner.execute(
+                task=task, assignment=assignment, context=context
+            )
+        except Exception:
+            attempt.status = TaskStatus.FAILED
+            attempt.completed_at = datetime.now(UTC)
+            self.store.save_entity("attempts", attempt)
+            raise
         artifact = artifact.model_copy(
             update={
                 "task_id": task.id,
                 "producer_step_run_id": step_run.id,
+                "attempt_id": attempt.id,
+                "schema_version": 2,
                 "accepted": False,
             }
         )
@@ -224,7 +368,8 @@ class WorkflowEngine:
             artifact = self.artifact_store.put(artifact, content)
         self.store.save_entity("artifacts", artifact)
         task.output_artifact_ids = [artifact.id]
-        step_run.output_artifact_ids = [artifact.id]
+        if artifact.id not in step_run.output_artifact_ids:
+            step_run.output_artifact_ids.append(artifact.id)
         self._set_status(task, "tasks", TaskStatus.VALIDATING)
         self._set_status(step_run, "step_runs", StepStatus.VALIDATING)
         self.store.save_entity("tasks", task)
@@ -254,6 +399,9 @@ class WorkflowEngine:
         if validation.status is not ValidationStatus.ACCEPTED:
             self._set_status(task, "tasks", TaskStatus.REJECTED)
             self._set_status(step_run, "step_runs", StepStatus.REJECTED)
+            attempt.status = TaskStatus.REJECTED
+            attempt.completed_at = datetime.now(UTC)
+            self.store.save_entity("attempts", attempt)
             self.store.save_entity("tasks", task)
             self.store.save_entity("step_runs", step_run)
             self._emit(
@@ -266,7 +414,7 @@ class WorkflowEngine:
         artifact.accepted = True
         self.store.save_entity("artifacts", artifact)
         handoff: Handoff | None = None
-        if step.requires_review:
+        if step.requires_review and artifact.type is not ArtifactType.REVIEW_REPORT:
             self._set_status(task, "tasks", TaskStatus.ACCEPTED)
             self._set_status(step_run, "step_runs", StepStatus.WAITING_REVIEW)
             review = Review(
@@ -274,6 +422,9 @@ class WorkflowEngine:
                 task_id=task.id,
                 artifact_id=artifact.id,
                 reviewer_role_id=step.role_id,
+                reviewed_task_id=task.id,
+                reviewed_artifact_id=artifact.id,
+                reviewed_attempt_id=attempt.id,
             )
             self.store.save_entity("reviews", review)
             self._emit(
@@ -281,11 +432,24 @@ class WorkflowEngine:
                 "review_requested",
                 {"review_id": review.id, "task_id": task.id},
             )
+        elif artifact.type is ArtifactType.REVIEW_REPORT:
+            # A review report is itself a gate.  Keep the reviewer step waiting
+            # until the Engine applies PASS/REWORK/PLAN_INVALID.
+            self._set_status(task, "tasks", TaskStatus.ACCEPTED)
+            self._set_status(step_run, "step_runs", StepStatus.WAITING_REVIEW)
+            self.ensure_review_for_report(
+                task=task,
+                artifact=artifact,
+                context=context,
+            )
         else:
             self._set_status(task, "tasks", TaskStatus.ACCEPTED)
             self._set_status(step_run, "step_runs", StepStatus.COMPLETED)
             self._emit(step_run.sop_run_id, "task_accepted", {"task_id": task.id})
             handoff = self._complete_step_and_create_handoff(step_run, task, step)
+        attempt.status = TaskStatus.ACCEPTED
+        attempt.completed_at = datetime.now(UTC)
+        self.store.save_entity("attempts", attempt)
         self.store.save_entity("tasks", task)
         self.store.save_entity("step_runs", step_run)
         self._refresh_run_status(step_run.sop_run_id)
@@ -300,18 +464,18 @@ class WorkflowEngine:
         handoff = self._get_model("handoffs", handoff_id, Handoff)
         if handoff.status is not HandoffStatus.READY:
             raise WorkflowEngineError("handoff is not ready for acceptance")
+        task = self._get_model("tasks", handoff.from_task_id, Task)
+        source_step = self._get_model("step_runs", task.step_run_id, StepRun)
+        target = self._find_target_step_run(source_step.sop_run_id, handoff.to_step_id)
+        if not self._dependencies_satisfied(target, candidate_handoff_id=handoff.id):
+            raise WorkflowEngineError(
+                "handoff accepted before all dependencies were satisfied"
+            )
         self._set_status(handoff, "handoffs", HandoffStatus.ACCEPTED)
         handoff.accepted_at = __import__("datetime").datetime.now(
             __import__("datetime").UTC
         )
         self.store.save_entity("handoffs", handoff)
-        task = self._get_model("tasks", handoff.from_task_id, Task)
-        source_step = self._get_model("step_runs", task.step_run_id, StepRun)
-        target = self._find_target_step_run(source_step.sop_run_id, handoff.to_step_id)
-        if not self._dependencies_satisfied(target):
-            raise WorkflowEngineError(
-                "handoff accepted before all dependencies were satisfied"
-            )
         self._set_status(target, "step_runs", StepStatus.READY)
         self.store.save_entity("step_runs", target)
         self._emit(
@@ -323,20 +487,52 @@ class WorkflowEngine:
         self._refresh_run_status(source_step.sop_run_id)
         return target
 
+    def _finalize_reviewer_step(
+        self, review: Review, *, create_handoff: bool
+    ) -> None:
+        """Close a dedicated reviewer step after its outcome is applied."""
+        reviewer_task = self._get_model("tasks", review.task_id, Task)
+        reviewed_task = self._reviewed_task(review)
+        if reviewer_task.id == reviewed_task.id:
+            return
+        reviewer_step_run = self._get_model(
+            "step_runs", reviewer_task.step_run_id, StepRun
+        )
+        if reviewer_step_run.status is StepStatus.COMPLETED:
+            return
+        reviewer_step = self.step_definition(
+            reviewer_step_run.sop_run_id, reviewer_step_run.step_id
+        )
+        self._set_status(reviewer_task, "tasks", TaskStatus.ACCEPTED)
+        self._set_status(reviewer_step_run, "step_runs", StepStatus.COMPLETED)
+        self.store.save_entity("tasks", reviewer_task)
+        self.store.save_entity("step_runs", reviewer_step_run)
+        if create_handoff:
+            self._complete_step_and_create_handoff(
+                reviewer_step_run, reviewer_task, reviewer_step
+            )
+
     def approve_review(self, review_id: str) -> StepRun:
         review = self._get_model("reviews", review_id, Review)
         if review.status is not ReviewStatus.PENDING:
             raise WorkflowEngineError("review is already decided")
         self._set_status(review, "reviews", ReviewStatus.APPROVED)
         self.store.save_entity("reviews", review)
-        task = self._get_model("tasks", review.task_id, Task)
+        task = self._reviewed_task(review)
         step_run = self._get_model("step_runs", task.step_run_id, StepRun)
         step = self.step_definition(step_run.sop_run_id, step_run.step_id)
         self._set_status(task, "tasks", TaskStatus.ACCEPTED)
-        self._set_status(step_run, "step_runs", StepStatus.COMPLETED)
+        was_completed = step_run.status is StepStatus.COMPLETED
+        if not was_completed:
+            self._set_status(step_run, "step_runs", StepStatus.COMPLETED)
         self.store.save_entity("tasks", task)
         self.store.save_entity("step_runs", step_run)
-        self._complete_step_and_create_handoff(step_run, task, step)
+        if not was_completed:
+            self._complete_step_and_create_handoff(step_run, task, step)
+        else:
+            self._unlock_dependents(step_run.sop_run_id, step.id)
+        with suppress(KeyError, TypeError, ValueError, WorkflowEngineError):
+            self._finalize_reviewer_step(review, create_handoff=True)
         self._emit(step_run.sop_run_id, "review_approved", {"review_id": review.id})
         self._refresh_run_status(step_run.sop_run_id)
         return step_run
@@ -348,7 +544,7 @@ class WorkflowEngine:
         self._set_status(review, "reviews", ReviewStatus.CHANGES_REQUESTED)
         review.feedback = feedback.strip()
         self.store.save_entity("reviews", review)
-        task = self._get_model("tasks", review.task_id, Task)
+        task = self._reviewed_task(review)
         step_run = self._get_model("step_runs", task.step_run_id, StepRun)
         self._set_status(task, "tasks", TaskStatus.REWORK)
         self._set_status(
@@ -358,11 +554,18 @@ class WorkflowEngine:
         )
         self.store.save_entity("tasks", task)
         self.store.save_entity("step_runs", step_run)
+        with suppress(KeyError, TypeError, ValueError, WorkflowEngineError):
+            self._finalize_reviewer_step(review, create_handoff=False)
         self._emit(
             step_run.sop_run_id,
             "review_rejected",
-            {"review_id": review.id, "feedback": review.feedback},
+            {
+                "review_id": review.id,
+                "task_id": task.id,
+                "feedback": review.feedback,
+            },
         )
+        self._refresh_run_status(step_run.sop_run_id)
         return step_run
 
     def _extract_review_feedback(self, review: Review) -> str:
@@ -372,59 +575,578 @@ class WorkflowEngine:
         Falls back to routing metadata if artifact parsing fails.
         """
         try:
-            import json
             artifact = self._get_model("artifacts", review.artifact_id, Artifact)
-            if artifact.content:
-                review_data = json.loads(artifact.content)
-                blocking = review_data.get("blocking", [])
-                if blocking:
-                    # Format blocking items as actionable feedback
+            data = json.loads(artifact.content or "")
+            if isinstance(data, dict):
+                blocking = data.get("blocking", [])
+                if isinstance(blocking, list) and blocking:
                     items = "\n".join(f"- {item}" for item in blocking)
                     return f"Review feedback - blocking issues:\n{items}"
-            # Fallback: use the verdict as minimal feedback
-            return review_data.get("result", "REWORK")
-        except (KeyError, json.JSONDecodeError, Exception):
-            # Safe fallback: return the verdict itself
-            return review.feedback or "Review requires changes"
+                result = data.get("result", data.get("verdict"))
+                if isinstance(result, str) and result.strip():
+                    return result.strip()
+        except (KeyError, OSError, TypeError, ValueError):
+            pass
+        return review.feedback or "Review requires changes"
 
-    def decide_review(self, review_id: str, *, verdict: str) -> tuple[StepRun, RouteTarget]:
-        """Route a review verdict through the Engine-owned routing table.
+    def _reviewed_task(self, review: Review) -> Task:
+        """Resolve the execution task a review is judging.
 
-        The destination is never chosen by the Reviewer and never chosen by a
-        calling script: :data:`role_contract.REVIEW_ROUTING` is the single
-        source of truth and only the Engine may resolve it.
+        New review records carry an explicit link. For legacy records, infer
+        the target from an artifact handed into the reviewer task.
         """
-        route = resolve_route(verdict, actor=AgentRole.SOP_ENGINE)
+        if review.reviewed_task_id:
+            try:
+                return self._get_model("tasks", review.reviewed_task_id, Task)
+            except KeyError:
+                pass
 
-        # Extract actual reviewer feedback from the Review artifact (blocking items)
-        review = self._get_model("reviews", review_id, Review)
-        feedback = self._extract_review_feedback(review)
+        reviewer_task = self._get_model("tasks", review.task_id, Task)
+        artifact_ids = list(reviewer_task.input_artifact_ids)
+        if not artifact_ids and reviewer_task.context_package_id:
+            try:
+                context = self._get_model(
+                    "contexts", reviewer_task.context_package_id, ContextPackage
+                )
+            except KeyError:
+                context = None
+            if context is not None:
+                artifact_ids = list(context.artifact_ids)
+        candidate_artifacts: list[Artifact] = []
+        for artifact_id in artifact_ids:
+            try:
+                artifact = self._get_model("artifacts", artifact_id, Artifact)
+                if artifact.task_id != reviewer_task.id:
+                    candidate_artifacts.append(artifact)
+            except KeyError:
+                continue
+        priority = {
+            ArtifactType.IMPLEMENTATION: 0,
+            ArtifactType.DIFF: 1,
+            ArtifactType.TEST_REPORT: 2,
+            ArtifactType.PLAN: 3,
+            ArtifactType.REVIEW_REPORT: 4,
+        }
+        for artifact in sorted(
+            candidate_artifacts,
+            key=lambda item: priority.get(item.type, 5),
+        ):
+            try:
+                return self._get_model("tasks", artifact.task_id, Task)
+            except KeyError:
+                continue
 
-        if route is RouteTarget.ADVANCE:
-            return self.approve_review(review_id), route
-        if route is RouteTarget.RERUN_EXECUTE:
-            return (
-                self.reject_review(review_id, feedback=feedback),
-                route,
+        # A caller may provide a minimal ContextPackage that omits artifact
+        # ids.  For a dedicated review step, the SOP dependency graph still
+        # identifies the execution attempt being reviewed.
+        try:
+            reviewer_step_run = self._get_model(
+                "step_runs", reviewer_task.step_run_id, StepRun
             )
+            reviewer_step = self.step_definition(
+                reviewer_step_run.sop_run_id, reviewer_step_run.step_id
+            )
+            for dependency in reversed(reviewer_step.depends_on):
+                dependency_run = self._find_target_step_run(
+                    reviewer_step_run.sop_run_id, dependency
+                )
+                if dependency_run.task_id:
+                    return self._get_model("tasks", dependency_run.task_id, Task)
+        except (KeyError, TypeError, ValueError, WorkflowEngineError):
+            pass
+        return reviewer_task
+
+    def ensure_review_for_report(
+        self,
+        *,
+        task: Task,
+        artifact: Artifact,
+        context: ContextPackage,
+    ) -> Review:
+        """Persist a Review when a Codex task emits a structured report."""
+        for item in self.store.list_entities("reviews"):
+            existing = Review.model_validate(item)
+            if existing.artifact_id == artifact.id:
+                return existing
+
+        reviewed_task_id: str | None = None
+        reviewed_artifact_id: str | None = None
+        review_request_handoff_id: str | None = None
+        correlation_id: str | None = None
+        input_artifacts: list[Artifact] = []
+        for artifact_id in context.artifact_ids:
+            try:
+                input_artifact = self._get_model("artifacts", artifact_id, Artifact)
+                if input_artifact.task_id != task.id:
+                    input_artifacts.append(input_artifact)
+            except KeyError:
+                continue
+        for input_artifact in sorted(
+            input_artifacts,
+            key=lambda item: {
+                ArtifactType.IMPLEMENTATION: 0,
+                ArtifactType.DIFF: 1,
+                ArtifactType.TEST_REPORT: 2,
+                ArtifactType.PLAN: 3,
+                ArtifactType.REVIEW_REPORT: 4,
+            }.get(item.type, 5),
+        ):
+            reviewed_task_id = input_artifact.task_id
+            reviewed_artifact_id = input_artifact.id
+            break
+
+        # Preserve the request/reply chain when the reviewer was reached via a
+        # Dispatcher handoff.  Match only accepted handoffs for this run and
+        # this task's input artifacts.
+        task_step_run = self._get_model("step_runs", task.step_run_id, StepRun)
+        try:
+            handoffs = self.store.list_entities("handoffs")
+        except (KeyError, AttributeError):
+            handoffs = []
+        for item in handoffs:
+            if item.get("to_step_id") != task_step_run.step_id or item.get(
+                "status"
+            ) != HandoffStatus.ACCEPTED.value:
+                continue
+            if set(item.get("artifact_ids", [])) & set(context.artifact_ids):
+                review_request_handoff_id = item.get("id")
+                correlation_id = item.get("correlation_id")
+
+        if review_request_handoff_id is None:
+            # Minimal builders may omit artifact ids. Recover the latest
+            # accepted handoff addressed to this review step in the same run.
+            for item in handoffs:
+                if item.get("to_step_id") != task_step_run.step_id or item.get(
+                    "status"
+                ) != HandoffStatus.ACCEPTED.value:
+                    continue
+                try:
+                    source_task = self._get_model(
+                        "tasks", item["from_task_id"], Task
+                    )
+                    source_step = self._get_model(
+                        "step_runs", source_task.step_run_id, StepRun
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if source_step.sop_run_id == task_step_run.sop_run_id:
+                    review_request_handoff_id = item.get("id")
+                    correlation_id = item.get("correlation_id")
+        if reviewed_task_id is None:
+            inferred = self._reviewed_task(
+                Review(
+                    id="_pending",
+                    task_id=task.id,
+                    artifact_id=artifact.id,
+                    reviewer_role_id=task.role_id,
+                )
+            )
+            if inferred.id != task.id:
+                reviewed_task_id = inferred.id
+                if inferred.output_artifact_ids:
+                    reviewed_artifact_id = inferred.output_artifact_ids[-1]
+
+        reviewed_attempt_id = self._ensure_reviewed_attempt_id(
+            reviewed_task_id=reviewed_task_id,
+            reviewed_artifact_id=reviewed_artifact_id,
+        )
+
+        review = Review(
+            id=str(uuid.uuid4()),
+            task_id=task.id,
+            artifact_id=artifact.id,
+            reviewer_role_id=task.role_id,
+            reviewed_task_id=reviewed_task_id,
+            reviewed_artifact_id=reviewed_artifact_id,
+            reviewed_attempt_id=reviewed_attempt_id,
+            review_request_handoff_id=review_request_handoff_id,
+            correlation_id=correlation_id,
+        )
+        self.store.save_entity("reviews", review)
+        self._emit(
+            self._get_model("step_runs", task.step_run_id, StepRun).sop_run_id,
+            "review_requested",
+            {
+                "review_id": review.id,
+                "task_id": task.id,
+                "reviewed_task_id": reviewed_task_id,
+            },
+        )
+        return review
+
+    # Compatibility alias for early routing prototypes.
+    _ensure_review_for_report = ensure_review_for_report
+
+    def _review_artifact_data(
+        self,
+        review: Review,
+        *,
+        allow_legacy_artifact: bool = False,
+    ) -> dict[str, Any] | None:
+        """Load a structured Codex report, if the artifact still exists."""
+        try:
+            artifact = self._get_model("artifacts", review.artifact_id, Artifact)
+        except KeyError:
+            return None
+        if artifact.type is not ArtifactType.REVIEW_REPORT:
+            if allow_legacy_artifact:
+                return None
+            raise WorkflowEngineError(
+                f"review artifact {artifact.id} must have type review_report"
+            )
+        try:
+            data = json.loads(artifact.content or "")
+        except (TypeError, ValueError) as exc:
+            raise WorkflowEngineError(
+                f"review artifact {artifact.id} is not valid JSON"
+            ) from exc
+        if not isinstance(data, dict):
+            raise WorkflowEngineError(
+                f"review artifact {artifact.id} must contain a JSON object"
+            )
+        result = data.get("result", data.get("verdict"))
+        if not isinstance(result, str) or result.strip().upper() not in {
+            "PASS",
+            "REWORK",
+            "PLAN_INVALID",
+        }:
+            raise WorkflowEngineError(
+                f"review artifact {artifact.id} has an invalid result"
+            )
+        for field in ("blocking", "non_blocking", "evidence"):
+            values = data.get(field, [])
+            if not isinstance(values, list) or not all(
+                isinstance(value, str) for value in values
+            ):
+                raise WorkflowEngineError(
+                    f"review artifact {artifact.id} field {field!r} must be a list of strings"
+                )
+        if result.strip().upper() != "PASS" and not data.get("blocking"):
+            raise WorkflowEngineError(
+                f"review artifact {artifact.id} requires blocking items for {result!r}"
+            )
+        return data
+
+    @staticmethod
+    def _normalise_verdict(value: object) -> str:
+        raw = getattr(value, "value", value)
+        if not isinstance(raw, str) or not raw.strip():
+            raise WorkflowEngineError("review verdict is required")
+        return raw.strip().upper()
+
+    def _resolve_plan_target(self, sop_run_id: str, reviewed_step_id: str) -> str:
+        """Resolve the planner step for a PLAN_INVALID review."""
+        sop = self._require_sop(sop_run_id)
+        steps = self._flatten_steps(sop)
+        metadata = sop.metadata.get("review_route_targets", {})
+        if isinstance(metadata, dict):
+            for key in (reviewed_step_id, "PLAN_INVALID", "plan_invalid", "plan"):
+                target = metadata.get(key)
+                if isinstance(target, str) and target in steps:
+                    return target
+
+        ancestors: set[str] = set()
+
+        def collect(step_id: str) -> None:
+            for dependency in steps[step_id].depends_on:
+                if dependency not in ancestors:
+                    ancestors.add(dependency)
+                    collect(dependency)
+
+        collect(reviewed_step_id)
+        if not ancestors:
+            plan_steps = [
+                step_id
+                for step_id, step in steps.items()
+                if step.output_type is ArtifactType.PLAN and step_id != reviewed_step_id
+            ]
+            if len(plan_steps) == 1:
+                return plan_steps[0]
+            return reviewed_step_id
+
+        def score(step_id: str) -> tuple[int, int, str]:
+            step = steps[step_id]
+            text = " ".join((step_id, step.name, step.role_id, step.instructions)).lower()
+            output_is_plan = int(step.output_type is ArtifactType.PLAN)
+            keyword = int(any(word in text for word in ("plan", "planner", "claude")))
+            root = int(not step.depends_on)
+            return output_is_plan, keyword + root, step_id
+
+        return max(ancestors, key=score)
+
+    def _route_target_step_id(self, route: RouteTarget, reviewed_task: Task) -> str:
+        reviewed_step = self._get_model("step_runs", reviewed_task.step_run_id, StepRun)
+        try:
+            sop = self._require_sop(reviewed_step.sop_run_id)
+            steps = self._flatten_steps(sop)
+            metadata = sop.metadata.get("review_route_targets", {})
+            if isinstance(metadata, dict):
+                keys = (
+                    reviewed_step.step_id,
+                    route.name,
+                    route.value,
+                    route.value.upper(),
+                )
+                for key in keys:
+                    target = metadata.get(key)
+                    if isinstance(target, str) and target in steps:
+                        return target
+        except (KeyError, TypeError, ValueError, WorkflowEngineError):
+            pass
+        if route is RouteTarget.RERUN_EXECUTE:
+            return reviewed_step.step_id
         if route is RouteTarget.RETURN_TO_PLAN:
-            task = self._get_model("tasks", review.task_id, Task)
-            step_run = self._get_model("step_runs", task.step_run_id, StepRun)
+            try:
+                return self._resolve_plan_target(
+                    reviewed_step.sop_run_id, reviewed_step.step_id
+                )
+            except (KeyError, TypeError, ValueError, WorkflowEngineError):
+                # Legacy snapshots may not contain a reconstructable SOP graph;
+                # keep the route fail-safe by retrying the reviewed step.
+                return reviewed_step.step_id
+        raise WorkflowEngineError(f"route {route.value} has no rework target")
+
+    def _effective_rework_limit(self, step: StepDefinition) -> int:
+        # Keep legacy ``retry_limit=0`` definitions safe via the Engine cap.
+        return step.retry_limit if step.retry_limit > 0 else self.max_rework_attempts
+
+    def _descendant_step_ids(self, sop_run_id: str, root_step_id: str) -> set[str]:
+        steps = self._flatten_steps(self._require_sop(sop_run_id))
+        descendants: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for step_id, step in steps.items():
+                if step_id in descendants:
+                    continue
+                if root_step_id in step.depends_on or any(
+                    dependency in descendants for dependency in step.depends_on
+                ):
+                    descendants.add(step_id)
+                    changed = True
+        return descendants
+
+    def _prepare_route_target(self, target: StepRun) -> None:
+        affected = {target.step_id} | self._descendant_step_ids(
+            target.sop_run_id, target.step_id
+        )
+        for item in self.store.list_entities("step_runs"):
+            if item.get("sop_run_id") != target.sop_run_id:
+                continue
+            step_id = item.get("step_id")
+            if step_id not in affected:
+                continue
+            step_run = StepRun.model_validate(item)
+            desired = StepStatus.READY if step_id == target.step_id else StepStatus.PENDING
+            if step_run.status is not desired:
+                self._set_status(step_run, "step_runs", desired)
+                self.store.save_entity("step_runs", step_run)
+
+    def _create_review_route_handoff(
+        self,
+        *,
+        review: Review,
+        target_step_id: str,
+        message_type: HandoffMessageType,
+        feedback: str,
+        correlation_id: str | None,
+    ) -> Handoff:
+        reviewer_task = self._get_model("tasks", review.task_id, Task)
+        source_step = self._get_model("step_runs", reviewer_task.step_run_id, StepRun)
+        artifact_ids = [review.artifact_id]
+        if review.reviewed_artifact_id and review.reviewed_artifact_id not in artifact_ids:
+            artifact_ids.append(review.reviewed_artifact_id)
+        handoff = Handoff(
+            id=str(uuid.uuid4()),
+            from_task_id=reviewer_task.id,
+            to_step_id=target_step_id,
+            artifact_ids=artifact_ids,
+            brief=feedback,
+            status=HandoffStatus.READY,
+            message_type=message_type,
+            reply_to_handoff_id=review.review_request_handoff_id,
+            correlation_id=(
+                correlation_id
+                or review.correlation_id
+                or review.review_request_handoff_id
+                or review.id
+            ),
+        )
+        self._handoffs[handoff.id] = handoff
+        with suppress(KeyError, AttributeError):
+            self.store.save_entity("handoffs", handoff)
+        self._emit(
+            source_step.sop_run_id,
+            "handoff_created",
+            {
+                "handoff_id": handoff.id,
+                "message_type": message_type.value,
+                "to_step_id": target_step_id,
+                "review_id": review.id,
+            },
+        )
+        return handoff
+
+    def apply_review_outcome(
+        self,
+        review_id: str,
+        *,
+        verdict: str | None = None,
+        correlation_id: str | None = None,
+        _allow_legacy_missing_artifact: bool = False,
+        _allow_legacy_artifact: bool = False,
+    ) -> ReviewRouteDecision:
+        """Apply a Codex outcome and stage the Engine-owned next handoff."""
+        review = self._get_model("reviews", review_id, Review)
+        if review.status is not ReviewStatus.PENDING:
+            raise WorkflowEngineError("review is already decided")
+        data = self._review_artifact_data(
+            review, allow_legacy_artifact=_allow_legacy_artifact
+        )
+        if data is None and not _allow_legacy_missing_artifact and not _allow_legacy_artifact:
+            raise WorkflowEngineError(
+                f"review artifact {review.artifact_id} is missing or unstructured"
+            )
+        report_verdict = None if data is None else data.get("result", data.get("verdict"))
+        if data is not None and (
+            not isinstance(report_verdict, str) or not report_verdict.strip()
+        ):
+            raise WorkflowEngineError(
+                f"review artifact {review.artifact_id} has no result"
+            )
+        supplied = self._normalise_verdict(verdict) if verdict is not None else None
+        normalized = supplied or self._normalise_verdict(report_verdict)
+        if report_verdict is not None:
+            report_normalized = self._normalise_verdict(report_verdict)
+            if normalized != report_normalized:
+                raise WorkflowEngineError(
+                    f"supplied review verdict {normalized!r} does not match "
+                    f"artifact result {report_normalized!r}"
+                )
+        route = resolve_route(normalized, actor=AgentRole.SOP_ENGINE)
+        feedback = self._extract_review_feedback(review)
+        if route is RouteTarget.ADVANCE:
+            step_run = self._get_model("step_runs", self._reviewed_task(review).step_run_id, StepRun)
             self._emit(
                 step_run.sop_run_id,
-                "plan_invalid",
+                "review_routed",
                 {
                     "review_id": review.id,
-                    "task_id": task.id,
+                    "verdict": normalized,
                     "route": route.value,
-                    "verdict": str(verdict),
                 },
             )
-            return (
-                self.reject_review(review_id, feedback=feedback),
-                route,
+            step_run = self.approve_review(review_id)
+            return ReviewRouteDecision(
+                step_run=step_run, route=route, review_id=review.id
             )
-        raise WorkflowEngineError(f"unroutable verdict {verdict!r} -> {route.value}")
+
+        reviewed_task = self._reviewed_task(review)
+        target_step_id = self._route_target_step_id(route, reviewed_task)
+        reviewed_step = self._get_model("step_runs", reviewed_task.step_run_id, StepRun)
+        target = self._find_target_step_run(reviewed_step.sop_run_id, target_step_id)
+        try:
+            target_step = self.step_definition(target.sop_run_id, target.step_id)
+        except (KeyError, TypeError, ValueError, WorkflowEngineError):
+            target_step = None
+        limit = (
+            self._effective_rework_limit(target_step)
+            if target_step is not None
+            else self.max_rework_attempts
+        )
+        if target.rework_count >= limit:
+            self.reject_review(review_id, feedback=feedback)
+            self._set_status(target, "step_runs", StepStatus.FAILED)
+            self.store.save_entity("step_runs", target)
+            run = self._get_model("sop_runs", target.sop_run_id, SopRun)
+            self._set_status(run, "sop_runs", SopRunStatus.FAILED)
+            self.store.save_entity("sop_runs", run)
+            self._emit(
+                target.sop_run_id,
+                "rework_exhausted",
+                {
+                    "review_id": review.id,
+                    "target_step_id": target.step_id,
+                    "rework_count": target.rework_count,
+                },
+            )
+            return ReviewRouteDecision(
+                step_run=target,
+                route=RouteTarget.FAIL_RUN,
+                review_id=review.id,
+                target_step_id=target.step_id,
+                rework_count=target.rework_count,
+            )
+
+        self.reject_review(review_id, feedback=feedback)
+        target = self._find_target_step_run(target.sop_run_id, target_step_id)
+        if target.task_id and target.task_id != reviewed_task.id:
+            with suppress(KeyError, TypeError, ValueError):
+                target_task = self._get_model("tasks", target.task_id, Task)
+                if target_task.status is not TaskStatus.REWORK:
+                    self._set_status(target_task, "tasks", TaskStatus.REWORK)
+                    self.store.save_entity("tasks", target_task)
+        target.rework_count += 1
+        try:
+            self._prepare_route_target(target)
+        except (KeyError, TypeError, ValueError, WorkflowEngineError):
+            # Preserve compatibility with pre-routing snapshots that only have
+            # a StepRun record and no valid definition snapshot.
+            self._set_status(target, "step_runs", StepStatus.READY)
+        self.store.save_entity("step_runs", target)
+        message_type = (
+            HandoffMessageType.REWORK
+            if route is RouteTarget.RERUN_EXECUTE
+            else HandoffMessageType.PLAN_INVALID
+        )
+        handoff = self._create_review_route_handoff(
+            review=review,
+            target_step_id=target_step_id,
+            message_type=message_type,
+            feedback=feedback,
+            correlation_id=correlation_id,
+        )
+        self._emit(
+            target.sop_run_id,
+            "review_routed",
+            {
+                "review_id": review.id,
+                "verdict": normalized,
+                "route": route.value,
+                "target_step_id": target_step_id,
+                "handoff_id": handoff.id,
+                "rework_count": target.rework_count,
+                "correlation_id": handoff.correlation_id,
+            },
+        )
+        self._refresh_run_status(target.sop_run_id)
+        return ReviewRouteDecision(
+            step_run=target,
+            route=route,
+            review_id=review.id,
+            target_step_id=target_step_id,
+            handoff_id=handoff.id,
+            rework_count=target.rework_count,
+        )
+
+    def decide_review(
+        self, review_id: str, *, verdict: str | None = None
+    ) -> tuple[StepRun, RouteTarget]:
+        """Backward-compatible tuple wrapper around ``apply_review_outcome``."""
+        review = self._get_model("reviews", review_id, Review)
+        legacy_step: StepRun | None = None
+        try:
+            reviewer_task = self._get_model("tasks", review.task_id, Task)
+            legacy_step = self._get_model("step_runs", reviewer_task.step_run_id, StepRun)
+        except (KeyError, TypeError, ValueError):
+            pass
+        decision = self.apply_review_outcome(
+            review_id,
+            verdict=verdict,
+            _allow_legacy_missing_artifact=True,
+            _allow_legacy_artifact=True,
+        )
+        return legacy_step or decision.step_run, decision.route
 
     def retry_task(self, task_id: str) -> Task:
         previous = self._get_model("tasks", task_id, Task)
@@ -435,7 +1157,13 @@ class WorkflowEngine:
             TaskStatus.REWORK,
         }:
             raise WorkflowEngineError("only failed or rejected tasks can be retried")
+        step = self.step_definition(step_run.sop_run_id, step_run.step_id)
+        if step_run.rework_count >= self._effective_rework_limit(step):
+            raise WorkflowEngineError(
+                f"retry limit exhausted for step {step_run.step_id}"
+            )
         self._set_status(step_run, "step_runs", StepStatus.READY)
+        step_run.rework_count += 1
         retry = previous.model_copy(
             update={
                 "id": str(uuid.uuid4()),
@@ -446,12 +1174,22 @@ class WorkflowEngine:
                 "context_package_id": None,
             }
         )
+        step_run.task_id = retry.id
         self.store.save_entity("step_runs", step_run)
         self.store.save_entity("tasks", retry)
+        attempt = self._create_attempt_for_task(retry)
+        previous_attempt = self._ensure_attempt_for_task(previous)
+        attempt.previous_attempt_id = previous_attempt.id
+        self.store.save_entity("attempts", attempt)
         self._emit(
             step_run.sop_run_id,
             "task_retry_ready",
             {"task_id": retry.id, "retry_of": previous.id},
+        )
+        self._emit(
+            step_run.sop_run_id,
+            "attempt_created",
+            {"attempt_id": attempt.id, "task_id": retry.id, "sequence": attempt.sequence},
         )
         return retry
 
@@ -492,7 +1230,9 @@ class WorkflowEngine:
                 self.store.save_entity("step_runs", target)
                 self._emit(sop_run_id, "step_ready", {"step_id": target.step_id})
 
-    def _dependencies_satisfied(self, target: StepRun) -> bool:
+    def _dependencies_satisfied(
+        self, target: StepRun, *, candidate_handoff_id: str | None = None
+    ) -> bool:
         step = self.step_definition(target.sop_run_id, target.step_id)
         for dependency in step.depends_on:
             source = self._find_target_step_run(target.sop_run_id, dependency)
@@ -504,7 +1244,10 @@ class WorkflowEngine:
                     Handoff.model_validate(item)
                     for item in self.store.list_entities("handoffs")
                     if item.get("to_step_id") == target.step_id
-                    and item.get("status") == HandoffStatus.ACCEPTED.value
+                    and (
+                        item.get("status") == HandoffStatus.ACCEPTED.value
+                        or item.get("id") == candidate_handoff_id
+                    )
                     and self._task_belongs_to_step(item["from_task_id"], source.id)
                 ]
                 if not handoffs:
@@ -525,7 +1268,11 @@ class WorkflowEngine:
             for item in self.store.list_entities("step_runs")
             if item.get("sop_run_id") == sop_run_id
         ]
-        if steps and all(item.status is StepStatus.COMPLETED for item in steps):
+        if run.status is SopRunStatus.FAILED or any(
+            item.status is StepStatus.FAILED for item in steps
+        ):
+            self._set_status(run, "sop_runs", SopRunStatus.FAILED)
+        elif steps and all(item.status is StepStatus.COMPLETED for item in steps):
             self._set_status(run, "sop_runs", SopRunStatus.COMPLETED)
         elif any(item.status is StepStatus.WAITING_REVIEW for item in steps):
             self._set_status(run, "sop_runs", SopRunStatus.WAITING_REVIEW)
@@ -539,6 +1286,8 @@ class WorkflowEngine:
                 self._emit(sop_run_id, "sop_completed", {"sop_run_id": sop_run_id})
             elif run.status is SopRunStatus.WAITING_REVIEW:
                 self._emit(sop_run_id, "sop_waiting_review", {"sop_run_id": sop_run_id})
+            elif run.status is SopRunStatus.FAILED:
+                self._emit(sop_run_id, "sop_failed", {"sop_run_id": sop_run_id})
 
     def _find_target_step_run(self, sop_run_id: str, step_id: str) -> StepRun:
         for item in self.store.list_entities("step_runs"):

@@ -276,6 +276,9 @@ class StepRun(BaseModel):
     status: StepStatus = StepStatus.PENDING
     task_id: str | None = None
     output_artifact_ids: list[str] = Field(default_factory=list)
+    # Number of Engine-directed rework attempts for this step.  The counter is
+    # durable so a process restart cannot reset the retry budget.
+    rework_count: int = 0
 
 
 class Task(BaseModel):
@@ -291,6 +294,35 @@ class Task(BaseModel):
     output_artifact_ids: list[str] = Field(default_factory=list)
     related_run_ids: list[str] = Field(default_factory=list)
     retry_of: str | None = None
+
+
+class Attempt(BaseModel):
+    """Single execution attempt of a Task (schema v2).
+
+    A Task may own multiple Attempts when the Engine routes a rework.  Each
+    Attempt produces its own Artifact set; Artifact.attempt_id and
+    Review.reviewed_attempt_id bind evidence to the exact Attempt that was
+    executed/reviewed.  Records predating schema v2 keep those fields None
+    and are attributed to a synthetic attempt #1 on the legacy read path.
+    """
+
+    id: str
+    task_id: str
+    sequence: int = 1  # 1-indexed attempt counter (1, 2, 3, ...)
+    status: TaskStatus = TaskStatus.PENDING
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+    # Execution context snapshot
+    session_id: str | None = None
+    runtime_id: str | None = None
+    agent_instance_id: str | None = None
+
+    # Rework linkage
+    previous_attempt_id: str | None = None
+    rework_reason: str | None = None
+
+    schema_version: int = 2
 
 
 class SubagentAssignment(BaseModel):
@@ -320,6 +352,7 @@ class ContextPackage(BaseModel):
 class Artifact(BaseModel):
     id: str
     task_id: str
+    attempt_id: str | None = None  # schema v2: owning Attempt (None for legacy)
     type: ArtifactType
     uri: str | None = None
     content: str | None = None
@@ -351,6 +384,14 @@ class Review(BaseModel):
     reviewer_role_id: str
     status: ReviewStatus = ReviewStatus.PENDING
     feedback: str | None = None
+    # ``artifact_id`` is the Codex review report.  These optional links identify
+    # the execution attempt and artifact that were actually reviewed; keeping
+    # them optional preserves compatibility with pre-routing snapshots.
+    reviewed_task_id: str | None = None
+    reviewed_artifact_id: str | None = None
+    reviewed_attempt_id: str | None = None  # schema v2: Attempt that was reviewed
+    review_request_handoff_id: str | None = None
+    correlation_id: str | None = None
     created_at: datetime = Field(default_factory=_now)
 
 
