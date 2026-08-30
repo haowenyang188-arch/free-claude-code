@@ -6,6 +6,13 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import Any
 
+from .role_contract import (
+    AgentRole,
+    RouteTarget,
+    apply_status,
+    resolve_route,
+)
+
 from ..artifacts.store import FileArtifactStore
 from ..domain.models import (
     Artifact,
@@ -57,6 +64,15 @@ class AcceptanceValidator(ABC):
 
 class WorkflowEngine:
     """Own SOP state transitions; never delegates scheduling decisions to agents."""
+
+    def _set_status(self, entity: object, kind: str, value: object) -> None:
+        """Write one SOP status field through the role contract guard.
+
+        The Engine is the only actor allowed to mutate SOP state; routing every
+        write through :func:`apply_status` keeps that invariant enforceable at
+        runtime instead of relying on review discipline.
+        """
+        apply_status(entity, kind=kind, value=value, actor=AgentRole.SOP_ENGINE)
 
     def __init__(
         self,
@@ -181,10 +197,10 @@ class WorkflowEngine:
         if context.task_id != task.id:
             raise WorkflowEngineError("context package does not match task")
 
-        task.status = TaskStatus.RUNNING
+        self._set_status(task, "tasks", TaskStatus.RUNNING)
         task.context_package_id = context.id
         task.input_artifact_ids = list(context.artifact_ids)
-        step_run.status = StepStatus.RUNNING
+        self._set_status(step_run, "step_runs", StepStatus.RUNNING)
         self.store.save_entity("tasks", task)
         self.store.save_entity("step_runs", step_run)
         self.store.save_entity("contexts", context)
@@ -209,8 +225,8 @@ class WorkflowEngine:
         self.store.save_entity("artifacts", artifact)
         task.output_artifact_ids = [artifact.id]
         step_run.output_artifact_ids = [artifact.id]
-        task.status = TaskStatus.VALIDATING
-        step_run.status = StepStatus.VALIDATING
+        self._set_status(task, "tasks", TaskStatus.VALIDATING)
+        self._set_status(step_run, "step_runs", StepStatus.VALIDATING)
         self.store.save_entity("tasks", task)
         self.store.save_entity("step_runs", step_run)
         self._emit(
@@ -236,8 +252,8 @@ class WorkflowEngine:
             },
         )
         if validation.status is not ValidationStatus.ACCEPTED:
-            task.status = TaskStatus.REJECTED
-            step_run.status = StepStatus.REJECTED
+            self._set_status(task, "tasks", TaskStatus.REJECTED)
+            self._set_status(step_run, "step_runs", StepStatus.REJECTED)
             self.store.save_entity("tasks", task)
             self.store.save_entity("step_runs", step_run)
             self._emit(
@@ -251,8 +267,8 @@ class WorkflowEngine:
         self.store.save_entity("artifacts", artifact)
         handoff: Handoff | None = None
         if step.requires_review:
-            task.status = TaskStatus.ACCEPTED
-            step_run.status = StepStatus.WAITING_REVIEW
+            self._set_status(task, "tasks", TaskStatus.ACCEPTED)
+            self._set_status(step_run, "step_runs", StepStatus.WAITING_REVIEW)
             review = Review(
                 id=str(uuid.uuid4()),
                 task_id=task.id,
@@ -266,8 +282,8 @@ class WorkflowEngine:
                 {"review_id": review.id, "task_id": task.id},
             )
         else:
-            task.status = TaskStatus.ACCEPTED
-            step_run.status = StepStatus.COMPLETED
+            self._set_status(task, "tasks", TaskStatus.ACCEPTED)
+            self._set_status(step_run, "step_runs", StepStatus.COMPLETED)
             self._emit(step_run.sop_run_id, "task_accepted", {"task_id": task.id})
             handoff = self._complete_step_and_create_handoff(step_run, task, step)
         self.store.save_entity("tasks", task)
@@ -284,7 +300,7 @@ class WorkflowEngine:
         handoff = self._get_model("handoffs", handoff_id, Handoff)
         if handoff.status is not HandoffStatus.READY:
             raise WorkflowEngineError("handoff is not ready for acceptance")
-        handoff.status = HandoffStatus.ACCEPTED
+        self._set_status(handoff, "handoffs", HandoffStatus.ACCEPTED)
         handoff.accepted_at = __import__("datetime").datetime.now(
             __import__("datetime").UTC
         )
@@ -296,7 +312,7 @@ class WorkflowEngine:
             raise WorkflowEngineError(
                 "handoff accepted before all dependencies were satisfied"
             )
-        target.status = StepStatus.READY
+        self._set_status(target, "step_runs", StepStatus.READY)
         self.store.save_entity("step_runs", target)
         self._emit(
             source_step.sop_run_id,
@@ -311,13 +327,13 @@ class WorkflowEngine:
         review = self._get_model("reviews", review_id, Review)
         if review.status is not ReviewStatus.PENDING:
             raise WorkflowEngineError("review is already decided")
-        review.status = ReviewStatus.APPROVED
+        self._set_status(review, "reviews", ReviewStatus.APPROVED)
         self.store.save_entity("reviews", review)
         task = self._get_model("tasks", review.task_id, Task)
         step_run = self._get_model("step_runs", task.step_run_id, StepRun)
         step = self.step_definition(step_run.sop_run_id, step_run.step_id)
-        task.status = TaskStatus.ACCEPTED
-        step_run.status = StepStatus.COMPLETED
+        self._set_status(task, "tasks", TaskStatus.ACCEPTED)
+        self._set_status(step_run, "step_runs", StepStatus.COMPLETED)
         self.store.save_entity("tasks", task)
         self.store.save_entity("step_runs", step_run)
         self._complete_step_and_create_handoff(step_run, task, step)
@@ -329,14 +345,16 @@ class WorkflowEngine:
         review = self._get_model("reviews", review_id, Review)
         if review.status is not ReviewStatus.PENDING:
             raise WorkflowEngineError("review is already decided")
-        review.status = ReviewStatus.CHANGES_REQUESTED
+        self._set_status(review, "reviews", ReviewStatus.CHANGES_REQUESTED)
         review.feedback = feedback.strip()
         self.store.save_entity("reviews", review)
         task = self._get_model("tasks", review.task_id, Task)
         step_run = self._get_model("step_runs", task.step_run_id, StepRun)
-        task.status = TaskStatus.REWORK
-        step_run.status = (
-            StepStatus.REWORK if hasattr(StepStatus, "REWORK") else StepStatus.READY
+        self._set_status(task, "tasks", TaskStatus.REWORK)
+        self._set_status(
+            step_run,
+            "step_runs",
+            StepStatus.REWORK if hasattr(StepStatus, "REWORK") else StepStatus.READY,
         )
         self.store.save_entity("tasks", task)
         self.store.save_entity("step_runs", step_run)
@@ -347,6 +365,67 @@ class WorkflowEngine:
         )
         return step_run
 
+    def _extract_review_feedback(self, review: Review) -> str:
+        """Extract structured feedback from the review's artifact.
+
+        Returns the blocking items as formatted feedback for the executor.
+        Falls back to routing metadata if artifact parsing fails.
+        """
+        try:
+            import json
+            artifact = self._get_model("artifacts", review.artifact_id, Artifact)
+            if artifact.content:
+                review_data = json.loads(artifact.content)
+                blocking = review_data.get("blocking", [])
+                if blocking:
+                    # Format blocking items as actionable feedback
+                    items = "\n".join(f"- {item}" for item in blocking)
+                    return f"Review feedback - blocking issues:\n{items}"
+            # Fallback: use the verdict as minimal feedback
+            return review_data.get("result", "REWORK")
+        except (KeyError, json.JSONDecodeError, Exception):
+            # Safe fallback: return the verdict itself
+            return review.feedback or "Review requires changes"
+
+    def decide_review(self, review_id: str, *, verdict: str) -> tuple[StepRun, RouteTarget]:
+        """Route a review verdict through the Engine-owned routing table.
+
+        The destination is never chosen by the Reviewer and never chosen by a
+        calling script: :data:`role_contract.REVIEW_ROUTING` is the single
+        source of truth and only the Engine may resolve it.
+        """
+        route = resolve_route(verdict, actor=AgentRole.SOP_ENGINE)
+
+        # Extract actual reviewer feedback from the Review artifact (blocking items)
+        review = self._get_model("reviews", review_id, Review)
+        feedback = self._extract_review_feedback(review)
+
+        if route is RouteTarget.ADVANCE:
+            return self.approve_review(review_id), route
+        if route is RouteTarget.RERUN_EXECUTE:
+            return (
+                self.reject_review(review_id, feedback=feedback),
+                route,
+            )
+        if route is RouteTarget.RETURN_TO_PLAN:
+            task = self._get_model("tasks", review.task_id, Task)
+            step_run = self._get_model("step_runs", task.step_run_id, StepRun)
+            self._emit(
+                step_run.sop_run_id,
+                "plan_invalid",
+                {
+                    "review_id": review.id,
+                    "task_id": task.id,
+                    "route": route.value,
+                    "verdict": str(verdict),
+                },
+            )
+            return (
+                self.reject_review(review_id, feedback=feedback),
+                route,
+            )
+        raise WorkflowEngineError(f"unroutable verdict {verdict!r} -> {route.value}")
+
     def retry_task(self, task_id: str) -> Task:
         previous = self._get_model("tasks", task_id, Task)
         step_run = self._get_model("step_runs", previous.step_run_id, StepRun)
@@ -356,7 +435,7 @@ class WorkflowEngine:
             TaskStatus.REWORK,
         }:
             raise WorkflowEngineError("only failed or rejected tasks can be retried")
-        step_run.status = StepStatus.READY
+        self._set_status(step_run, "step_runs", StepStatus.READY)
         retry = previous.model_copy(
             update={
                 "id": str(uuid.uuid4()),
@@ -409,7 +488,7 @@ class WorkflowEngine:
             if target.status is StepStatus.PENDING and self._dependencies_satisfied(
                 target
             ):
-                target.status = StepStatus.READY
+                self._set_status(target, "step_runs", StepStatus.READY)
                 self.store.save_entity("step_runs", target)
                 self._emit(sop_run_id, "step_ready", {"step_id": target.step_id})
 
@@ -447,11 +526,11 @@ class WorkflowEngine:
             if item.get("sop_run_id") == sop_run_id
         ]
         if steps and all(item.status is StepStatus.COMPLETED for item in steps):
-            run.status = SopRunStatus.COMPLETED
+            self._set_status(run, "sop_runs", SopRunStatus.COMPLETED)
         elif any(item.status is StepStatus.WAITING_REVIEW for item in steps):
-            run.status = SopRunStatus.WAITING_REVIEW
+            self._set_status(run, "sop_runs", SopRunStatus.WAITING_REVIEW)
         else:
-            run.status = SopRunStatus.RUNNING
+            self._set_status(run, "sop_runs", SopRunStatus.RUNNING)
         self.store.save_entity("sop_runs", run)
 
         # Emit status change events
