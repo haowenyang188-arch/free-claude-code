@@ -102,6 +102,7 @@ class Capability(str, Enum):
     # ---- transition capabilities (SOP_ENGINE exclusive) --------------
     TRANSITION_TASK = "transition_task"
     TRANSITION_STEP = "transition_step"
+    TRANSITION_ATTEMPT = "transition_attempt"
     TRANSITION_RUN = "transition_run"
     TRANSITION_HANDOFF = "transition_handoff"
     TRANSITION_REVIEW = "transition_review"
@@ -118,6 +119,7 @@ TRANSITION_CAPABILITIES: frozenset[Capability] = frozenset(
     {
         Capability.TRANSITION_TASK,
         Capability.TRANSITION_STEP,
+        Capability.TRANSITION_ATTEMPT,
         Capability.TRANSITION_RUN,
         Capability.TRANSITION_HANDOFF,
         Capability.TRANSITION_REVIEW,
@@ -213,6 +215,7 @@ def require_engine(role: AgentRole, *, context: str = "") -> None:
 STATUS_AUTHORITY: dict[str, Capability] = {
     "tasks": Capability.TRANSITION_TASK,
     "step_runs": Capability.TRANSITION_STEP,
+    "attempts": Capability.TRANSITION_ATTEMPT,
     "sop_runs": Capability.TRANSITION_RUN,
     "handoffs": Capability.TRANSITION_HANDOFF,
     "reviews": Capability.TRANSITION_REVIEW,

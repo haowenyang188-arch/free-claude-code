@@ -7,7 +7,7 @@ import uuid
 from abc import ABC, abstractmethod
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..artifacts.store import FileArtifactStore
@@ -357,13 +357,19 @@ class WorkflowEngine:
             raise WorkflowEngineError("assignment does not match task")
         if context.task_id != task.id:
             raise WorkflowEngineError("context package does not match task")
+        if task.status is not TaskStatus.PENDING:
+            raise WorkflowEngineError(
+                f"task {task.id} is not pending (status={task.status.value}); "
+                "duplicate execute blocked"
+            )
+        self._require_run_active(step_run.sop_run_id)
 
         self._set_status(task, "tasks", TaskStatus.RUNNING)
         task.context_package_id = context.id
         task.input_artifact_ids = list(context.artifact_ids)
         self._set_status(step_run, "step_runs", StepStatus.RUNNING)
         attempt = self._ensure_attempt_for_task(task)
-        attempt.status = TaskStatus.RUNNING
+        self._set_status(attempt, "attempts", TaskStatus.RUNNING)
         attempt.started_at = datetime.now(UTC)
         attempt.session_id = assignment.session_id
         attempt.runtime_id = assignment.runtime_id
@@ -421,10 +427,14 @@ class WorkflowEngine:
                     )
                 ]
         except Exception:
-            attempt.status = TaskStatus.FAILED
-            attempt.completed_at = datetime.now(UTC)
-            self.store.save_entity("attempts", attempt)
+            try:
+                self._require_run_active(step_run.sop_run_id)
+            except WorkflowEngineError:
+                pass  # cancelled/paused during execution: states already invalidated
+            else:
+                self._fail_task_via_engine(task, reason="runner exception")
             raise
+        self._require_run_active(step_run.sop_run_id)
         if self.artifact_store is not None:
             stored: list[Artifact] = []
             for item in artifacts:
@@ -448,7 +458,17 @@ class WorkflowEngine:
             {"artifact_id": artifact.id, "task_id": task.id},
         )
 
-        validation = await self.validator.validate(task=task, artifact=artifact)
+        try:
+            validation = await self.validator.validate(task=task, artifact=artifact)
+        except Exception:
+            try:
+                self._require_run_active(step_run.sop_run_id)
+            except WorkflowEngineError:
+                pass  # cancelled/paused during validation: states already invalidated
+            else:
+                self._fail_task_via_engine(task, reason="validator exception")
+            raise
+        self._require_run_active(step_run.sop_run_id)
         self.store.save_entity("validations", validation)
         validation_event = (
             "validation_completed"
@@ -467,7 +487,7 @@ class WorkflowEngine:
         if validation.status is not ValidationStatus.ACCEPTED:
             self._set_status(task, "tasks", TaskStatus.REJECTED)
             self._set_status(step_run, "step_runs", StepStatus.REJECTED)
-            attempt.status = TaskStatus.REJECTED
+            self._set_status(attempt, "attempts", TaskStatus.REJECTED)
             attempt.completed_at = datetime.now(UTC)
             self.store.save_entity("attempts", attempt)
             self.store.save_entity("tasks", task)
@@ -516,7 +536,7 @@ class WorkflowEngine:
             self._set_status(step_run, "step_runs", StepStatus.COMPLETED)
             self._emit(step_run.sop_run_id, "task_accepted", {"task_id": task.id})
             handoff = self._complete_step_and_create_handoff(step_run, task, step)
-        attempt.status = TaskStatus.ACCEPTED
+        self._set_status(attempt, "attempts", TaskStatus.ACCEPTED)
         attempt.completed_at = datetime.now(UTC)
         self.store.save_entity("attempts", attempt)
         self.store.save_entity("tasks", task)
@@ -1118,6 +1138,14 @@ class WorkflowEngine:
         review = self._get_model("reviews", review_id, Review)
         if review.status is not ReviewStatus.PENDING:
             raise WorkflowEngineError("review is already decided")
+        try:
+            reviewed_run_step = self._get_model(
+                "step_runs", self._reviewed_task(review).step_run_id, StepRun
+            )
+        except (KeyError, TypeError, ValueError):
+            reviewed_run_step = None
+        if reviewed_run_step is not None:
+            self._require_run_active(reviewed_run_step.sop_run_id)
         data = self._review_artifact_data(
             review, allow_legacy_artifact=_allow_legacy_artifact
         )
@@ -1350,6 +1378,135 @@ class WorkflowEngine:
         )
         return retry
 
+    def pause_sop_run(self, *, sop_run_id: str, reason: str = "paused") -> SopRun:
+        """Pause an active SOP run (all further step execution halts)."""
+        run = self._require_run(sop_run_id)
+        if run.status in (
+            SopRunStatus.CANCELLED,
+            SopRunStatus.FAILED,
+            SopRunStatus.COMPLETED,
+        ):
+            raise WorkflowEngineError(
+                f"Cannot pause {sop_run_id}: already {run.status.value}"
+            )
+        self._set_status(run, "sop_runs", SopRunStatus.PAUSED)
+        self.store.save_entity("sop_runs", run)
+        self._emit(sop_run_id, "sop_paused", {"reason": reason})
+        return run
+
+    def resume_sop_run(self, *, sop_run_id: str) -> SopRun:
+        """Resume a paused SOP run."""
+        run = self._require_run(sop_run_id)
+        if run.status is not SopRunStatus.PAUSED:
+            raise WorkflowEngineError(f"SOPRun {sop_run_id} is not paused")
+        pending_review = any(
+            item.get("status") == StepStatus.WAITING_REVIEW.value
+            for item in self.store.list_entities("step_runs")
+            if item.get("sop_run_id") == sop_run_id
+        )
+        target = (
+            SopRunStatus.WAITING_REVIEW
+            if pending_review
+            else SopRunStatus.RUNNING
+        )
+        self._set_status(run, "sop_runs", target)
+        self.store.save_entity("sop_runs", run)
+        self._emit(sop_run_id, "sop_resumed", {})
+        return run
+
+    def cancel_sop_run(self, *, sop_run_id: str, reason: str = "cancelled") -> SopRun:
+        """Cancel an SOP run and invalidate in-flight work.
+
+        RUNNING/READY steps become BLOCKED and RUNNING tasks/attempts become
+        FAILED so late callbacks cannot flip the cancelled run back to a live
+        state (the run-active gate rejects any late write).
+        """
+        run = self._require_run(sop_run_id)
+        if run.status in (
+            SopRunStatus.CANCELLED,
+            SopRunStatus.FAILED,
+            SopRunStatus.COMPLETED,
+        ):
+            raise WorkflowEngineError(
+                f"Cannot cancel {sop_run_id}: already {run.status.value}"
+            )
+        for item in self.store.list_entities("step_runs"):
+            if item.get("sop_run_id") != sop_run_id:
+                continue
+            if item.get("status") in {
+                StepStatus.RUNNING.value,
+                StepStatus.READY.value,
+            }:
+                step_run = StepRun.model_validate(item)
+                self._set_status(step_run, "step_runs", StepStatus.BLOCKED)
+                self.store.save_entity("step_runs", step_run)
+        for item in self.store.list_entities("tasks"):
+            if item.get("status") != TaskStatus.RUNNING.value:
+                continue
+            try:
+                task = self._get_model("tasks", item["id"], Task)
+                step_run = self._get_model("step_runs", task.step_run_id, StepRun)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if step_run.sop_run_id != sop_run_id:
+                continue
+            self._set_status(task, "tasks", TaskStatus.FAILED)
+            self.store.save_entity("tasks", task)
+            attempt = self._current_attempt_for_task(task.id)
+            if attempt is not None and attempt.status is TaskStatus.RUNNING:
+                self._set_status(attempt, "attempts", TaskStatus.FAILED)
+                attempt.completed_at = datetime.now(UTC)
+                self.store.save_entity("attempts", attempt)
+        self._set_status(run, "sop_runs", SopRunStatus.CANCELLED)
+        self.store.save_entity("sop_runs", run)
+        self._emit(sop_run_id, "sop_cancelled", {"reason": reason})
+        return run
+
+    def recover_orphaned_tasks(self) -> list[str]:
+        """Fail tasks stuck RUNNING with no RUNNING attempt (engine-legal)."""
+        recovered: list[str] = []
+        for item in self.store.list_entities("tasks"):
+            if item.get("status") != TaskStatus.RUNNING.value:
+                continue
+            task = self._get_model("tasks", item["id"], Task)
+            running_attempts = [
+                a
+                for a in self.store.list_entities("attempts")
+                if a.get("task_id") == task.id
+                and a.get("status") == TaskStatus.RUNNING.value
+            ]
+            if running_attempts:
+                continue
+            self._fail_task_via_engine(
+                task, reason="orphaned (RUNNING with no RUNNING attempt)"
+            )
+            recovered.append(task.id)
+        return recovered
+
+    def recover_stuck_step_runs(self, *, timeout_seconds: int = 3600) -> list[str]:
+        """Fail steps whose RUNNING attempt exceeded the timeout (engine-legal)."""
+        recovered: list[str] = []
+        cutoff = datetime.now(UTC) - timedelta(seconds=timeout_seconds)
+        for item in self.store.list_entities("attempts"):
+            if item.get("status") != TaskStatus.RUNNING.value:
+                continue
+            attempt = Attempt.model_validate(item)
+            started = attempt.started_at
+            if started is None or started >= cutoff:
+                continue
+            try:
+                task = self._get_model("tasks", attempt.task_id, Task)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if task.status is not TaskStatus.RUNNING:
+                continue
+            self._fail_task_via_engine(
+                task,
+                reason=f"stuck attempt {attempt.id} beyond {timeout_seconds}s",
+            )
+            recovered.append(task.id)
+        return recovered
+
     def _complete_step_and_create_handoff(
         self, step_run: StepRun, task: Task, step: StepDefinition
     ) -> Handoff | None:
@@ -1451,6 +1608,61 @@ class WorkflowEngine:
             if item.get("sop_run_id") == sop_run_id and item.get("step_id") == step_id:
                 return StepRun.model_validate(item)
         raise WorkflowEngineError(f"unknown step run: {step_id}")
+
+    def _require_run(self, sop_run_id: str) -> SopRun:
+        """Load a SopRun or raise WorkflowEngineError."""
+        try:
+            return self._get_model("sop_runs", sop_run_id, SopRun)
+        except (KeyError, TypeError, ValueError):
+            raise WorkflowEngineError(f"SOPRun {sop_run_id} not found") from None
+
+    def _require_run_active(
+        self, sop_run_id: str, *, allow_paused: bool = False
+    ) -> SopRun:
+        """Reject state writes on a finished/cancelled/failed run.
+
+        This is the late-callback / stale-generation guard: a result that
+        arrives after cancel/pause/fail may not flip the run back to a live
+        state.
+        """
+        run = self._require_run(sop_run_id)
+        if run.status in (
+            SopRunStatus.CANCELLED,
+            SopRunStatus.FAILED,
+            SopRunStatus.COMPLETED,
+        ):
+            raise WorkflowEngineError(
+                f"SOPRun {sop_run_id} is {run.status.value}; "
+                "refusing late state write"
+            )
+        if run.status is SopRunStatus.PAUSED and not allow_paused:
+            raise WorkflowEngineError(f"SOPRun {sop_run_id} is paused")
+        return run
+
+    def _fail_task_via_engine(self, task: Task, *, reason: str) -> None:
+        """The ONLY legal recovery path: Engine state transitions only."""
+        self._set_status(task, "tasks", TaskStatus.FAILED)
+        self.store.save_entity("tasks", task)
+        try:
+            step_run = self._get_model("step_runs", task.step_run_id, StepRun)
+        except (KeyError, TypeError, ValueError):
+            return
+        if step_run.status not in {StepStatus.COMPLETED, StepStatus.FAILED}:
+            self._set_status(step_run, "step_runs", StepStatus.FAILED)
+            self.store.save_entity("step_runs", step_run)
+        attempt = self._current_attempt_for_task(task.id)
+        if attempt is not None and attempt.status not in {
+            TaskStatus.FAILED,
+            TaskStatus.ACCEPTED,
+        }:
+            self._set_status(attempt, "attempts", TaskStatus.FAILED)
+            attempt.completed_at = datetime.now(UTC)
+            self.store.save_entity("attempts", attempt)
+        self._emit(
+            step_run.sop_run_id,
+            "task_failed",
+            {"task_id": task.id, "reason": reason},
+        )
 
     def _require_sop(self, sop_run_id: str) -> SopDefinition:
         if sop_run_id not in self._sops:
