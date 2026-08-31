@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -76,7 +77,10 @@ if __package__:
     from .runtime.workspace import WorkspacePolicy, WorkspacePolicyError
     from .sop_models import (
         ArtifactResponse,
+        AttemptChainResponse,
+        AttemptResponse,
         HandoffResponse,
+        ReviewEvidenceResponse,
         SopControlRequest,
         SopEventResponse,
         SopRunStatusResponse,
@@ -1854,29 +1858,358 @@ async def get_sop_artifacts(run_id: str):
         if item.get("step_run_id") in step_run_ids
     ]
     task_ids = {item["id"] for item in tasks}
+    task_role_by_id = {item["id"]: item.get("role_id") for item in tasks}
 
     artifacts = [
         item
         for item in service.workflow_store.list_entities("artifacts")
         if item.get("task_id") in task_ids
     ]
-    return [
-        ArtifactResponse(
-            id=item["id"],
-            task_id=item["task_id"],
-            type=item["type"],
-            uri=item.get("uri"),
-            summary=item.get("summary"),
-            sha256=item.get("sha256"),
-            accepted=item.get("accepted", False),
-            created_at=item["created_at"],
-            # Phase 5A: Attempt lineage
-            attempt_id=item.get("attempt_id"),
-            step_run_id=item.get("step_run_id"),
-            role=item.get("role"),
-        )
-        for item in artifacts
+    return [_artifact_response(item, task_role_by_id) for item in artifacts]
+
+
+_REVIEW_OUTCOMES = {"PASS", "REWORK", "PLAN_INVALID"}
+
+
+def _artifact_response(
+    item: dict[str, Any], task_role_by_id: dict[str, str | None]
+) -> ArtifactResponse:
+    """Project one Artifact row into ArtifactResponse.
+
+    role_id 是 Task.role_id 的 join 投影（Artifact 模型上没有 role / role_id）。
+    """
+    return ArtifactResponse(
+        id=item["id"],
+        task_id=item["task_id"],
+        type=item["type"],
+        uri=item.get("uri"),
+        summary=item.get("summary"),
+        sha256=item.get("sha256"),
+        accepted=item.get("accepted", False),
+        created_at=item["created_at"],
+        attempt_id=item.get("attempt_id"),
+        producer_step_run_id=item.get("producer_step_run_id"),
+        role_id=task_role_by_id.get(item["task_id"]),
+    )
+
+
+def _attempt_response(
+    item: dict[str, Any],
+    *,
+    task_to_step: dict[str, str],
+    step_to_run: dict[str, str],
+    artifacts_by_attempt: dict[str, list[str]],
+) -> AttemptResponse:
+    """Project one Attempt row into AttemptResponse.
+
+    sop_run_id 由 Task -> StepRun -> SopRun 解析；解析不到时为空字符串。
+    """
+    step_run_id = task_to_step.get(item["task_id"])
+    sop_run_id = step_to_run.get(step_run_id or "", "")
+    return AttemptResponse(
+        id=item["id"],
+        task_id=item["task_id"],
+        sequence=item.get("sequence", 1),
+        session_id=item.get("session_id"),
+        runtime_id=item.get("runtime_id"),
+        previous_attempt_id=item.get("previous_attempt_id"),
+        started_at=item.get("started_at"),
+        completed_at=item.get("completed_at"),
+        status=item.get("status", "pending"),
+        sop_run_id=sop_run_id,
+        artifact_ids=artifacts_by_attempt.get(item["id"], []),
+    )
+
+
+def _artifacts_by_attempt(artifacts: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """attempt_id -> [artifact_id] 索引（一次全表扫描）。"""
+    index: dict[str, list[str]] = {}
+    for artifact in artifacts:
+        attempt_id = artifact.get("attempt_id")
+        if attempt_id:
+            index.setdefault(attempt_id, []).append(artifact["id"])
+    return index
+
+
+def _parse_review_outcome(
+    content: str | None,
+) -> tuple[str | None, list[str], str | None]:
+    """解析评审 Artifact 的 JSON content（result / blocking），容错语义与 engine 一致。
+
+    失败时显式返回 (None, [], 原因)——绝不伪造 PASS。
+    """
+    if not content:
+        return None, [], "reviewer report has no content"
+    try:
+        data = json.loads(content)
+    except (TypeError, ValueError) as exc:
+        return None, [], f"reviewer report is not valid JSON: {exc}"
+    if not isinstance(data, dict):
+        return None, [], "reviewer report content is not a JSON object"
+    result = data.get("result", data.get("verdict"))
+    if not isinstance(result, str) or result.strip().upper() not in _REVIEW_OUTCOMES:
+        return None, [], f"review result {result!r} is not one of {sorted(_REVIEW_OUTCOMES)}"
+    blocking = data.get("blocking", [])
+    if not isinstance(blocking, list) or not all(isinstance(b, str) for b in blocking):
+        blocking = []
+    return result.strip().upper(), list(blocking), None
+
+
+@app.get("/api/sop-runs/{run_id}/attempts", response_model=list[AttemptResponse])
+async def get_sop_attempts(run_id: str):
+    """该 run 的全部执行 Attempt（血缘投影：Task -> StepRun -> SopRun）。
+
+    只读；run_id 不存在时返回 []（与 /tasks、/artifacts 语义一致）。
+    排序 (task_id, sequence) 仅作稳定展示序，逻辑重试顺序看 /chain。
+    """
+    step_runs = [
+        item
+        for item in service.workflow_store.list_entities("step_runs")
+        if item.get("sop_run_id") == run_id
     ]
+    step_run_ids = {item["id"] for item in step_runs}
+    if not step_run_ids:
+        return []
+
+    tasks = [
+        item
+        for item in service.workflow_store.list_entities("tasks")
+        if item.get("step_run_id") in step_run_ids
+    ]
+    task_ids = {item["id"] for item in tasks}
+    if not task_ids:
+        return []
+
+    attempts = [
+        item
+        for item in service.workflow_store.list_entities("attempts")
+        if item.get("task_id") in task_ids
+    ]
+    task_to_step = {item["id"]: item["step_run_id"] for item in tasks}
+    step_to_run = {item["id"]: item["sop_run_id"] for item in step_runs}
+    artifacts_by_attempt = _artifacts_by_attempt(
+        service.workflow_store.list_entities("artifacts")
+    )
+
+    ordered = sorted(
+        attempts, key=lambda item: (item.get("task_id", ""), item.get("sequence", 1))
+    )
+    return [
+        _attempt_response(
+            item,
+            task_to_step=task_to_step,
+            step_to_run=step_to_run,
+            artifacts_by_attempt=artifacts_by_attempt,
+        )
+        for item in ordered
+    ]
+
+
+@app.get("/api/sop-runs/{run_id}/evidence", response_model=list[ReviewEvidenceResponse])
+async def get_sop_evidence(run_id: str):
+    """把每个 Review 绑定到被评审/评审 Attempt 的证据三件套并校验。
+
+    outcome / blocking 解析自 reviewer_report Artifact 的 JSON content；
+    解析失败或证据跨 Attempt 时 evidence_valid=False（后端判定，前端不再自行推断）。
+    """
+    step_runs = [
+        item
+        for item in service.workflow_store.list_entities("step_runs")
+        if item.get("sop_run_id") == run_id
+    ]
+    step_run_ids = {item["id"] for item in step_runs}
+    if not step_run_ids:
+        return []
+
+    tasks = [
+        item
+        for item in service.workflow_store.list_entities("tasks")
+        if item.get("step_run_id") in step_run_ids
+    ]
+    task_ids = {item["id"] for item in tasks}
+    if not task_ids:
+        return []
+
+    task_role_by_id = {item["id"]: item.get("role_id") for item in tasks}
+    reviews = [
+        item
+        for item in service.workflow_store.list_entities("reviews")
+        if item.get("task_id") in task_ids
+    ]
+
+    artifacts = service.workflow_store.list_entities("artifacts")
+    artifact_by_id = {item["id"]: item for item in artifacts}
+    attempt_by_id = {
+        item["id"]: item
+        for item in service.workflow_store.list_entities("attempts")
+    }
+    artifacts_by_attempt: dict[str, list[dict[str, Any]]] = {}
+    for artifact in artifacts:
+        attempt_id = artifact.get("attempt_id")
+        if attempt_id:
+            artifacts_by_attempt.setdefault(attempt_id, []).append(artifact)
+
+    result: list[ReviewEvidenceResponse] = []
+    for review in sorted(reviews, key=lambda item: item.get("created_at") or ""):
+        reviewed_attempt_id = review.get("reviewed_attempt_id")
+        created_at = review.get("created_at") or datetime.now(UTC)
+
+        reviewer_report_row = artifact_by_id.get(review.get("artifact_id"))
+        reviewer_report = (
+            _artifact_response(reviewer_report_row, task_role_by_id)
+            if reviewer_report_row is not None
+            else None
+        )
+        reviewer_attempt_id = (
+            reviewer_report_row.get("attempt_id")
+            if reviewer_report_row is not None
+            else None
+        )
+
+        if reviewed_attempt_id is None or reviewed_attempt_id not in attempt_by_id:
+            # schema-v2 之前的 legacy 记录（或悬挂引用）：无 Attempt 血缘，
+            # 仍返回并显式标 invalid——绝不伪造证据。
+            result.append(
+                ReviewEvidenceResponse(
+                    review_id=review["id"],
+                    reviewed_attempt_id=reviewed_attempt_id,
+                    review_status=str(review.get("status", "pending")),
+                    outcome=None,
+                    blocking_items=[],
+                    outcome_parse_error=None,
+                    execution_diff=None,
+                    execution_test_report=None,
+                    reviewer_report=reviewer_report,
+                    reviewer_attempt_id=reviewer_attempt_id,
+                    evidence_valid=False,
+                    evidence_complete=False,
+                    created_at=created_at,
+                )
+            )
+            continue
+
+        # 执行证据按被评审 Attempt 选择——与 Phase 3 lineage._attempt_artifacts
+        # 的 evidence-gate 语义一致：跨 Attempt 的证据视为缺失（fail-closed），
+        # UI 判定与引擎门禁不会互相矛盾。
+        candidates = artifacts_by_attempt.get(reviewed_attempt_id, [])
+
+        def _latest(
+            candidates: list[dict[str, Any]], artifact_type: str
+        ) -> ArtifactResponse | None:
+            matched = [
+                item
+                for item in candidates
+                if str(item.get("type")) == artifact_type
+            ]
+            if not matched:
+                return None
+            matched.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+            return _artifact_response(matched[0], task_role_by_id)
+
+        execution_diff = _latest(candidates, "diff")
+        execution_test_report = _latest(candidates, "test_report")
+
+        outcome, blocking_items, parse_error = _parse_review_outcome(
+            reviewer_report_row.get("content")
+            if reviewer_report_row is not None
+            else None
+        )
+
+        evidence_complete = (
+            execution_diff is not None
+            and execution_test_report is not None
+            and reviewer_report is not None
+        )
+        evidence_valid = (
+            evidence_complete
+            and execution_diff.attempt_id == reviewed_attempt_id
+            and execution_test_report.attempt_id == reviewed_attempt_id
+            and execution_diff.accepted
+            and execution_test_report.accepted
+            and outcome is not None
+        )
+
+        result.append(
+            ReviewEvidenceResponse(
+                review_id=review["id"],
+                reviewed_attempt_id=reviewed_attempt_id,
+                review_status=str(review.get("status", "pending")),
+                outcome=outcome,
+                blocking_items=blocking_items,
+                outcome_parse_error=parse_error,
+                execution_diff=execution_diff,
+                execution_test_report=execution_test_report,
+                reviewer_report=reviewer_report,
+                reviewer_attempt_id=reviewer_attempt_id,
+                evidence_valid=evidence_valid,
+                evidence_complete=evidence_complete,
+                created_at=created_at,
+            )
+        )
+    return result
+
+
+@app.get("/api/attempts/{attempt_id}/chain", response_model=AttemptChainResponse)
+async def get_attempt_chain(attempt_id: str):
+    """沿 previous_attempt_id 回溯 REWORK 重试链（不使用 sequence）。
+
+    previous_attempt_id 成环时停止并在响应中标 truncated，前端必须显式提示。
+    """
+    try:
+        service.workflow_store.get_entity("attempts", attempt_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="attempt not found") from exc
+
+    attempts = service.workflow_store.list_entities("attempts")
+    attempt_by_id = {item["id"]: item for item in attempts}
+
+    tasks = service.workflow_store.list_entities("tasks")
+    step_runs = service.workflow_store.list_entities("step_runs")
+    task_to_step = {
+        item["id"]: item["step_run_id"]
+        for item in tasks
+        if item.get("step_run_id")
+    }
+    step_to_run = {
+        item["id"]: item["sop_run_id"]
+        for item in step_runs
+        if item.get("sop_run_id")
+    }
+    artifacts_by_attempt = _artifacts_by_attempt(
+        service.workflow_store.list_entities("artifacts")
+    )
+
+    chain: list[dict[str, Any]] = []
+    visited: set[str] = set()
+    truncated = False
+    current_id: str | None = attempt_id
+    while current_id is not None:
+        if current_id in visited:
+            truncated = True
+            break
+        visited.add(current_id)
+        current = attempt_by_id.get(current_id)
+        if current is None:
+            break
+        chain.append(current)
+        current_id = current.get("previous_attempt_id")
+
+    chain.reverse()  # 时间正序：链首 -> 链尾
+    root_task_id = chain[0]["task_id"] if chain else ""
+    return AttemptChainResponse(
+        attempts=[
+            _attempt_response(
+                item,
+                task_to_step=task_to_step,
+                step_to_run=step_to_run,
+                artifacts_by_attempt=artifacts_by_attempt,
+            )
+            for item in chain
+        ],
+        root_task_id=root_task_id,
+        chain_length=len(chain),
+        truncated=truncated,
+    )
 
 
 @app.get("/api/artifacts/{artifact_id}/content")
@@ -1963,6 +2296,43 @@ async def get_sop_events(run_id: str, after: int = Query(default=0, ge=0)):
         )
         for event in events
     ]
+
+
+@app.get("/api/sop-runs/{run_id}/snapshot")
+async def get_sop_run_snapshot(run_id: str):
+    """Phase 6: consolidated observability snapshot (step/task/attempt/session/
+    artifacts/reviews/policy gates/error reasons) for one run."""
+    from workbench.backend.workflow.observability import collect_run_snapshot
+
+    return collect_run_snapshot(sop_run_id=run_id, store=service.workflow_store)
+
+
+@app.get("/api/sop-runs/{run_id}/rework-lineage")
+async def get_sop_rework_lineage(run_id: str):
+    """Phase 6: per-step rework chains (tasks via retry_of, attempts via
+    previous_attempt_id) for pinpointing which attempt a run is on."""
+    from workbench.backend.workflow.observability import collect_rework_lineage
+
+    return collect_rework_lineage(sop_run_id=run_id, store=service.workflow_store)
+
+
+@app.get("/api/provider-health")
+async def get_provider_health():
+    """Phase 6: configured runtimes + last session seen per runtime."""
+    from workbench.backend.workflow.observability import collect_provider_health
+
+    return collect_provider_health(
+        store=service.workflow_store,
+        runners=getattr(service.workflow_engine, "_runners", None),
+    )
+
+
+@app.get("/api/overview")
+async def get_overview():
+    """Phase 6: cross-run overview counts (metrics-lite)."""
+    from workbench.backend.workflow.observability import collect_global_overview
+
+    return collect_global_overview(store=service.workflow_store)
 
 
 @app.websocket("/ws")
