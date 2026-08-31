@@ -30,6 +30,7 @@ node_modules
 /deliverables/
 
 # SOP Workbench Phase 0 security baseline
+.env.real_e2e
 .env.backup
 .staging/
 .codex-tmp/
