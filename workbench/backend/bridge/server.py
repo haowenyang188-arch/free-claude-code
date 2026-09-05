@@ -1,5 +1,6 @@
 """Standalone Bridge server for testing and development."""
 
+import os
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,7 +33,9 @@ def create_app() -> FastAPI:
     runner = RuntimeNeutralRunner(adapters=[claude_code_adapter])
     runner.register_runtime("claude_code", RuntimeKind.CLAUDE_CODE)
 
-    bridge_service = BridgeService(runner=runner)
+    # Read execution timeout from environment (default: 300s = 5 minutes)
+    execution_timeout = float(os.getenv("BRIDGE_EXECUTION_TIMEOUT", "300.0"))
+    bridge_service = BridgeService(runner=runner, execution_timeout=execution_timeout)
 
     # Mount Bridge routes
     bridge_router = create_bridge_router(bridge_service=bridge_service)

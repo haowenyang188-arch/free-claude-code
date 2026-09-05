@@ -12,13 +12,11 @@ Design rules (per architecture decision):
 from __future__ import annotations
 
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from ..domain.models import (
-    Artifact,
-    ArtifactType,
     ContextPackage,
     Handoff,
     HandoffMessageType,
@@ -142,6 +140,19 @@ class HandoffDispatcher:
         rk = self._runtime_registry.get(runtime_id)
         return rk.value if isinstance(rk, RuntimeKind) else str(rk or runtime_id)
 
+    def assert_policy_allowed(
+        self,
+        source_runtime_id: str,
+        message_type: str,
+        target_runtime_id: str,
+    ) -> None:
+        """Apply the collaboration allowlist to server-selected runtime IDs."""
+        self.policy.assert_allowed(
+            self._kind(source_runtime_id),
+            message_type,
+            self._kind(target_runtime_id),
+        )
+
     async def _resolve(self, role_id: str, run_id: str) -> SubagentAssignment:
         if self._resolve_assignment is None:
             raise RuntimeError("HandoffDispatcher requires a resolve_assignment callable")
@@ -184,8 +195,10 @@ class HandoffDispatcher:
         recipient_assignment = await self._resolve(target_step.role_id, run_id)
         recipient_kind = self._kind(recipient_assignment.runtime_id)
 
-        self.policy.assert_allowed(
-            sender_kind, handoff.message_type.value, recipient_kind
+        self.assert_policy_allowed(
+            source_assignment.runtime_id,
+            handoff.message_type.value,
+            recipient_assignment.runtime_id,
         )
 
         corr = correlation_id or handoff.correlation_id or str(uuid.uuid4())
@@ -224,9 +237,24 @@ class HandoffDispatcher:
 
         outgoing_id: str | None = None
         if result.handoff is not None:
+            next_kind: str | None = None
+            try:
+                next_step = self.engine.step_definition(
+                    run_id, result.handoff.to_step_id
+                )
+                next_assignment = await self._resolve(next_step.role_id, run_id)
+                next_kind = self._kind(next_assignment.runtime_id)
+            except (KeyError, TypeError, ValueError):
+                # Keep the legacy fallback when a handoff points to a step that
+                # is not present in a partially persisted snapshot.
+                next_kind = None
             self._stamp_handoff(
                 result.handoff.id,
-                message_type=self._outgoing_type(recipient_kind, handoff.message_type.value),
+                message_type=self._outgoing_type(
+                    recipient_kind,
+                    handoff.message_type.value,
+                    next_kind=next_kind,
+                ),
                 correlation_id=corr,
                 reply_to_handoff_id=handoff.id,
             )
@@ -243,7 +271,22 @@ class HandoffDispatcher:
             outgoing_handoff_id=outgoing_id,
         )
 
-    def _outgoing_type(self, recipient_kind: str, incoming: str) -> HandoffMessageType:
+    def _outgoing_type(
+        self,
+        recipient_kind: str,
+        incoming: str,
+        *,
+        next_kind: str | None = None,
+    ) -> HandoffMessageType:
+        # The next step's runtime is the authoritative recipient.  This keeps
+        # DSH rework replies as REVIEW_REQUEST and Claude replans as PLAN_READY
+        # instead of leaking an internal lifecycle label onto the wire.
+        if next_kind == "codex":
+            return HandoffMessageType.REVIEW_REQUEST
+        if next_kind == "sop_engine":
+            return HandoffMessageType.PASS
+        if next_kind == "deepseek_harness" and recipient_kind == "claude_code":
+            return HandoffMessageType.PLAN_READY
         if recipient_kind == "codex":
             return HandoffMessageType.REVIEW_REQUEST
         if recipient_kind == "deepseek_harness":
@@ -253,7 +296,13 @@ class HandoffDispatcher:
                 else HandoffMessageType.HANDOFF
             )
         if recipient_kind == "claude_code":
-            return HandoffMessageType.PLAN_INVALID
+            # Claude receiving PLAN_INVALID emits a fresh plan, which is the
+            # normal PLAN_READY handoff to the executor.
+            return (
+                HandoffMessageType.PLAN_READY
+                if incoming == HandoffMessageType.PLAN_INVALID.value
+                else HandoffMessageType.PLAN_INVALID
+            )
         return HandoffMessageType.HANDOFF
 
     def _ensure_session(

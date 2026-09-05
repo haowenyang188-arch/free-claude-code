@@ -279,22 +279,7 @@ class EventLog:
             raise TypeError("identity must be a RuntimeIdentity")
         if identity is not None and identity.run_id not in (None, run_id):
             raise ValueError("identity run_id does not match event run_id")
-        identity_values: dict[str, str | None] = {
-            field: None
-            for field in (
-                "provider",
-                "runtime_id",
-                "thread_id",
-                "turn_id",
-                "item_id",
-                "approval_id",
-                "one_shot_id",
-                "agent_id",
-                "tool_id",
-                "call_id",
-                "message_id",
-            )
-        }
+        identity_values: dict[str, str | None] = dict.fromkeys(("provider", "runtime_id", "thread_id", "turn_id", "item_id", "approval_id", "one_shot_id", "agent_id", "tool_id", "call_id", "message_id"))
         if identity is not None:
             for field, value in identity.to_mapping(include_unknown=False).items():
                 if field in identity_values:

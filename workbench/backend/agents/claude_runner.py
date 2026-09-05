@@ -17,7 +17,10 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
-from workbench.backend.agents.claude_plan import PlanParseError, PlanValidationError, parse_plan
+from workbench.backend.agents.claude_plan import (
+    PlanParseError,
+    parse_plan,
+)
 
 PLANNER_TOOLS = "Read,Grep,Glob"
 PLANNER_MODEL_WHITELIST_ARGV = (
@@ -122,8 +125,21 @@ def run_claude_once(
     except subprocess.TimeoutExpired as exc:
         raise ClaudeTimeout(f"claude timed out after {timeout}s") from exc
 
+    return parse_claude_stream_json(
+        stdout=proc.stdout, stderr=proc.stderr, returncode=proc.returncode
+    )
+
+
+def parse_claude_stream_json(
+    *, stdout: str, stderr: str, returncode: int
+) -> ClaudeRunResult:
+    """Parse ``--print --output-format stream-json`` output into a result.
+
+    Shared by the SOP planner runner and the chat runtime (which assembles
+    its own conversational argv but must interpret events identically).
+    """
     events: list[dict[str, Any]] = []
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -132,13 +148,13 @@ def run_claude_once(
         except (json.JSONDecodeError, ValueError):
             continue
 
-    if proc.returncode != 0 and not events:
-        raise ClaudeNonZeroExit(proc.returncode, proc.stderr)
+    if returncode != 0 and not events:
+        raise ClaudeNonZeroExit(returncode, stderr)
 
     init = next((e for e in events if e.get("type") == "system" and e.get("subtype") == "init"), None)
     result = next((e for e in events if e.get("type") == "result"), None)
     if init is None and result is None:
-        raise ClaudeMalformedOutput(f"no system/init or result event; stderr: {proc.stderr[-200:]}")
+        raise ClaudeMalformedOutput(f"no system/init or result event; stderr: {stderr[-200:]}")
 
     texts: list[str] = []
     for e in events:

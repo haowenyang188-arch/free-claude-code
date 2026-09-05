@@ -2,20 +2,20 @@
 
 import asyncio
 import uuid
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from typing import Any
+
 from workbench.backend.bridge.api_models import (
+    ArtifactResponse,
     ExecuteStepRequest,
     ExecuteStepResponse,
     TaskStatus,
     TaskStatusResponse,
-    ArtifactResponse,
 )
 from workbench.backend.domain.models import (
-    Task,
-    SubagentAssignment,
-    Artifact,
     ContextPackage,
+    SubagentAssignment,
+    Task,
 )
 from workbench.backend.workflow.runners import RuntimeNeutralRunner
 
@@ -27,10 +27,13 @@ class BridgeError(Exception):
 class BridgeService:
     """Service layer for Dify Bridge - manages async task execution."""
 
-    def __init__(self, runner: RuntimeNeutralRunner) -> None:
+    def __init__(
+        self, runner: RuntimeNeutralRunner, *, execution_timeout: float = 300.0
+    ) -> None:
         self._runner = runner
         self._tasks: dict[str, dict[str, Any]] = {}
         self._background_tasks: dict[str, asyncio.Task] = {}
+        self._execution_timeout = execution_timeout
 
     async def execute_step(self, request: ExecuteStepRequest) -> ExecuteStepResponse:
         """
@@ -97,9 +100,10 @@ class BridgeService:
             context = self._request_to_context(task_id, request)
             assignment = self._request_to_assignment(task_id, request)
 
-            # Execute through RuntimeNeutralRunner
-            artifact = await self._runner.execute(
-                task=task, assignment=assignment, context=context
+            # Execute through RuntimeNeutralRunner with timeout
+            artifact = await asyncio.wait_for(
+                self._runner.execute(task=task, assignment=assignment, context=context),
+                timeout=self._execution_timeout,
             )
 
             # Update task status to COMPLETED
@@ -108,6 +112,16 @@ class BridgeService:
                     "status": TaskStatus.COMPLETED,
                     "updated_at": datetime.now(UTC),
                     "artifact": artifact,
+                }
+            )
+
+        except asyncio.TimeoutError:
+            # Update task status to FAILED due to timeout
+            self._tasks[task_id].update(
+                {
+                    "status": TaskStatus.FAILED,
+                    "updated_at": datetime.now(UTC),
+                    "error": f"Execution timed out after {self._execution_timeout}s",
                 }
             )
 

@@ -2,6 +2,73 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Design Tokens（P0）——颜色值唯一权威来源。
+ * 通道值以空格分隔的 RGB 三元组存储，供 tailwind.config.js
+ * 用 rgb(var(--c-*) / <alpha-value>) 引用以支持透明度语法。
+ *
+ * 当前主题为深色单主题（slate 系 + cyan 强调）；变量名不含 light/dark 前缀，
+ * 未来若加亮色主题，改 :root 并在 .theme-light 覆盖即可（v1 方案 §5 预留）。
+ */
+:root {
+  /* 版面层 */
+  --c-page: 2 6 23; /* slate-950 */
+  --c-panel: 15 23 42; /* slate-900 */
+  --c-inset: 2 6 23; /* slate-950（表头 / 代码块内嵌面） */
+  --c-edge: 30 41 59; /* slate-800 */
+  --c-edge-strong: 51 65 85; /* slate-700 */
+
+  /* 文本层 */
+  --c-fg-main: 241 245 249; /* slate-100 */
+  --c-fg-secondary: 148 163 184; /* slate-400 */
+  --c-fg-muted: 100 116 139; /* slate-500 */
+
+  /* 品牌强调（cyan 系，现行为主） */
+  --c-primary: 34 211 238; /* cyan-400 */
+  --c-primary-fg: 2 6 23; /* slate-950（primary 上的前景） */
+  --c-primary-soft: 34 211 238; /* cyan-400（配合 /10 等透明度做浅底） */
+
+  /* 状态语义 7 态（与 src/lib/labels.ts Tone 一一对应）
+     DEFAULT=主色（徽标底 / ring / 圆点基调）
+     fg     =文本色（现状语义文本用 300 级）
+     ring   =描边色
+     dot    =状态圆点色 */
+  --c-state-neutral: 30 41 59; /* slate-800 */
+  --c-state-neutral-fg: 203 213 225; /* slate-300 */
+  --c-state-neutral-ring: 51 65 85; /* slate-700 */
+  --c-state-neutral-dot: 100 116 139; /* slate-500 */
+
+  --c-state-idle: 30 41 59; /* slate-800 */
+  --c-state-idle-fg: 148 163 184; /* slate-400 */
+  --c-state-idle-ring: 51 65 85; /* slate-700 */
+  --c-state-idle-dot: 71 85 105; /* slate-600 */
+
+  --c-state-active: 59 130 246; /* blue-500 */
+  --c-state-active-fg: 147 197 253; /* blue-300 */
+  --c-state-active-ring: 59 130 246; /* blue-500 */
+  --c-state-active-dot: 96 165 250; /* blue-400 */
+
+  --c-state-success: 16 185 129; /* emerald-500 */
+  --c-state-success-fg: 110 231 183; /* emerald-300 */
+  --c-state-success-ring: 16 185 129; /* emerald-500 */
+  --c-state-success-dot: 52 211 153; /* emerald-400 */
+
+  --c-state-warn: 245 158 11; /* amber-500 */
+  --c-state-warn-fg: 252 211 77; /* amber-300 */
+  --c-state-warn-ring: 245 158 11; /* amber-500 */
+  --c-state-warn-dot: 251 191 36; /* amber-400 */
+
+  --c-state-danger: 244 63 94; /* rose-500 */
+  --c-state-danger-fg: 253 164 175; /* rose-300 */
+  --c-state-danger-ring: 244 63 94; /* rose-500 */
+  --c-state-danger-dot: 251 113 133; /* rose-400 */
+
+  --c-state-accent: 6 182 212; /* cyan-500 */
+  --c-state-accent-fg: 103 232 249; /* cyan-300 */
+  --c-state-accent-ring: 6 182 212; /* cyan-500 */
+  --c-state-accent-dot: 34 211 238; /* cyan-400 */
+}
+
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',

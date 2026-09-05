@@ -38,8 +38,17 @@ class ClaudeCodeAdapter(RuntimeAdapter):
         runtime_registry: RuntimeRegistry | None = None,
         preflight_runtime: bool = False,
         mcp_config_path: str | None = None,
+        execution_timeout: float | None = None,
+        workspace_path: str | None = None,
     ) -> None:
-        """Initialize adapter with optional artifact store for loading upstream artifacts."""
+        """Initialize adapter with optional artifact store for loading upstream artifacts.
+
+        workspace_path: default cwd when the task context carries no
+        workspace_scope.  The Claude CLI runs its plan-mode read-only tools
+        against the cwd tree; inheriting the host process cwd (e.g. the
+        free-claude-code repo root with ~900 files) makes a plan invocation
+        hang until timeout because the model explores the whole tree.
+        """
         if isolation_mode not in {"safe", "inherit"}:
             raise ValueError("isolation_mode must be 'safe' or 'inherit'")
         self._artifact_store = artifact_store
@@ -54,6 +63,39 @@ class ClaudeCodeAdapter(RuntimeAdapter):
             if isolation_mode == "inherit"
             else None
         )
+        # P1-B gap fix (C2): the Claude CLI blocks indefinitely on slow API
+        # responses, so the process timeout is configurable via env
+        # CLAUDE_EXECUTION_TIMEOUT (seconds, default 300) to ride out
+        # transient upstream slowness instead of failing at a hard 5 min.
+        self._execution_timeout = (
+            float(execution_timeout)
+            if execution_timeout is not None
+            else float(os.getenv("CLAUDE_EXECUTION_TIMEOUT", "300.0"))
+        )
+        self._workspace_path = workspace_path
+
+    def _child_environment(self) -> dict[str, str]:
+        """Least-privilege env plus loopback-only proxy passthrough (C2).
+
+        ``build_cli_environment`` deliberately strips proxy state.  On hosts
+        where outbound Anthropic API traffic must go through a local proxy
+        (e.g. WSL with a 127.0.0.1 gateway), the Claude CLI hangs with zero
+        output until timeout without it.  Only loopback/private proxy values
+        are inherited (no credentials, no external proxy URLs).
+        """
+        env = build_cli_environment(RuntimeBackend.CLAUDE)
+        parent = os.environ
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"):
+            value = parent.get(key)
+            if not value:
+                continue
+            lowered = value.lower()
+            if key.upper().endswith("_PROXY") and not lowered.startswith(
+                ("http://127.", "http://localhost", "http://[::1]", "socks5://127.", "socks5h://127.")
+            ):
+                continue  # external proxy: not inherited
+            env[key] = value
+        return env
 
     def supports(self, runtime_kind: RuntimeKind) -> bool:
         """Return True for CLAUDE_CODE runtime."""
@@ -82,8 +124,10 @@ class ClaudeCodeAdapter(RuntimeAdapter):
         # Build prompt from context
         prompt = self._build_prompt(task=task, context=context)
 
-        # Determine working directory
-        cwd = context.workspace_scope if context.workspace_scope else None
+        # Determine working directory: task workspace scope wins; otherwise
+        # fall back to the adapter default workspace so the CLI never inherits
+        # the host process cwd (see workspace_path docstring).
+        cwd = context.workspace_scope if context.workspace_scope else self._workspace_path
 
         # Invoke Claude Code
         try:
@@ -94,11 +138,24 @@ class ClaudeCodeAdapter(RuntimeAdapter):
         # Generate summary (first 100 chars)
         summary = response[:100] + "..." if len(response) > 100 else response
 
+        # P1-B gap fix (C1): artifact type must follow the SOP role so the
+        # engine step contract (plan -> ArtifactType.PLAN, review ->
+        # REVIEW_REPORT) holds for the real Claude runner.  Previously the
+        # real runner always emitted TEXT, so a real plan step could never
+        # satisfy the PLAN evidence assertions in test_real_e2e.
+        role = (task.role_id or "").lower()
+        if role in {"planner", "claude"}:
+            artifact_type = ArtifactType.PLAN
+        elif role in {"reviewer", "codex"}:
+            artifact_type = ArtifactType.REVIEW_REPORT
+        else:
+            artifact_type = ArtifactType.TEXT
+
         # Create artifact
         artifact = Artifact(
             id=f"artifact-{task.id}",
             task_id=task.id,
-            type=ArtifactType.TEXT,
+            type=artifact_type,
             content=response,
             summary=summary,
         )
@@ -218,7 +275,7 @@ class ClaudeCodeAdapter(RuntimeAdapter):
                 stderr=asyncio.subprocess.DEVNULL,
                 stdin=asyncio.subprocess.DEVNULL,
                 cwd=cwd,
-                env=build_cli_environment(RuntimeBackend.CLAUDE),
+                env=self._child_environment(),
             )
             pid = getattr(process, "pid", None)
             if isinstance(pid, int) and pid > 0:
@@ -226,14 +283,20 @@ class ClaudeCodeAdapter(RuntimeAdapter):
 
             try:
                 stdout, _stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=300.0
+                    process.communicate(), timeout=self._execution_timeout
                 )
             except TimeoutError as exc:
                 process.kill()
                 await process.wait()
                 raise RunnerError(
-                    "Claude Code execution timeout after 5 minutes"
+                    f"Claude Code execution timeout after {int(self._execution_timeout)}s"
                 ) from exc
+            except asyncio.CancelledError:
+                # Run cancellation (engine stop) must not orphan the CLI child.
+                process.kill()
+                with suppress(Exception):
+                    await process.wait()
+                raise
             finally:
                 if isinstance(pid, int) and pid > 0:
                     unregister_process(pid, generation=generation)

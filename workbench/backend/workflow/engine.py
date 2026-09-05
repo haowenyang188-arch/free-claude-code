@@ -1512,24 +1512,67 @@ class WorkflowEngine:
     ) -> Handoff | None:
         self._emit(step_run.sop_run_id, "step_completed", {"step_id": step.id})
         if step.handoff_to:
+            target_step = self.step_definition(step_run.sop_run_id, step.handoff_to)
+            message_type = self._handoff_message_type(
+                source_role_id=step.role_id,
+                target_role_id=target_step.role_id,
+            )
             handoff = Handoff(
                 id=str(uuid.uuid4()),
                 from_task_id=task.id,
                 to_step_id=step.handoff_to,
                 artifact_ids=list(task.output_artifact_ids),
                 context_package_id=task.context_package_id,
+                brief=(
+                    f"{step.name or step.id} 已完成；请基于附带 Artifact 继续下一阶段。"
+                ),
                 status=HandoffStatus.READY,
+                message_type=message_type,
             )
             self._handoffs[handoff.id] = handoff
             self.store.save_entity("handoffs", handoff)
             self._emit(
                 step_run.sop_run_id,
                 "handoff_created",
-                {"handoff_id": handoff.id, "to_step_id": handoff.to_step_id},
+                {
+                    "handoff_id": handoff.id,
+                    "to_step_id": handoff.to_step_id,
+                    "message_type": handoff.message_type.value,
+                    "artifact_ids": list(handoff.artifact_ids),
+                },
             )
             return handoff
         self._unlock_dependents(step_run.sop_run_id, step.id)
         return None
+
+    @staticmethod
+    def _handoff_message_type(
+        *, source_role_id: str, target_role_id: str
+    ) -> HandoffMessageType:
+        """Derive the fixed-pipeline handoff intent from declared SOP roles.
+
+        Generic SOPs retain ``HANDOFF``.  The mapping only names the four
+        role transitions already permitted by ``CommunicationPolicy``; it
+        never lets a runtime choose its own routing intent.
+        """
+        source = source_role_id.lower()
+        target = target_role_id.lower()
+        source_is_claude = source in {"claude", "planner"}
+        source_is_dsh = source in {"dsh", "executor"}
+        source_is_codex = source in {"codex", "reviewer"}
+        target_is_claude = target in {"claude", "planner"}
+        target_is_dsh = target in {"dsh", "executor"}
+        target_is_codex = target in {"codex", "reviewer"}
+
+        if source_is_claude and target_is_dsh:
+            return HandoffMessageType.PLAN_READY
+        if source_is_dsh and target_is_codex:
+            return HandoffMessageType.REVIEW_REQUEST
+        if source_is_codex and target_is_dsh:
+            return HandoffMessageType.REWORK
+        if source_is_codex and target_is_claude:
+            return HandoffMessageType.PLAN_INVALID
+        return HandoffMessageType.HANDOFF
 
     def _unlock_dependents(self, sop_run_id: str, source_step_id: str) -> None:
         sop = self._require_sop(sop_run_id)

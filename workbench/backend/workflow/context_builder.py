@@ -6,7 +6,6 @@ import uuid
 
 from ..artifacts.store import FileArtifactStore
 from ..domain.models import (
-    AcceptanceCriteria,
     Artifact,
     ContextPackage,
     Goal,
@@ -57,10 +56,20 @@ class ContextPackageBuilder:
     def _collect_upstream_artifacts(
         self, task: Task, step: StepDefinition
     ) -> list[str]:
-        """Collect accepted artifacts from dependencies and handoffs."""
+        """Collect accepted artifacts from dependencies and handoffs.
+
+        M7: Filter by task.step_run_id's sop_run_id to prevent cross-SOP pollution.
+        """
         artifact_ids_set: set[str] = set()
 
-        # Find handoffs targeting this step
+        # M7: Extract sop_run_id from the task's step_run
+        from ..domain.models import StepRun
+        step_run = StepRun.model_validate(
+            self.store.get_entity("step_runs", task.step_run_id)
+        )
+        sop_run_id = step_run.sop_run_id
+
+        # Find handoffs targeting this step within the same SOP run
         handoffs = [
             Handoff.model_validate(item)
             for item in self.store.list_entities("handoffs")
@@ -68,7 +77,13 @@ class ContextPackageBuilder:
             and item.get("status") == "accepted"
         ]
         for handoff in handoffs:
-            artifact_ids_set.update(handoff.artifact_ids)
+            # M7: Verify handoff belongs to the same SOP run
+            from_task = self.store.get_entity("tasks", handoff.from_task_id)
+            from_step_run = StepRun.model_validate(
+                self.store.get_entity("step_runs", from_task["step_run_id"])
+            )
+            if from_step_run.sop_run_id == sop_run_id:
+                artifact_ids_set.update(handoff.artifact_ids)
 
         # Find artifacts from dependency steps (not already in handoffs)
         for dep_step_id in step.depends_on:
@@ -78,7 +93,19 @@ class ContextPackageBuilder:
                 if item.get("producer_step_run_id", "").endswith(f":{dep_step_id}")
                 and item.get("accepted") is True
             ]
-            artifact_ids_set.update(artifact["id"] for artifact in dep_artifacts)
+            # M7: Filter by sop_run_id
+            for artifact in dep_artifacts:
+                producer_step_run_id = artifact.get("producer_step_run_id", "")
+                if producer_step_run_id:
+                    try:
+                        producer_step_run = StepRun.model_validate(
+                            self.store.get_entity("step_runs", producer_step_run_id)
+                        )
+                        if producer_step_run.sop_run_id == sop_run_id:
+                            artifact_ids_set.add(artifact["id"])
+                    except Exception:
+                        # Skip artifacts with invalid step_run references
+                        continue
 
         return list(artifact_ids_set)
 

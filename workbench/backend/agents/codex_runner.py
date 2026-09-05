@@ -106,7 +106,14 @@ class CodexSubagentRunner(SubagentRunner):
             app_server = getattr(self.codex_adapter, "app_server_session", None)
             if app_server is not None:
                 turn_id = app_server.current_turn_id
-            review = parse_review(output_text, thread_id=thread_id, turn_id=turn_id)
+            try:
+                review = parse_review(output_text, thread_id=thread_id, turn_id=turn_id)
+            except Exception as exc:
+                # B-fix diagnosis: keep the raw reviewer output visible so a
+                # contract-parse failure is actionable instead of opaque.
+                raise type(exc)(
+                    f"{exc} | raw reviewer output head: {output_text[:500]!r}"
+                ) from exc
             artifact = Artifact(
                 id=str(uuid.uuid4()),
                 task_id=task.id,
@@ -131,7 +138,8 @@ class CodexSubagentRunner(SubagentRunner):
     def _build_prompt(self, task: Task, context: ContextPackage) -> str:
         """Build Codex prompt from task and context.
 
-        M7: Load artifact content for CODE and TEST_RESULT types.
+        M7: Load artifact content for CODE, TEST_RESULT and PLAN types
+        (PLAN so a plan-review gate can inspect the actual plan).
         """
         parts = [
             f"# Task: {task.title}",
@@ -163,10 +171,8 @@ class CodexSubagentRunner(SubagentRunner):
                 "## Context from Previous Steps",
             ])
 
-            # M7: Load and include content for IMPLEMENTATION and TEST_REPORT
-            # artifacts through the injected workflow store.  The old
-            # ContextBuilder/MemoryStore imports referenced modules that do not
-            # exist; Artifact.type is an enum, not an "artifact_type" string.
+            # M7: Load and include content for IMPLEMENTATION, TEST_REPORT and
+            # PLAN artifacts (PLAN enables the plan-review gate).
             loaded_count = 0
             if self.store is not None:
                 for artifact_id in context.artifact_ids:
@@ -178,6 +184,7 @@ class CodexSubagentRunner(SubagentRunner):
                     if artifact.type not in {
                         ArtifactType.IMPLEMENTATION,
                         ArtifactType.TEST_REPORT,
+                        ArtifactType.PLAN,
                     }:
                         continue
                     content = artifact.content or ""
@@ -207,6 +214,22 @@ class CodexSubagentRunner(SubagentRunner):
                 parts.append(
                     "You have access to " + str(len(context.artifact_ids)) + " artifact(s) from previous steps."
                 )
+
+        # B-fix (C4): the real reviewer must emit the structured review
+        # contract, otherwise codex produces free-form text and parse_review
+        # fails closed.  Only the reviewer role gets this instruction.
+        if (task.role_id or "").lower() in {"codex", "reviewer"}:
+            parts.extend(
+                [
+                    "",
+                    "## Review Output Contract",
+                    "Reply with ONLY a single JSON object on its own, matching exactly:",
+                    '{"result": "PASS" | "REWORK" | "PLAN_INVALID", "blocking": ["<issue or reason>", ...], "non_blocking": ["<optional>", ...], "evidence": ["<what you inspected>", ...]}',
+                    "Rules: result must be exactly one of PASS|REWORK|PLAN_INVALID. "
+                    "REWORK/PLAN_INVALID require at least one blocking item. "
+                    "Do not wrap in markdown fences. Do not add prose before or after the JSON.",
+                ]
+            )
 
         return "\n".join(parts)
 

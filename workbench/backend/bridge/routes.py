@@ -1,12 +1,13 @@
 """FastAPI routes for Dify Bridge."""
 
 from fastapi import APIRouter, HTTPException, status
+
 from workbench.backend.bridge.api_models import (
     ExecuteStepRequest,
     ExecuteStepResponse,
     TaskStatusResponse,
 )
-from workbench.backend.bridge.service import BridgeService, BridgeError
+from workbench.backend.bridge.service import BridgeError, BridgeService
 
 
 def create_bridge_router(bridge_service: BridgeService) -> APIRouter:

@@ -75,9 +75,19 @@ export default function DashboardPage({ agents, tasks, events, connected }: Prop
       {/* 顶部导航 */}
       <header className="border-b border-slate-800 bg-slate-900/95 px-4 py-4 backdrop-blur sm:px-6">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-4">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-400">WSL Control Plane</p>
-            <h1 className="mt-1 text-xl font-semibold tracking-tight sm:text-2xl">智能体工作台</h1>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => navigate('/')}
+              className="rounded-md border border-slate-700 px-3 py-1 text-sm text-slate-300 hover:bg-slate-800 hover:text-white"
+              aria-label="返回 SOP 控制台"
+            >
+              ← 返回
+            </button>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-400">WSL Control Plane</p>
+              <h1 className="mt-1 text-xl font-semibold tracking-tight sm:text-2xl">智能体工作台</h1>
+            </div>
           </div>
           <div className="flex items-center gap-2 text-xs text-slate-400" role="status" aria-live="polite">
             <span className={`h-2 w-2 rounded-full ${connected ? 'bg-emerald-400' : 'bg-amber-400'}`} aria-hidden="true" />

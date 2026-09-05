@@ -60,7 +60,7 @@ managed_alive() {
 
 port_responds() {
   local url="$1"
-  curl --silent --show-error --output /dev/null --max-time 1 "$url"
+  curl --noproxy '*' --silent --show-error --output /dev/null --max-time 1 "$url"
 }
 
 wait_for_url() {
@@ -101,6 +101,21 @@ read_token() {
   token="$(<"$TOKEN_FILE")"
   [[ -n "$token" ]] || return 1
   printf '%s\n' "$token"
+}
+
+discover_canvas_session_key() {
+  local pid args key
+  while read -r pid args; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$args" == *agent-server* && "$args" == *"--port 18000"* ]] || continue
+    [[ -r "/proc/$pid/environ" ]] || continue
+    key="$(tr '\0' '\n' <"/proc/$pid/environ" | awk -F= '$1 == "OH_SESSION_API_KEYS_0" { print substr($0, index($0, "=") + 1); exit }')"
+    if [[ -n "$key" ]]; then
+      printf '%s\n' "$key"
+      return 0
+    fi
+  done < <(ps -eo pid=,args=)
+  return 1
 }
 
 status() {
@@ -152,14 +167,24 @@ start() {
   fi
   [[ -n "$token" ]] || die "无法生成临时 token"
 
+  local canvas_key="${WORKBENCH_CANVAS_SESSION_API_KEY:-}"
+  if [[ -z "$canvas_key" ]]; then
+    canvas_key="$(discover_canvas_session_key 2>/dev/null || true)"
+  fi
+  local -a backend_env=(
+    "WORKBENCH_AUTH_TOKEN=$token"
+    "WORKBENCH_STATE=$STATE_FILE"
+    "WORKBENCH_EVENT_LOG=$EVENT_LOG"
+    "WORKBENCH_WORKSPACE_ROOT=$PROJECT_DIR"
+    "WORKBENCH_CODEX_HOME=$CODEX_HOME_DIR"
+    "WORKBENCH_ALLOWED_ORIGINS=http://$BACKEND_HOST:$FRONTEND_PORT"
+  )
+  if [[ -n "$canvas_key" ]]; then
+    backend_env+=("WORKBENCH_CANVAS_SESSION_API_KEY=$canvas_key")
+  fi
+
   printf '正在启动 Workbench...\n'
-  setsid env \
-    WORKBENCH_AUTH_TOKEN="$token" \
-    WORKBENCH_STATE="$STATE_FILE" \
-    WORKBENCH_EVENT_LOG="$EVENT_LOG" \
-    WORKBENCH_WORKSPACE_ROOT="$PROJECT_DIR" \
-    WORKBENCH_CODEX_HOME="$CODEX_HOME_DIR" \
-    WORKBENCH_ALLOWED_ORIGINS="http://$BACKEND_HOST:$FRONTEND_PORT" \
+  setsid env "${backend_env[@]}" \
     "$UV_BIN" run uvicorn workbench.backend.main:app \
       --host "$BACKEND_HOST" --port "$BACKEND_PORT" --log-level warning \
       >"$BACKEND_LOG" 2>&1 < /dev/null &

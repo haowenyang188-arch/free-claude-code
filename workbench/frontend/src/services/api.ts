@@ -2,7 +2,8 @@ import { Agent, Task, Run, Event, CreateTaskRequest, ApprovalIdentity, ApprovalR
 
 const API_BASE = '/api'
 
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+/** 统一的 /api 请求封装。SOP 控制台（services/sopApi.ts）复用它，不另起一套。 */
+export async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
     credentials: 'include',

@@ -260,6 +260,7 @@ class SopRun(BaseModel):
     current_step_id: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class StageRun(BaseModel):

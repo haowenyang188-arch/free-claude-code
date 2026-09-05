@@ -14,10 +14,10 @@ from harness.bridge import DeepSeekHarnessBridge
 from harness.config import HarnessConfig
 from harness.events import safe_log_context
 from providers.common.identity import RuntimeIdentity
-from .dsh_transport import DshClient, DshTransportError, discover_dsh_desktop_endpoint
 
 from ..models import AgentStatus, AgentType, EventType
 from .base import BaseAgentAdapter
+from .dsh_transport import DshClient, DshTransportError, discover_dsh_desktop_endpoint
 
 
 def _dsh_event_identity(

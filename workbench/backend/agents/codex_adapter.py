@@ -11,7 +11,7 @@ from cli.codex_session import CodexSession
 from cli.runtime_registry import RuntimeBackend, RuntimeRegistry
 from providers.common.identity import RuntimeIdentity
 
-from ..runtime.approval import ApprovalManager, ApprovalRecord
+from ..runtime.approval import ApprovalManager, ApprovalRecord, ApprovalScope
 from .codex_app_server import CodexAppServerSession
 
 if __package__:
@@ -78,7 +78,13 @@ class CodexAdapter(BaseAgentAdapter):
         ).available
 
     async def start_task(
-        self, run_id: str, task_description: str, workspace_path: str
+        self,
+        run_id: str,
+        task_description: str,
+        workspace_path: str,
+        *,
+        sandbox_mode: str | None = None,
+        approval_scope: str = ApprovalScope.NORMAL,
     ) -> bool:
         """Start a Codex task through the shared hardened CLI session."""
         self.current_run_id = run_id
@@ -103,9 +109,14 @@ class CodexAdapter(BaseAgentAdapter):
                 requested_workspace = (
                     Path(workspace_path).expanduser().resolve(strict=True)
                 )
+                resolved_sandbox = sandbox_mode or "workspace-write"
                 if (
                     self.app_server_session is not None
-                    and self.app_server_session.workspace != requested_workspace
+                    and (
+                        self.app_server_session.workspace != requested_workspace
+                        or self.app_server_session.sandbox_mode != resolved_sandbox
+                        or self.app_server_session.approval_scope != approval_scope
+                    )
                 ):
                     await self.app_server_session.stop()
                     self.app_server_session = None
@@ -113,9 +124,10 @@ class CodexAdapter(BaseAgentAdapter):
                 if self.app_server_session is None:
                     self.app_server_session = CodexAppServerSession(
                         workspace_path=workspace_path,
-                        sandbox_mode="workspace-write",
+                        sandbox_mode=resolved_sandbox,
                         approval_manager=self.approval_manager,
                         on_approval_pending=self._on_approval_pending,
+                        approval_scope=approval_scope,
                     )
                 self.session = self.app_server_session
             elif self.session is None:
@@ -309,9 +321,15 @@ class CodexAdapter(BaseAgentAdapter):
                                 identity=event_identity,
                             )
                         elif exit_code == 0:
+                            # Role contract RC-2: the Reviewer reports that its
+                            # own turn ended.  It must NOT declare the task
+                            # complete -- terminality belongs to the SOP Engine.
                             await self.emit_event(
                                 EventType.RUN_FINISHED,
-                                {"message": "Task completed successfully"},
+                                {
+                                    "message": "Reviewer turn finished; verdict "
+                                    "subject to SOP Engine routing"
+                                },
                                 run_id=run_id,
                                 identity=event_identity,
                             )
@@ -411,11 +429,19 @@ class CodexAdapter(BaseAgentAdapter):
         return False
 
     async def cancel(self) -> bool:
-        """取消执行"""
+        """取消执行 — turn/interrupt 优先，进程 kill 仅作 fallback"""
         if self.session:
             run_id = self.current_run_id
             self._cancel_requested = True
-            result = await self.session.stop()
+            if (
+                isinstance(self.session, CodexAppServerSession)
+                and self.session.is_busy
+            ):
+                result = await self.session.interrupt_turn()
+                if not result:
+                    result = await self.session.stop()
+            else:
+                result = await self.session.stop()
             if result:
                 self.status = AgentStatus.ONLINE
                 if not self._terminal_event_emitted:
@@ -427,6 +453,17 @@ class CodexAdapter(BaseAgentAdapter):
                 self.current_run_id = None
             return result
         return False
+
+    async def interrupt(self) -> bool:
+        """Turn-level interrupt (preferred over process kill).
+
+        Only cancels the current codex turn; the app-server process and the
+        thread survive, so a follow-up turn can run afterwards.  Falls back to
+        ``cancel()`` (process stop) for non-app-server sessions.
+        """
+        if isinstance(self.session, CodexAppServerSession):
+            return await self.session.interrupt_turn()
+        return await self.cancel()
 
     async def get_status(self) -> dict[str, Any]:
         """获取当前状态"""

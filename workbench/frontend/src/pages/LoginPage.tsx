@@ -33,7 +33,33 @@ export default function LoginPage({ onAuthenticated }: Props) {
           <h1 className="text-2xl font-semibold tracking-tight">智能体工作台</h1>
           <p className="mt-2 text-sm leading-6 text-slate-400">输入本机 Workbench token，建立安全的手机控制会话。</p>
         </div>
+        <aside
+          data-testid="login-token-help"
+          className="mb-6 space-y-2 rounded-lg border border-cyan-900/60 bg-cyan-950/20 px-3 py-3 text-xs leading-5 text-slate-400"
+          aria-labelledby="login-token-help-title"
+        >
+          <h2 id="login-token-help-title" className="text-sm font-medium text-slate-200">访问 token 是什么？</h2>
+          <p>它是启动脚本会在用户运行时目录生成的 Workbench 登录凭证，只用于 <code className="font-mono text-cyan-300">http://127.0.0.1:3000</code>。</p>
+          <ol className="list-decimal space-y-1 pl-4">
+            <li>先进入仓库根目录：<code className="font-mono text-cyan-300">cd /home/gnen/free-claude-code</code>。</li>
+            <li>运行 <code className="font-mono text-cyan-300">./workbench/launcher.sh start</code>。</li>
+            <li>启动命令会在当前终端显示 token；已运行时再次执行 <code className="font-mono text-cyan-300">./workbench/launcher.sh start</code> 也会显示当前 token。</li>
+            <li>只读查看服务状态可运行 <code className="font-mono text-cyan-300">./workbench/launcher.sh status</code>。</li>
+          </ol>
+          <p className="text-slate-500">它不是 Agent Canvas 的会话密钥（Agent Canvas 入口是 8010）。本地模式会自动注入自己的密钥，不要把两个 token 互相粘贴。</p>
+          <p className="text-slate-500">完整说明见仓库中的 <code className="font-mono text-cyan-300">workbench/docs/AGENT-CANVAS-OPERATIONS.md</code>。</p>
+        </aside>
         <form onSubmit={submit} className="space-y-4">
+          <input
+            type="text"
+            name="username"
+            autoComplete="username"
+            value="workbench"
+            readOnly
+            tabIndex={-1}
+            aria-hidden="true"
+            className="sr-only"
+          />
           <div>
             <label htmlFor="workbench-token" className="mb-2 block text-sm font-medium text-slate-200">访问 token</label>
             <input

@@ -3,6 +3,7 @@
 from .engine import (
     AcceptanceValidator,
     ExecutionResult,
+    ReviewRouteDecision,
     SubagentRunner,
     WorkflowEngine,
     WorkflowEngineError,
@@ -14,6 +15,7 @@ __all__ = [
     "AutoOrchestrator",
     "ExecutionResult",
     "ManualOrchestrator",
+    "ReviewRouteDecision",
     "SOPOrchestrator",
     "SubagentRunner",
     "WorkflowEngine",

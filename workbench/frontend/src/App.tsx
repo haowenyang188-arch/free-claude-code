@@ -7,6 +7,9 @@ import DashboardPage from './pages/DashboardPage'
 import TaskDetailPage from './pages/TaskDetailPage'
 import RunDetailPage from './pages/RunDetailPage'
 import LoginPage from './pages/LoginPage'
+import SopConsolePage from './pages/SopConsolePage'
+import AgentCanvasPage from './pages/AgentCanvasPage'
+import CollectorPage from './pages/CollectorPage'
 
 function App() {
   const [agents, setAgents] = useState<Agent[]>([])
@@ -80,7 +83,13 @@ function App() {
       }}
     >
       <Routes>
-        <Route path="/" element={<DashboardPage agents={agents} tasks={tasks} events={events} connected={connected} />} />
+        {/* SOP 控制台作为主入口；旧版仪表盘保留在 /dashboard */}
+        <Route path="/" element={<SopConsolePage />} />
+        <Route path="/sop" element={<SopConsolePage />} />
+        {/* P1-A：Agent Canvas 会话视图（A 生产架构的「会话面」） */}
+        <Route path="/agent" element={<AgentCanvasPage />} />
+        <Route path="/collector" element={<CollectorPage />} />
+        <Route path="/dashboard" element={<DashboardPage agents={agents} tasks={tasks} events={events} connected={connected} />} />
         <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
         <Route path="/runs/:runId" element={<RunDetailPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />

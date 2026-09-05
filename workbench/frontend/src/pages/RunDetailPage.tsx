@@ -7,6 +7,7 @@ export default function RunDetailPage() {
   const { runId } = useParams<{ runId: string }>()
   const navigate = useNavigate()
   const [run, setRun] = useState<(Omit<Run, 'events'> & { events: Event[] }) | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [message, setMessage] = useState('')
   const [activeTab, setActiveTab] = useState<'messages' | 'tools' | 'files' | 'terminal'>('messages')
   const [approvalBusy, setApprovalBusy] = useState(false)
@@ -21,8 +22,13 @@ export default function RunDetailPage() {
 
   const loadRun = async () => {
     if (runId) {
-      const data = await api.getRun(runId)
-      setRun(data)
+      try {
+        const data = await api.getRun(runId)
+        setRun(data)
+        setLoadError(null)
+      } catch (e) {
+        setLoadError(e instanceof Error ? e.message : '加载失败')
+      }
     }
   }
 
@@ -59,8 +65,34 @@ export default function RunDetailPage() {
 
   if (!run) {
     return (
-      <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
-        <div>加载中...</div>
+      <div className="min-h-screen bg-gray-900 text-white">
+        <header className="bg-gray-800 border-b border-gray-700 p-4">
+          <div className="container mx-auto flex items-center justify-between">
+            <div className="flex items-center space-x-4">
+              <button
+                type="button"
+                onClick={() => navigate('/')}
+                className="hover:text-blue-400"
+              >
+                ← 返回
+              </button>
+              <h1 className="text-xl font-bold">Run 详情</h1>
+            </div>
+          </div>
+        </header>
+        <div className="container mx-auto p-6">
+          {loadError ? (
+            <div className="rounded border border-red-600 bg-red-900/30 p-4 text-red-200" role="alert">
+              <div className="mb-1 font-medium">加载 Run 失败</div>
+              <div className="text-sm">{loadError}</div>
+              <div className="mt-2 text-xs text-red-300">
+                可能是 404（旧仪表盘接口已变更）或后端不可用。
+              </div>
+            </div>
+          ) : (
+            <div>加载中...</div>
+          )}
+        </div>
       </div>
     )
   }

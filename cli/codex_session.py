@@ -106,6 +106,30 @@ class CodexSession:
             command.extend(["--ignore-user-config", "--strict-config"])
             if not self.approval_policy.enabled:
                 command.append("--ignore-rules")
+            # B-gap fix: --ignore-user-config also drops the tkapi model-provider
+            # routing from ~/.codex/config.toml, so codex exec falls back to
+            # api.openai.com with an invalid key and hangs on 401 retries.
+            # Re-inject the local gateway provider via --config overrides
+            # (deterministic, no hooks/approval from user config). Override with
+            # CODEX_GATEWAY_BASE_URL to point elsewhere; empty disables.
+            gateway_base = os.getenv("CODEX_GATEWAY_BASE_URL", "http://127.0.0.1:15721/v1")
+            if gateway_base:
+                command.extend(
+                    [
+                        "--config",
+                        'model_provider="custom"',
+                        "--config",
+                        f'model="{os.getenv("CODEX_GATEWAY_MODEL", "gpt-5.6-sol")}"',
+                        "--config",
+                        "model_providers.custom.name=tkapi-gw",
+                        "--config",
+                        f"model_providers.custom.base_url={gateway_base}",
+                        "--config",
+                        "model_providers.custom.wire_api=responses",
+                        "--config",
+                        "model_providers.custom.requires_openai_auth=true",
+                    ]
+                )
         if self.approval_policy.enabled:
             command.extend(
                 [

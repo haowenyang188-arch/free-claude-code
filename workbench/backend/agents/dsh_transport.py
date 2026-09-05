@@ -28,13 +28,13 @@ Empirical contract notes (v2.0.3, observed on the loopback webserver):
 
 from __future__ import annotations
 
-import asyncio
 import json
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable, Iterable
+from typing import Any
 
 # --------------------------------------------------------------------------
 # Wire types (Typert envelope)
@@ -302,19 +302,26 @@ def discover_dsh_desktop_endpoint() -> str | None:
             capture_output=True, timeout=10,
         )
         pids = set(re.findall(r"\b(\d{3,6})\b", task.stdout.decode("utf-8", errors="replace")))
-        if not pids:
-            return None
-        net = subprocess.run([netstat, "-ano"], capture_output=True, timeout=10)
-        listeners: list[str] = []
-        for line in net.stdout.decode("utf-8", errors="replace").splitlines():
-            m = re.match(r"\s*TCP\s+(\S+:\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$", line)
-            if m and m.group(2) in pids:
-                addr, port = m.group(1).rsplit(":", 1)
-                if addr in ("127.0.0.1", "[::1]"):
-                    listeners.append(f"{addr}:{port}")
-        return discover_endpoint(listeners)
+        if pids:
+            net = subprocess.run([netstat, "-ano"], capture_output=True, timeout=10)
+            listeners: list[str] = []
+            for line in net.stdout.decode("utf-8", errors="replace").splitlines():
+                m = re.match(r"\s*TCP\s+(\S+:\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$", line)
+                if m and m.group(2) in pids:
+                    addr, port = m.group(1).rsplit(":", 1)
+                    if addr in ("127.0.0.1", "[::1]"):
+                        listeners.append(f"{addr}:{port}")
+            found = discover_endpoint(listeners)
+            if found:
+                return found
     except (OSError, subprocess.SubprocessError, TimeoutError):
-        return None
+        pass
+    # B-gap fallback: under some daemon/service contexts (uvicorn) the Windows
+    # interop subprocesses can fail or return nothing even though the Desktop
+    # API is listening on the observed-stable loopback port.  The port is still
+    # NOT part of primary discovery; this is a last-resort single-endpoint
+    # probe so SOP execute steps do not hard-fail on a transient interop issue.
+    return discover_endpoint(["127.0.0.1:43120"])
 
 
 # --------------------------------------------------------------------------

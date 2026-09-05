@@ -64,7 +64,11 @@ class TestCodexSession:
             "inspect"
         )
 
-        assert command.count("--config") == 5
+        # approval hook projection (5 configs) + tkapi gateway routing
+        # overrides (6 configs) — see cli/codex_session.py gateway fix
+        assert command.count("--config") == 11
+        assert any(v.startswith("model_provider=") for v in command)
+        assert any(v.startswith("model_providers.custom.base_url=") for v in command)
         assert any("hooks.PreToolUse" in value for value in command)
         assert any("hooks.PermissionRequest" in value for value in command)
 
