@@ -1,5 +1,6 @@
 """Tests for Bridge service layer."""
 
+import asyncio
 import pytest
 from datetime import datetime
 from unittest.mock import AsyncMock, Mock
@@ -256,3 +257,84 @@ class TestBridgeServiceBackgroundExecution:
         status = await bridge_service.get_task_status(task_id)
         assert status.status == TaskStatus.FAILED
         assert "Runtime execution failed" in status.error
+
+    async def test_background_task_handles_timeout(
+        self, bridge_service, mock_runner
+    ):
+        """Should update task status to FAILED when execution times out."""
+        request = ExecuteStepRequest(
+            workflow_run_id="dify-run-123",
+            node_id="researcher-node",
+            role="security_researcher",
+            capability="research_oauth2",
+            goal="Research OAuth2",
+            runtime_kind="claude_code",
+        )
+
+        # Mock runner to simulate a slow operation that exceeds timeout
+        async def slow_execute(*args, **kwargs):
+            await asyncio.sleep(10)  # Simulate long execution
+            return Artifact(
+                id="artifact-789",
+                task_id="task-456",
+                type="text",
+                content="Result",
+                summary="Done",
+            )
+
+        mock_runner.execute.side_effect = slow_execute
+
+        # Create service with short timeout
+        short_timeout_service = BridgeService(runner=mock_runner, execution_timeout=0.1)
+
+        execute_response = await short_timeout_service.execute_step(request)
+        task_id = execute_response.task_id
+
+        # Wait for background task to timeout
+        await short_timeout_service._wait_for_task(task_id)
+
+        status = await short_timeout_service.get_task_status(task_id)
+        assert status.status == TaskStatus.FAILED
+        assert "timed out after 0.1s" in status.error
+
+
+@pytest.mark.asyncio
+class TestBridgeServiceTimeout:
+    """Test timeout configuration and behavior."""
+
+    async def test_default_timeout_is_300_seconds(self, mock_runner):
+        """Should use default timeout of 300 seconds."""
+        service = BridgeService(runner=mock_runner)
+        assert service._execution_timeout == 300.0
+
+    async def test_custom_timeout_can_be_set(self, mock_runner):
+        """Should allow custom timeout configuration."""
+        service = BridgeService(runner=mock_runner, execution_timeout=120.0)
+        assert service._execution_timeout == 120.0
+
+    async def test_timeout_error_message_includes_duration(self, mock_runner):
+        """Timeout error should include the configured timeout duration."""
+        async def slow_execute(*args, **kwargs):
+            await asyncio.sleep(10)
+            return Artifact(
+                id="art-1", task_id="task-1", type="text", content="", summary=""
+            )
+
+        mock_runner.execute.side_effect = slow_execute
+        service = BridgeService(runner=mock_runner, execution_timeout=0.05)
+
+        request = ExecuteStepRequest(
+            workflow_run_id="run-1",
+            node_id="node-1",
+            role="researcher",
+            capability="research",
+            goal="Test timeout",
+            runtime_kind="claude_code",
+        )
+
+        response = await service.execute_step(request)
+        await service._wait_for_task(response.task_id)
+
+        status = await service.get_task_status(response.task_id)
+        assert status.status == TaskStatus.FAILED
+        assert "0.05s" in status.error
