@@ -2,8 +2,10 @@
 
 Executes through the REAL runtimes only (execution-side revision #10):
 - Claude Code CLI (ClaudeCodeAdapter)
-- DSH Desktop v2 bridge (DshClient)
 - Codex CLI / app-server (CodexAdapter)
+
+（DSH 桥已按 2026-09-06 定版从流水线移除；本 e2e 同步改为
+Claude PLAN -> Codex REVIEW 两步真流程冒烟。）
 
 NO FakeStore, NO API-key runners, NO skip-on-failure, NO RUNNING-as-pass.
 External failures (auth / balance / service unavailable / network) are
@@ -58,7 +60,7 @@ def _sop():
     goal = Goal(id="g-real-e2e", project_id="p", description="real e2e")
     sop = SopDefinition(
         id="sop-real-e2e",
-        name="plan execute review",
+        name="plan review",
         stages=[
             StageDefinition(
                 id="s1",
@@ -72,19 +74,11 @@ def _sop():
                         handoff_to="execute",
                     ),
                     StepDefinition(
-                        id="execute",
-                        name="Execute",
-                        role_id="dsh",
-                        output_type=ArtifactType.IMPLEMENTATION,
-                        depends_on=["plan"],
-                        handoff_to="review",
-                    ),
-                    StepDefinition(
                         id="review",
                         name="Review",
                         role_id="codex",
                         output_type=ArtifactType.REVIEW_REPORT,
-                        depends_on=["execute"],
+                        depends_on=["plan"],
                     ),
                 ],
             )
@@ -117,7 +111,7 @@ def real_engine(tmp_path):
 
 @pytest.mark.asyncio
 async def test_real_e2e_full_loop(real_engine, tmp_path):
-    """Claude PLAN -> DSH EXECUTE (DIFF + TEST_REPORT) -> Codex REVIEW -> COMPLETE.
+    """Claude PLAN -> Codex REVIEW -> user-approved COMPLETE.
 
     Success requires the full evidence chain; external provider failure is
     reported as BLOCKED_EXTERNAL, never converted to skip or pass.
@@ -151,12 +145,10 @@ async def test_real_e2e_full_loop(real_engine, tmp_path):
     # are BLOCKED_EXTERNAL.  Workbench bugs (WorkflowEngineError, parse
     # failures, assertion defects) propagate as ordinary test failures so the
     # E2E can distinguish provider outages from Workbench defects.
-    from workbench.backend.agents.dsh_transport import DshTransportError
     from workbench.backend.workflow.runners import RunnerError
 
     external_types = (
         RuntimeUnavailableError,
-        DshTransportError,
         RunnerError,
         OSError,
         ConnectionError,

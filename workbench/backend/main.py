@@ -37,17 +37,24 @@ if __package__:
     from .artifacts.store import ArtifactStoreError, FileArtifactStore
     from .domain.models import (
         Artifact,
+        ArtifactType,
         Goal,
         GoalStatus,
+        Handoff,
+        HandoffMessageType,
+        HandoffStatus,
+        RuntimeKind,
         SopDefinition,
         SopRun,
         SopRunStatus,
         StepDefinition,
+        StepRun,
         SubagentAssignment,
     )
     from .domain.models import (
         Task as SopTask,
     )
+    from .integrations.canvas import router as canvas_integration_router
     from .models import (
         Agent,
         AgentStatus,
@@ -83,7 +90,10 @@ if __package__:
         ReviewEvidenceResponse,
         SopControlRequest,
         SopEventResponse,
+        SopHandoffDispatchResponse,
         SopRunStatusResponse,
+        SopTraceEntryResponse,
+        SopTraceResponse,
         StartSopRunRequest,
         StartSopRunResponse,
         StepRunResponse,
@@ -91,9 +101,14 @@ if __package__:
     )
     from .validation.always_accept import AlwaysAcceptValidator
     from .workflow.context_builder import ContextPackageBuilder
-    from .workflow.engine import WorkflowEngine
+    from .workflow.dispatcher import (
+        CommunicationPolicy,
+        HandoffDispatcher,
+        PolicyViolation,
+    )
+    from .workflow.engine import WorkflowEngine, WorkflowEngineError
     from .workflow.orchestrator import AutoOrchestrator
-    from .workflow.runner_factory import create_runners
+    from .workflow.runner_factory import RuntimeUnavailableError, create_runners
 else:  # Support ``python workbench/backend/main.py`` as a local entry point.
     import sys
 
@@ -105,12 +120,18 @@ else:  # Support ``python workbench/backend/main.py`` as a local entry point.
     from workbench.backend.artifacts.store import ArtifactStoreError, FileArtifactStore
     from workbench.backend.domain.models import (
         Artifact,
+        ArtifactType,
         Goal,
         GoalStatus,
+        Handoff,
+        HandoffMessageType,
+        HandoffStatus,
+        RuntimeKind,
         SopDefinition,
         SopRun,
         SopRunStatus,
         StepDefinition,
+        StepRun,
         SubagentAssignment,
     )
     from workbench.backend.domain.models import (
@@ -153,10 +174,16 @@ else:  # Support ``python workbench/backend/main.py`` as a local entry point.
     )
     from workbench.backend.sop_models import (
         ArtifactResponse,
+        AttemptChainResponse,
+        AttemptResponse,
         HandoffResponse,
+        ReviewEvidenceResponse,
         SopControlRequest,
         SopEventResponse,
+        SopHandoffDispatchResponse,
         SopRunStatusResponse,
+        SopTraceEntryResponse,
+        SopTraceResponse,
         StartSopRunRequest,
         StartSopRunResponse,
         StepRunResponse,
@@ -164,13 +191,31 @@ else:  # Support ``python workbench/backend/main.py`` as a local entry point.
     )
     from workbench.backend.validation.always_accept import AlwaysAcceptValidator
     from workbench.backend.workflow.context_builder import ContextPackageBuilder
-    from workbench.backend.workflow.engine import WorkflowEngine
+    from workbench.backend.workflow.dispatcher import (
+        CommunicationPolicy,
+        HandoffDispatcher,
+        PolicyViolation,
+    )
+    from workbench.backend.workflow.engine import WorkflowEngine, WorkflowEngineError
     from workbench.backend.workflow.orchestrator import AutoOrchestrator
-    from workbench.backend.workflow.runner_factory import create_runners
+    from workbench.backend.workflow.runner_factory import (
+        RuntimeUnavailableError,
+        create_runners,
+    )
 
 
 class _SessionAwareAdapter(Protocol):
     session_id: str | None
+
+
+class HandoffDispatchValidationError(ValueError):
+    """A client-visible precondition failed before the Engine mutates state."""
+
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
 
 
 _WORKBENCH_PROVIDER_BY_RUNTIME: dict[str, str] = {
@@ -287,7 +332,8 @@ class WorkbenchService:
         self.event_envelopes: dict[str, EventEnvelope] = {}
         self._run_provenance: dict[str, tuple[str | None, str | None, str | None]] = {}
         self.websocket_connections: list[WebSocket] = []
-
+        self.sop_runtime_mode = os.environ.get("RUNTIME_MODE", "fake").strip().lower()
+        self.manual_handoffs = os.environ.get("WORKBENCH_MANUAL_HANDOFFS", "0") == "1"
         # SOP workflow components
         self._init_sop_workflow()
 
@@ -307,11 +353,17 @@ class WorkbenchService:
             root=sop_workspace / "artifacts",
         )
 
-        # Runtime adapters from RUNTIME_MODE (default fake; real fails closed)
+        # Runtime adapters from RUNTIME_MODE (fake is explicit for tests; real
+        # mode fails closed rather than silently replacing a missing runtime).
         runners = create_runners(
+            mode=self.sop_runtime_mode,
             store=self.workflow_store,
             artifact_store=self.artifact_store,
-            workspace_path=str(sop_workspace),
+            workspace_path=str(self.workspace_policy.root),
+            # B1: optional shared-workspace (WSL /mnt view) for Claude/Codex so
+            # they verify the SAME files DSH Desktop writes on Windows.
+            cross_os_workspace=os.environ.get("WORKBENCH_SOP_RUNTIME_WORKSPACE")
+            or None,
         )
         validator = AlwaysAcceptValidator()
 
@@ -325,13 +377,569 @@ class WorkbenchService:
             store=self.workflow_store,
             artifact_store=self.artifact_store,
         )
-        self.orchestrator = AutoOrchestrator(self.workflow_engine)
+        self.orchestrator = AutoOrchestrator(
+            self.workflow_engine,
+            manual_handoffs=self.manual_handoffs,
+        )
+        self.handoff_dispatcher = self._handoff_dispatcher()
 
         # SOP definitions cache (will be loaded from storage)
         self.sop_definitions: dict[str, SopDefinition] = {}
 
         # Background SOP execution tasks
         self._background_sop_tasks: dict[str, asyncio.Task] = {}
+
+    def _sop_run_id_for_handoff(self, handoff: Handoff) -> str:
+        source_task = self.workflow_engine._get_model(
+            "tasks", handoff.from_task_id, SopTask
+        )
+        source_step = self.workflow_engine._get_model(
+            "step_runs", source_task.step_run_id, StepRun
+        )
+        return source_step.sop_run_id
+
+    @staticmethod
+    def _runtime_id_for_sop_role(role_id: str) -> str:
+        role = role_id.lower()
+        if role in {"claude", "planner"}:
+            return "claude"
+        if role in {"codex", "reviewer", "codex_executor"}:
+            # codex_executor 与 codex 共用 Codex CLI runtime；
+            # 读写沙箱差异由 runner 按 SubagentAssignment.role_id 区分（F-5）。
+            return "codex"
+        if role in {"dsh", "executor"}:
+            # legacy：历史 run 兼容；新流水线（claude-codex-v2）不再分配 dsh。
+            return "dsh"
+        return "default"
+
+    def _handoff_assignment_resolver(
+        self, role_id: str, sop_run_id: str
+    ) -> SubagentAssignment:
+        """Resolve a fixed role without allowing browser-selected runtimes.
+
+        Existing same-run assignments contribute session continuity.  The
+        task id is replaced by the dispatcher after Engine task creation.
+        """
+        session_id: str | None = None
+        for item in reversed(self.workflow_store.list_entities("assignments")):
+            if item.get("role_id") != role_id or not item.get("session_id"):
+                continue
+            try:
+                prior_task = self.workflow_engine._get_model(
+                    "tasks", item["task_id"], SopTask
+                )
+                prior_step = self.workflow_engine._get_model(
+                    "step_runs", prior_task.step_run_id, StepRun
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if prior_step.sop_run_id == sop_run_id:
+                session_id = str(item["session_id"])
+                break
+        runtime_id = self._runtime_id_for_sop_role(role_id)
+        return SubagentAssignment(
+            id=str(uuid.uuid4()),
+            task_id=f"{sop_run_id}:{role_id}:pending",
+            role_id=role_id,
+            agent_instance_id=f"sop-{runtime_id}",
+            runtime_id=runtime_id,
+            session_id=session_id,
+        )
+
+    def _handoff_dispatcher(self) -> HandoffDispatcher:
+        existing = getattr(self, "handoff_dispatcher", None)
+        if isinstance(existing, HandoffDispatcher) and existing.engine is self.workflow_engine:
+            return existing
+        dispatcher = HandoffDispatcher(
+            engine=self.workflow_engine,
+            policy=CommunicationPolicy(),
+            runtime_registry={
+                "claude": RuntimeKind.CLAUDE_CODE,
+                "dsh": RuntimeKind.DEEPSEEK_HARNESS,
+                "codex": RuntimeKind.CODEX,
+                "default": RuntimeKind.CUSTOM,
+            },
+            resolve_assignment=self._handoff_assignment_resolver,
+        )
+        self.handoff_dispatcher = dispatcher
+        return dispatcher
+
+    async def _ensure_dsh_dispatch_available(self) -> None:
+        adapter = getattr(self.workflow_engine, "_runners", {}).get("dsh")
+        client = getattr(adapter, "_client", None)
+        if client is None:
+            raise RuntimeUnavailableError("DSH runtime is not configured")
+        try:
+            await asyncio.to_thread(client.list_sessions)
+        except Exception as exc:
+            raise RuntimeUnavailableError(
+                "DSH Desktop is not reachable; start DSH Desktop before dispatching"
+            ) from exc
+
+    def _prepare_sop_handoff_dispatch(
+        self, *, sop_run_id: str, handoff_id: str
+    ) -> tuple[Handoff, SopTask, StepDefinition, str, str]:
+        """Validate a browser-selected Handoff before Engine dispatch.
+
+        The browser supplies only stable IDs. Roles, runtimes, artifact lineage,
+        and policy all come from persisted SOP state, never from request input.
+        """
+        try:
+            self.workflow_store.get_entity("sop_runs", sop_run_id)
+        except KeyError as exc:
+            raise HandoffDispatchValidationError(
+                404, "sop_run_not_found", "SOP run not found"
+            ) from exc
+
+        try:
+            handoff = Handoff.model_validate(
+                self.workflow_store.get_entity("handoffs", handoff_id)
+            )
+            source_task = self.workflow_engine._get_model(
+                "tasks", handoff.from_task_id, SopTask
+            )
+            source_step = self.workflow_engine._get_model(
+                "step_runs", source_task.step_run_id, StepRun
+            )
+        except (KeyError, TypeError, ValueError, WorkflowEngineError) as exc:
+            raise HandoffDispatchValidationError(
+                404, "handoff_not_found", "Handoff not found"
+            ) from exc
+
+        if source_step.sop_run_id != sop_run_id:
+            raise HandoffDispatchValidationError(
+                404, "handoff_not_in_run", "Handoff does not belong to this SOP run"
+            )
+        if handoff.status is not HandoffStatus.READY:
+            raise HandoffDispatchValidationError(
+                409,
+                "handoff_not_ready",
+                f"Handoff is {handoff.status.value}, not ready",
+            )
+
+        try:
+            target = self.workflow_engine.step_definition(
+                sop_run_id, handoff.to_step_id
+            )
+        except (KeyError, TypeError, ValueError, WorkflowEngineError) as exc:
+            raise HandoffDispatchValidationError(
+                422, "handoff_target_invalid", "Handoff target step is invalid"
+            ) from exc
+
+        source_runtime_id = self._runtime_id_for_sop_role(source_task.role_id)
+        target_runtime_id = self._runtime_id_for_sop_role(target.role_id)
+        if target_runtime_id != "dsh":
+            raise HandoffDispatchValidationError(
+                422,
+                "handoff_target_not_dsh",
+                "Only a DSH target step can be dispatched from this endpoint",
+            )
+        if source_runtime_id not in {"claude", "codex"}:
+            raise HandoffDispatchValidationError(
+                422,
+                "handoff_source_not_collaboration_agent",
+                "Only Claude PLAN or Codex REWORK output can be sent to DSH",
+            )
+        if not handoff.artifact_ids:
+            raise HandoffDispatchValidationError(
+                422,
+                "handoff_artifacts_missing",
+                "Handoff must carry at least one accepted Artifact",
+            )
+
+        artifacts: dict[str, Artifact] = {}
+        for artifact_id in handoff.artifact_ids:
+            try:
+                artifact = Artifact.model_validate(
+                    self.workflow_store.get_entity("artifacts", artifact_id)
+                )
+                producer_task = self.workflow_engine._get_model(
+                    "tasks", artifact.task_id, SopTask
+                )
+                producer_step = self.workflow_engine._get_model(
+                    "step_runs", producer_task.step_run_id, StepRun
+                )
+            except (KeyError, TypeError, ValueError, WorkflowEngineError) as exc:
+                raise HandoffDispatchValidationError(
+                    422,
+                    "handoff_artifact_missing",
+                    "Handoff references an unavailable Artifact",
+                ) from exc
+            if producer_step.sop_run_id != sop_run_id or not artifact.accepted:
+                raise HandoffDispatchValidationError(
+                    422,
+                    "handoff_artifact_untrusted",
+                    "Handoff Artifact is not accepted in this SOP run",
+                )
+            artifacts[artifact.id] = artifact
+
+        if handoff.message_type is HandoffMessageType.PLAN_READY:
+            if source_runtime_id != "claude" or any(
+                artifact.task_id != source_task.id
+                or artifact.type is not ArtifactType.PLAN
+                for artifact in artifacts.values()
+            ):
+                raise HandoffDispatchValidationError(
+                    422,
+                    "plan_handoff_artifact_invalid",
+                    "PLAN_READY must carry accepted PLAN Artifacts from Claude",
+                )
+        elif handoff.message_type is HandoffMessageType.REWORK:
+            if source_runtime_id != "codex":
+                raise HandoffDispatchValidationError(
+                    422,
+                    "rework_handoff_source_invalid",
+                    "REWORK must originate from the Codex review step",
+                )
+            review_report_ids = {
+                artifact.id
+                for artifact in artifacts.values()
+                if artifact.task_id == source_task.id
+                and artifact.type is ArtifactType.REVIEW_REPORT
+            }
+            if not review_report_ids:
+                raise HandoffDispatchValidationError(
+                    422,
+                    "rework_handoff_artifact_invalid",
+                    "REWORK must carry Codex's accepted REVIEW_REPORT",
+                )
+            allowed_ids = set(review_report_ids)
+            for row in self.workflow_store.list_entities("reviews"):
+                if (
+                    row.get("task_id") != source_task.id
+                    or row.get("artifact_id") not in review_report_ids
+                ):
+                    continue
+                for artifact_id in [
+                    row.get("artifact_id"),
+                    row.get("reviewed_artifact_id"),
+                    *(row.get("reviewed_artifact_ids") or []),
+                ]:
+                    if isinstance(artifact_id, str) and artifact_id:
+                        allowed_ids.add(artifact_id)
+            if not set(handoff.artifact_ids).issubset(allowed_ids):
+                raise HandoffDispatchValidationError(
+                    422,
+                    "rework_handoff_lineage_invalid",
+                    "REWORK contains Artifacts outside its recorded review lineage",
+                )
+        else:
+            raise HandoffDispatchValidationError(
+                422,
+                "handoff_message_type_not_dispatchable",
+                "Only PLAN_READY and REWORK Handoffs can be sent to DSH",
+            )
+
+        dispatcher = self._handoff_dispatcher()
+        try:
+            dispatcher.assert_policy_allowed(
+                source_runtime_id,
+                handoff.message_type.value,
+                target_runtime_id,
+            )
+        except PolicyViolation as exc:
+            raise HandoffDispatchValidationError(
+                422, "handoff_policy_denied", "Handoff is not allowed by collaboration policy"
+            ) from exc
+        return handoff, source_task, target, source_runtime_id, target_runtime_id
+
+    def collaboration_handoff_view(
+        self, *, sop_run_id: str, handoff: Handoff, task_roles: dict[str, str]
+    ) -> dict[str, Any]:
+        """Project one Engine-authored handoff without exposing runtime secrets."""
+        source_role_id = task_roles.get(handoff.from_task_id)
+        try:
+            target_role_id = self.workflow_engine.step_definition(
+                sop_run_id, handoff.to_step_id
+            ).role_id
+        except (KeyError, TypeError, ValueError, WorkflowEngineError):
+            target_role_id = None
+
+        source_runtime_id = (
+            self._runtime_id_for_sop_role(source_role_id)
+            if source_role_id
+            else None
+        )
+        target_runtime_id = (
+            self._runtime_id_for_sop_role(target_role_id)
+            if target_role_id
+            else None
+        )
+        dispatchable = False
+        dispatch_reason: str | None = None
+        try:
+            self._prepare_sop_handoff_dispatch(
+                sop_run_id=sop_run_id, handoff_id=handoff.id
+            )
+            dispatchable = True
+            if self.sop_runtime_mode != "real":
+                dispatch_reason = "将在 fake Runtime 中执行，不会调用真实 DSH"
+        except HandoffDispatchValidationError as exc:
+            dispatch_reason = exc.message
+
+        return {
+            "id": handoff.id,
+            "from_task_id": handoff.from_task_id,
+            "to_step_id": handoff.to_step_id,
+            "status": handoff.status.value,
+            "artifact_ids": list(handoff.artifact_ids),
+            "created_at": None,
+            "accepted_at": handoff.accepted_at,
+            "message_type": handoff.message_type.value,
+            "brief": handoff.brief,
+            "reply_to_handoff_id": handoff.reply_to_handoff_id,
+            "correlation_id": handoff.correlation_id,
+            "source_role_id": source_role_id,
+            "target_role_id": target_role_id,
+            "source_runtime_id": source_runtime_id,
+            "target_runtime_id": target_runtime_id,
+            "from_role_id": source_role_id,
+            "to_role_id": target_role_id,
+            "dispatchable": dispatchable,
+            "dispatch_reason": dispatch_reason,
+        }
+
+    async def request_sop_handoff_dispatch(
+        self, *, sop_run_id: str, handoff_id: str
+    ) -> SopHandoffDispatchResponse:
+        """Execute a validated Engine-owned Handoff and return durable IDs."""
+        try:
+            (
+                handoff,
+                _source_task,
+                target,
+                _source_runtime_id,
+                target_runtime_id,
+            ) = self._prepare_sop_handoff_dispatch(
+                sop_run_id=sop_run_id, handoff_id=handoff_id
+            )
+        except HandoffDispatchValidationError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": exc.message},
+            ) from exc
+
+        if self.sop_runtime_mode == "real":
+            try:
+                await self._ensure_dsh_dispatch_available()
+            except RuntimeUnavailableError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "dsh_unavailable",
+                        "message": "DSH Desktop is not reachable for this dispatch",
+                    },
+                ) from exc
+
+        try:
+            result = await self._handoff_dispatcher().dispatch(handoff_id)
+        except PolicyViolation as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "handoff_policy_denied",
+                    "message": "Handoff is not allowed by collaboration policy",
+                },
+            ) from exc
+        except RuntimeUnavailableError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "dispatch_runtime_unavailable",
+                    "message": "DSH dispatch did not complete because the runtime is unavailable",
+                },
+            ) from exc
+        except (KeyError, TypeError, ValueError, WorkflowEngineError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "handoff_dispatch_conflict",
+                    "message": "Handoff dispatch could not complete from its current state",
+                },
+            ) from exc
+
+        attempt_id = result.execution_result.artifact.attempt_id
+        runtime_session_id: str | None = None
+        if attempt_id:
+            try:
+                runtime_session_id = self.workflow_store.get_entity(
+                    "attempts", attempt_id
+                ).get("session_id")
+            except KeyError:
+                runtime_session_id = None
+        return SopHandoffDispatchResponse(
+            sop_run_id=sop_run_id,
+            handoff_id=handoff.id,
+            status="dispatched",
+            target_step_id=target.id,
+            target_role_id=target.role_id,
+            target_runtime_id=target_runtime_id,
+            runtime_mode=self.sop_runtime_mode,
+            task_id=result.execution_result.task.id,
+            attempt_id=attempt_id,
+            workflow_session_id=result.session_id,
+            session_id=runtime_session_id,
+            event_id=result.event_id,
+            outgoing_handoff_id=result.outgoing_handoff_id,
+            artifact_ids=list(result.execution_result.task.output_artifact_ids),
+        )
+
+    def sop_trace(self, *, sop_run_id: str) -> SopTraceResponse:
+        """Return a sanitized workflow trace, never model reasoning or payloads."""
+        try:
+            self.workflow_store.get_entity("sop_runs", sop_run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="sop run not found") from exc
+
+        step_rows = [
+            item
+            for item in self.workflow_store.list_entities("step_runs")
+            if item.get("sop_run_id") == sop_run_id
+        ]
+        step_role_by_id: dict[str, str] = {}
+        for row in step_rows:
+            step_id = row.get("step_id")
+            if not isinstance(step_id, str):
+                continue
+            try:
+                step_role_by_id[step_id] = self.workflow_engine.step_definition(
+                    sop_run_id, step_id
+                ).role_id
+            except (KeyError, TypeError, ValueError, WorkflowEngineError):
+                continue
+        step_run_ids = {item.get("id") for item in step_rows}
+        task_rows = [
+            item
+            for item in self.workflow_store.list_entities("tasks")
+            if item.get("step_run_id") in step_run_ids
+        ]
+        task_role_by_id = {
+            item["id"]: item.get("role_id")
+            for item in task_rows
+            if isinstance(item.get("id"), str) and isinstance(item.get("role_id"), str)
+        }
+        task_ids = set(task_role_by_id)
+        handoff_rows = {
+            item["id"]: item
+            for item in self.workflow_store.list_entities("handoffs")
+            if item.get("from_task_id") in task_ids and isinstance(item.get("id"), str)
+        }
+        review_rows = {
+            item["id"]: item
+            for item in self.workflow_store.list_entities("reviews")
+            if (
+                item.get("task_id") in task_ids
+                or item.get("reviewed_task_id") in task_ids
+            )
+            and isinstance(item.get("id"), str)
+        }
+
+        messages = {
+            "sop_started": "SOP Engine started the run.",
+            "step_started": "A workflow step started.",
+            "task_created": "The Engine created a task.",
+            "attempt_created": "A task attempt was created.",
+            "task_started": "The assigned runtime started work.",
+            "artifact_created": "An Artifact was recorded.",
+            "validation_completed": "Artifact validation passed.",
+            "validation_rejected": "Artifact validation rejected the output.",
+            "task_accepted": "The Engine accepted the task output.",
+            "handoff_created": "An Artifact handoff is ready.",
+            "handoff_accepted": "The Engine accepted the handoff.",
+            "handoff_dispatched": "The handoff was dispatched to its target runtime.",
+            "review_requested": "A review gate is waiting for Codex.",
+            "review_approved": "The review gate was approved.",
+            "review_rejected": "The review requested rework.",
+            "review_routed": "The Engine applied the review route.",
+            "sop_waiting_review": "The SOP run is waiting for review.",
+            "sop_completed": "The SOP run completed.",
+            "sop_failed": "The SOP run failed.",
+            "sop_paused": "The SOP run was paused.",
+            "sop_resumed": "The SOP run resumed.",
+            "sop_cancelled": "The SOP run was cancelled.",
+        }
+        statuses = {
+            "sop_started": "running",
+            "step_started": "running",
+            "task_created": "pending",
+            "attempt_created": "pending",
+            "task_started": "running",
+            "artifact_created": "produced",
+            "validation_completed": "accepted",
+            "validation_rejected": "rejected",
+            "task_accepted": "accepted",
+            "handoff_created": "ready",
+            "handoff_accepted": "accepted",
+            "handoff_dispatched": "dispatched",
+            "review_requested": "waiting_review",
+            "review_approved": "approved",
+            "review_rejected": "rework",
+            "review_routed": "routed",
+            "sop_waiting_review": "waiting_review",
+            "sop_completed": "completed",
+            "sop_failed": "failed",
+            "sop_paused": "paused",
+            "sop_resumed": "running",
+            "sop_cancelled": "cancelled",
+        }
+        entries: list[SopTraceEntryResponse] = []
+        for event in self.workflow_store.replay_events(sop_run_id):
+            payload = event.payload
+            role_id: str | None = None
+            task_id = payload.get("task_id")
+            step_id = payload.get("step_id") or payload.get("to_step_id")
+            if isinstance(task_id, str):
+                role_id = task_role_by_id.get(task_id)
+            if role_id is None and isinstance(step_id, str):
+                role_id = step_role_by_id.get(step_id)
+            handoff_id = payload.get("handoff_id")
+            if role_id is None and isinstance(handoff_id, str):
+                handoff_row = handoff_rows.get(handoff_id)
+                if handoff_row is not None:
+                    if event.event_type in {"handoff_accepted", "handoff_dispatched"}:
+                        role_id = step_role_by_id.get(handoff_row.get("to_step_id"))
+                    else:
+                        role_id = task_role_by_id.get(handoff_row.get("from_task_id"))
+            review_id = payload.get("review_id")
+            if role_id is None and isinstance(review_id, str):
+                review_row = review_rows.get(review_id)
+                if review_row is not None:
+                    role_id = task_role_by_id.get(review_row.get("task_id"))
+            if role_id is None:
+                role_id = "sop_engine"
+            runtime_id = (
+                "sop_engine"
+                if role_id == "sop_engine"
+                else self._runtime_id_for_sop_role(role_id)
+            )
+            phase = {
+                "claude": "plan",
+                "planner": "plan",
+                "dsh": "execute",
+                "executor": "execute",
+                "codex": "review",
+                "reviewer": "review",
+            }.get(role_id, "engine")
+            entries.append(
+                SopTraceEntryResponse(
+                    sequence=event.sequence,
+                    event_type=event.event_type,
+                    role_id=None if role_id == "sop_engine" else role_id,
+                    runtime_id=runtime_id,
+                    phase=phase,
+                    message=messages.get(event.event_type, "Workflow state changed."),
+                    tool=None,
+                    status=statuses.get(event.event_type, "observed"),
+                    occurred_at=event.occurred_at,
+                )
+            )
+        return SopTraceResponse(
+            sop_run_id=sop_run_id,
+            mode="workflow_events_only",
+            provider_events_available=False,
+            empty=not entries,
+            entries=entries,
+        )
 
     def _restore_state(self) -> None:
         try:
@@ -1316,14 +1924,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 只读集成挂载点（P1-A）：Canvas 会话状态联动；独立命名空间，未配 key 时各端点返回 503。
+app.include_router(canvas_integration_router)
+
 
 @app.middleware("http")
 async def require_workbench_auth(request: Request, call_next):
-    """Protect API routes while leaving login/status available anonymously."""
+    """Protect API routes while leaving login/status available anonymously.
+
+    P1-B: OPTIONS 预检放行给 CORSMiddleware 处理（跨源页面如 Canvas Extension 的
+    GET 预检在浏览器侧不带凭据；若在此 401 会导致跨源读取 8000 永远失败）。
+    仅放行预检（无副作用），实际数据请求仍受鉴权。属 PoC 集成配置，弃 B 可整体回退。
+    """
     path = request.url.path
     public_paths = {"/api/auth/login", "/api/auth/status"}
     if (
         path.startswith("/api/")
+        and request.method != "OPTIONS"
         and path not in public_paths
         and not _request_authenticated(request)
     ):
@@ -1696,6 +2313,9 @@ async def start_sop_run(request: StartSopRunRequest):
     )
 
     sop_run = service.workflow_engine.start_sop_run(goal=goal, sop=sop)
+    if request.metadata:
+        sop_run.metadata = dict(request.metadata)
+        service.workflow_store.save_entity("sop_runs", sop_run)
 
     # Optionally trigger automatic execution
     if request.auto_execute:
@@ -1788,6 +2408,7 @@ async def get_sop_run(run_id: str):
         steps_completed=steps_by_status.get("completed", 0),
         steps_ready=steps_by_status.get("ready", 0),
         steps_running=steps_by_status.get("running", 0),
+        metadata=sop_run.get("metadata", {}),
     )
 
 
@@ -1951,8 +2572,11 @@ def _parse_review_outcome(
         return None, [], f"review result {result!r} is not one of {sorted(_REVIEW_OUTCOMES)}"
     blocking = data.get("blocking", [])
     if not isinstance(blocking, list) or not all(isinstance(b, str) for b in blocking):
-        blocking = []
-    return result.strip().upper(), list(blocking), None
+        return None, [], "review blocking must be a list of strings"
+    blocking = list(blocking)
+    if result.strip().upper() != "PASS" and not blocking:
+        return None, [], f"review result {result.strip().upper()!r} requires blocking items"
+    return result.strip().upper(), blocking, None
 
 
 @app.get("/api/sop-runs/{run_id}/attempts", response_model=list[AttemptResponse])
@@ -1988,7 +2612,11 @@ async def get_sop_attempts(run_id: str):
     task_to_step = {item["id"]: item["step_run_id"] for item in tasks}
     step_to_run = {item["id"]: item["sop_run_id"] for item in step_runs}
     artifacts_by_attempt = _artifacts_by_attempt(
-        service.workflow_store.list_entities("artifacts")
+        [
+            item
+            for item in service.workflow_store.list_entities("artifacts")
+            if item.get("task_id") in task_ids
+        ]
     )
 
     ordered = sorted(
@@ -2055,20 +2683,40 @@ async def get_sop_evidence(run_id: str):
         created_at = review.get("created_at") or datetime.now(UTC)
 
         reviewer_report_row = artifact_by_id.get(review.get("artifact_id"))
+        # Phase 3 provenance：评审报告必须存在、类型为 review_report 且属于评审 Task。
+        report_provenance_ok = (
+            reviewer_report_row is not None
+            and str(reviewer_report_row.get("type")) == "review_report"
+            and reviewer_report_row.get("task_id") == review.get("task_id")
+        )
         reviewer_report = (
             _artifact_response(reviewer_report_row, task_role_by_id)
-            if reviewer_report_row is not None
+            if report_provenance_ok
             else None
         )
         reviewer_attempt_id = (
             reviewer_report_row.get("attempt_id")
-            if reviewer_report_row is not None
+            if report_provenance_ok and reviewer_report_row is not None
             else None
         )
 
-        if reviewed_attempt_id is None or reviewed_attempt_id not in attempt_by_id:
-            # schema-v2 之前的 legacy 记录（或悬挂引用）：无 Attempt 血缘，
-            # 仍返回并显式标 invalid——绝不伪造证据。
+        reviewed_attempt = (
+            attempt_by_id.get(reviewed_attempt_id)
+            if reviewed_attempt_id is not None
+            else None
+        )
+        # 被评审 Attempt 必须属于本 run 的 Task（防跨 run / 悬挂引用）。
+        reviewed_in_run = (
+            reviewed_attempt is not None
+            and reviewed_attempt.get("task_id") in task_ids
+        )
+
+        if (
+            reviewed_attempt_id is None
+            or not reviewed_in_run
+            or not report_provenance_ok
+        ):
+            # legacy / 悬挂 / 跨 run / 类型或归属错误的评审报告 → 显式 invalid。
             result.append(
                 ReviewEvidenceResponse(
                     review_id=review["id"],
@@ -2115,6 +2763,13 @@ async def get_sop_evidence(run_id: str):
             else None
         )
 
+        # Phase 3 claimed-evidence check：若 Review 声明了 evidence_ids，必须与
+        # 实际选中的 DIFF + TEST_REPORT 完全一致（防"未声明的证据变绿"）。
+        evidence_ids_match = True
+        claimed = review.get("evidence_ids") or []
+        if claimed and execution_diff is not None and execution_test_report is not None:
+            evidence_ids_match = {execution_diff.id, execution_test_report.id} == set(claimed)
+
         evidence_complete = (
             execution_diff is not None
             and execution_test_report is not None
@@ -2126,7 +2781,9 @@ async def get_sop_evidence(run_id: str):
             and execution_test_report.attempt_id == reviewed_attempt_id
             and execution_diff.accepted
             and execution_test_report.accepted
+            and reviewer_report.accepted
             and outcome is not None
+            and evidence_ids_match
         )
 
         result.append(
@@ -2156,7 +2813,7 @@ async def get_attempt_chain(attempt_id: str):
     previous_attempt_id 成环时停止并在响应中标 truncated，前端必须显式提示。
     """
     try:
-        service.workflow_store.get_entity("attempts", attempt_id)
+        start = service.workflow_store.get_entity("attempts", attempt_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="attempt not found") from exc
 
@@ -2175,9 +2832,13 @@ async def get_attempt_chain(attempt_id: str):
         for item in step_runs
         if item.get("sop_run_id")
     }
-    artifacts_by_attempt = _artifacts_by_attempt(
-        service.workflow_store.list_entities("artifacts")
-    )
+
+    def _run_of(attempt_row: dict[str, Any]) -> str:
+        """Attempt 所属 run（Task -> StepRun -> SopRun；解析不到为空串）。"""
+        step_run_id = task_to_step.get(attempt_row.get("task_id"))
+        return step_to_run.get(step_run_id or "", "")
+
+    start_run = _run_of(start)
 
     chain: list[dict[str, Any]] = []
     visited: set[str] = set()
@@ -2191,11 +2852,24 @@ async def get_attempt_chain(attempt_id: str):
         current = attempt_by_id.get(current_id)
         if current is None:
             break
+        # 跨 run 血缘：previous_attempt_id 指向其它 run 的 attempt → 截断，
+        # 不把其它 run 的 Attempt 混入本链。
+        if chain and _run_of(current) != start_run:
+            truncated = True
+            break
         chain.append(current)
         current_id = current.get("previous_attempt_id")
 
     chain.reverse()  # 时间正序：链首 -> 链尾
     root_task_id = chain[0]["task_id"] if chain else ""
+    chain_task_ids = {item["task_id"] for item in chain}
+    artifacts_by_attempt = _artifacts_by_attempt(
+        [
+            item
+            for item in service.workflow_store.list_entities("artifacts")
+            if item.get("task_id") in chain_task_ids
+        ]
+    )
     return AttemptChainResponse(
         attempts=[
             _attempt_response(
@@ -2261,24 +2935,42 @@ async def get_sop_handoffs(run_id: str):
         if item.get("step_run_id") in step_run_ids
     ]
     task_ids = {item["id"] for item in tasks}
+    task_roles = {item["id"]: item.get("role_id", "") for item in tasks}
 
     handoffs = [
         item
         for item in service.workflow_store.list_entities("handoffs")
         if item.get("from_task_id") in task_ids
     ]
-    return [
-        HandoffResponse(
-            id=item["id"],
-            from_task_id=item["from_task_id"],
-            to_step_id=item["to_step_id"],
-            status=item["status"],
-            artifact_ids=item.get("artifact_ids", []),
-            created_at=item.get("created_at"),
-            accepted_at=item.get("accepted_at"),
+    result: list[HandoffResponse] = []
+    for item in handoffs:
+        handoff = Handoff.model_validate(item)
+        view = service.collaboration_handoff_view(
+            sop_run_id=run_id,
+            handoff=handoff,
+            task_roles=task_roles,
         )
-        for item in handoffs
-    ]
+        view["created_at"] = item.get("created_at")
+        result.append(HandoffResponse(**view))
+    return result
+
+
+@app.post(
+    "/api/sop-runs/{run_id}/handoffs/{handoff_id}/dispatch",
+    response_model=SopHandoffDispatchResponse,
+)
+async def dispatch_sop_handoff(run_id: str, handoff_id: str):
+    """Dispatch only a server-validated Handoff through the Engine boundary."""
+    return await service.request_sop_handoff_dispatch(
+        sop_run_id=run_id,
+        handoff_id=handoff_id,
+    )
+
+
+@app.get("/api/sop-runs/{run_id}/trace", response_model=SopTraceResponse)
+async def get_sop_trace(run_id: str):
+    """Read a sanitized SOP process trace without raw model/runtime payloads."""
+    return service.sop_trace(sop_run_id=run_id)
 
 
 @app.get("/api/sop-runs/{run_id}/events", response_model=list[SopEventResponse])

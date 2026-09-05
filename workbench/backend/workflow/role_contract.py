@@ -75,15 +75,25 @@ __all__ = [
 
 
 class AgentRole(str, Enum):
-    """The four frozen roles.  Adding a fifth role is not allowed."""
+    """The pipeline roles.
+
+    2026-09-06 用户定版：聊天机器人 = Claude/Codex 双机器人；SOP 流水线改为
+    Claude 方案/修订 + Codex 审核/复审/最终门 + Codex 执行者落地。为此在原
+    四角色基础上新增 CODEX_EXECUTOR（可写沙箱的执行者，与只读审核者 CODEX
+    严格区分——F-5 的评审身份来源仍是 SubagentAssignment.role_id）。
+    DSH 保留为遗留角色：仅用于历史 run 的数据兼容，新流水线不再分配。
+    """
 
     SOP_ENGINE = "sop_engine"
     CLAUDE = "claude"
-    DSH = "dsh"
+    DSH = "dsh"  # legacy：历史 run 兼容；新流水线不再分配
     CODEX = "codex"
+    CODEX_EXECUTOR = "codex_executor"
 
 
-AGENT_ROLES: frozenset[AgentRole] = frozenset({AgentRole.CLAUDE, AgentRole.DSH, AgentRole.CODEX})
+AGENT_ROLES: frozenset[AgentRole] = frozenset(
+    {AgentRole.CLAUDE, AgentRole.DSH, AgentRole.CODEX, AgentRole.CODEX_EXECUTOR}
+)
 
 
 class Capability(str, Enum):
@@ -155,11 +165,23 @@ ROLE_CAPABILITIES: dict[AgentRole, frozenset[Capability]] = {
             Capability.PRODUCE_ARTIFACT,
         }
     ),
+    # 遗留：历史 run 兼容，新流水线不再分配（见 AgentRole docstring）。
     AgentRole.CODEX: frozenset(
         {
             Capability.INSPECT_WORKSPACE,
             Capability.PRODUCE_ARTIFACT,
             Capability.EMIT_REVIEW_VERDICT,
+        }
+    ),
+    # Codex 执行者：与只读审核者 CODEX 严格区分（用户定版 2026-09-06），
+    # 继承原执行角色（DSH）的生产能力，但无评审裁决权。
+    AgentRole.CODEX_EXECUTOR: frozenset(
+        {
+            Capability.MODIFY_CODE,
+            Capability.RUN_COMMANDS,
+            Capability.RUN_TESTS,
+            Capability.INSPECT_WORKSPACE,
+            Capability.PRODUCE_ARTIFACT,
         }
     ),
 }
@@ -596,14 +618,21 @@ KNOWN_VIOLATIONS: frozenset[ContractViolation] = frozenset(
         ContractViolation(
             rule_id="RC-5",
             path="workbench/backend/bridge/service.py",
-            line=108,
+            line=112,
             why_open=_SECOND_STATE_MACHINE,
             routed_to=SESSION_LEGACY_BRIDGE,
         ),
         ContractViolation(
             rule_id="RC-5",
             path="workbench/backend/bridge/service.py",
-            line=118,
+            line=122,
+            why_open=_SECOND_STATE_MACHINE,
+            routed_to=SESSION_LEGACY_BRIDGE,
+        ),
+        ContractViolation(
+            rule_id="RC-5",
+            path="workbench/backend/bridge/service.py",
+            line=132,
             why_open=_SECOND_STATE_MACHINE,
             routed_to=SESSION_LEGACY_BRIDGE,
         ),
@@ -611,7 +640,7 @@ KNOWN_VIOLATIONS: frozenset[ContractViolation] = frozenset(
         ContractViolation(
             rule_id="RC-6",
             path="workbench/backend/main.py",
-            line=601,
+            line=1202,
             why_open=f"{_FROZEN}; RUN_FINISHED maps 1:1 to RunStatus/TaskStatus "
             "COMPLETED, bypassing both the Engine and the Reviewer",
             routed_to=SESSION_COMMIT_GATE,

@@ -65,19 +65,22 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # ---------------------------------------------------------------------------
 
 
-def test_role_model_is_frozen_to_four_roles() -> None:
+def test_role_model_is_frozen_to_registered_roles() -> None:
+    # 2026-09-06 定版：新增第五角色 codex_executor（可写执行者）；
+    # dsh 为遗留角色，仅为历史 run 数据兼容保留，新流水线不再分配。
     assert {role.value for role in AgentRole} == {
         "sop_engine",
         "claude",
         "dsh",
         "codex",
+        "codex_executor",
     }
 
 
 def test_agent_roles_exclude_the_engine() -> None:
     assert AgentRole.SOP_ENGINE not in AGENT_ROLES
     assert AGENT_ROLES == frozenset(
-        {AgentRole.CLAUDE, AgentRole.DSH, AgentRole.CODEX}
+        {AgentRole.CLAUDE, AgentRole.DSH, AgentRole.CODEX, AgentRole.CODEX_EXECUTOR}
     )
 
 
