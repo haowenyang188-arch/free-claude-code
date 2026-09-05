@@ -51,7 +51,24 @@ def create_messaging_platform(
             allowed_channel_ids=kwargs.get("allowed_discord_channels"),
         )
 
+    if platform_type == "feishu":
+        app_id = kwargs.get("feishu_app_id")
+        app_secret = kwargs.get("feishu_app_secret")
+        if not app_id or not app_secret:
+            logger.info("No Feishu app credentials configured, skipping platform setup")
+            return None
+
+        from .feishu import FeishuPlatform
+
+        return FeishuPlatform(
+            app_id=app_id,
+            app_secret=app_secret,
+            allowed_open_ids=kwargs.get("allowed_feishu_open_ids"),
+            allowed_chat_ids=kwargs.get("allowed_feishu_chat_ids"),
+            require_mention=kwargs.get("feishu_require_mention", True),
+        )
+
     logger.warning(
-        f"Unknown messaging platform: '{platform_type}'. Supported: 'telegram', 'discord'"
+        f"Unknown messaging platform: '{platform_type}'. Supported: 'telegram', 'discord', 'feishu'"
     )
     return None

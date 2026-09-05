@@ -99,9 +99,29 @@ class Settings(BaseSettings):
     )
 
     # ==================== Messaging Platform Selection ====================
-    # Valid: "telegram" | "discord"
+    # Valid: "telegram" | "discord" | "feishu"
     messaging_platform: str = Field(
         default="discord", validation_alias="MESSAGING_PLATFORM"
+    )
+
+    # ==================== Feishu (Lark) ====================
+    # 企业自建应用凭证（开放平台 → 凭证与基础信息）。
+    feishu_app_id: str = Field(default="", validation_alias="FEISHU_APP_ID")
+    feishu_app_secret: str = Field(default="", validation_alias="FEISHU_APP_SECRET")
+    # 可选白名单：逗号分隔的 open_id / chat_id；留空表示不限制。
+    allowed_feishu_open_ids: str | None = Field(
+        default=None, validation_alias="ALLOWED_FEISHU_OPEN_IDS"
+    )
+    allowed_feishu_chat_ids: str | None = Field(
+        default=None, validation_alias="ALLOWED_FEISHU_CHAT_IDS"
+    )
+    # 群聊是否必须 @机器人才响应（单聊始终响应）。
+    feishu_require_mention: bool = Field(
+        default=True, validation_alias="FEISHU_REQUIRE_MENTION"
+    )
+    # 可选：机器人的 open_id，用于精确判定群聊 @（不配则任何 @ 都算）。
+    feishu_bot_open_id: str | None = Field(
+        default=None, validation_alias="FEISHU_BOT_OPEN_ID"
     )
 
     # ==================== Model ====================

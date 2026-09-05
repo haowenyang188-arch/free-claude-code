@@ -144,6 +144,11 @@ async def lifespan(app: FastAPI):
             agent_backend=getattr(settings, "agent_backend", "claude"),
             discord_bot_token=settings.discord_bot_token,
             allowed_discord_channels=settings.allowed_discord_channels,
+            feishu_app_id=settings.feishu_app_id,
+            feishu_app_secret=settings.feishu_app_secret,
+            allowed_feishu_open_ids=settings.allowed_feishu_open_ids,
+            allowed_feishu_chat_ids=settings.allowed_feishu_chat_ids,
+            feishu_require_mention=settings.feishu_require_mention,
         )
 
         if messaging_platform:
