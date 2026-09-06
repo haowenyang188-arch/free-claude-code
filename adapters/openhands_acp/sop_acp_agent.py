@@ -386,51 +386,15 @@ class SopAcpAgent(Agent):
         } or os.environ.get("PYTEST_CURRENT_TEST"):
             return
         try:
-            import json as _json
-            import threading
-            import urllib.request
-
-            key_path = os.path.expanduser(
-                "~/.openhands/agent-canvas/api-key.txt"
-            )
-            with open(key_path, encoding="utf-8") as f:
-                key = f.read().strip()
-            base = os.environ.get(
-                "OH_AGENT_SERVER_BASE", "http://127.0.0.1:18000"
-            ).rstrip("/")
+            self._sop.login()  # 幂等:聊天路径未登录过(同步 HTTP,brief 阻塞可接受)
             conv_id = self._resolve_conversation_id(session_id)
             if not conv_id:
                 _log("persist skipped: conversation id unresolved")
                 return
-            body = _json.dumps(
-                {
-                    # agent-server role 枚举: user/assistant/system/tool
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": text}],
-                    "run": False,
-                }
-            ).encode()
-
-            def _post():
-                try:
-                    opener = urllib.request.build_opener(
-                        urllib.request.ProxyHandler({})
-                    )
-                    req = urllib.request.Request(
-                        f"{base}/api/conversations/{conv_id}/events",
-                        data=body,
-                        headers={
-                            "Content-Type": "application/json",
-                            "X-Session-API-Key": key,
-                        },
-                        method="POST",
-                    )
-                    with opener.open(req, timeout=8) as resp:
-                        _log(f"persisted event status={resp.status}")
-                except Exception as exc:  # noqa: BLE001
-                    _log(f"persist POST failed: {exc!r}")
-
-            threading.Thread(target=_post, daemon=True).start()
+            # 落 Workbench 存档(8000 bot-replies 端点),非 agent-server
+            # 事件 API(后者仅收 user 消息,见上方实验结论)。
+            self._sop.post_bot_reply(conv_id, text)
+            _log(f"reply persisted to workbench ({conv_id[:8]})")
         except Exception as exc:  # noqa: BLE001
             _log(f"persist best-effort failed: {exc!r}")
 

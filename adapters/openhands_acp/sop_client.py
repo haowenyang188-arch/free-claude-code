@@ -45,7 +45,17 @@ class SopClient:
         )
 
     # -- http helpers -------------------------------------------------------
-    def _request(self, method: str, path: str, body: dict | None = None) -> dict:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: dict | None = None,
+        params: dict | None = None,
+    ) -> dict:
+        if params:
+            from urllib.parse import urlencode
+
+            path = f"{path}?{urlencode(params)}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(
             f"{self._base}{path}",
@@ -185,6 +195,15 @@ class SopClient:
             ],
         }
         self._request("POST", "/api/sop-definitions", body)
+
+    def post_bot_reply(self, conversation_id: str, text: str) -> dict:
+        """机器人回复落 Workbench 存档(持久化通道,见 canvas.py bot-replies)。"""
+        return self._request(
+            "POST",
+            "/api/integrations/canvas/bot-replies",
+            {"text": text, "role": "bot"},
+            params={"conversation_id": conversation_id},
+        )
 
     def start_run(self, goal: str, *, metadata: dict | None = None) -> dict:
         """起 run；goal 为用户在 Canvas 输入的任务文本。"""

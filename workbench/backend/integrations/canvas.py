@@ -21,8 +21,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -273,3 +276,63 @@ async def canvas_send_message(
         f"/api/conversations/{safe_id}/events",
         message,
     )
+
+
+_BOT_REPLIES_DIR = (
+    Path.home() / ".local" / "state" / "free-claude-code" / "workbench" / "bot_replies"
+)
+
+
+def _bot_replies_file(conversation_id: str) -> Path:
+    return _BOT_REPLIES_DIR / f"{conversation_id}.json"
+
+
+@router.get("/bot-replies")
+async def canvas_bot_replies(conversation_id: str) -> JSONResponse:
+    """机器人回复存档:按 conversation id 读取(双机器人持久化通道)。
+
+    存 Workbench 本地状态目录,与 agent-server 事件无关——落地
+    2026-09-06 实验结论(ACP 推送不进 agent-server 历史)。
+    """
+    safe_id = quote(conversation_id.strip(), safe="")
+    if not safe_id:
+        raise HTTPException(status_code=422, detail="conversation_id 不能为空")
+    file = _bot_replies_file(safe_id)
+    if not file.exists():
+        return JSONResponse([])
+    try:
+        return JSONResponse(json.loads(file.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return JSONResponse([])
+
+
+@router.post("/bot-replies")
+async def canvas_bot_reply_append(
+    conversation_id: str, payload: dict[str, Any] = Body(...)
+) -> JSONResponse:
+    """追加一条机器人回复(由 ACP 机器人在回合结束时调用)。"""
+    safe_id = quote(conversation_id.strip(), safe="")
+    if not safe_id:
+        raise HTTPException(status_code=422, detail="conversation_id 不能为空")
+    text = str(payload.get("text", ""))
+    if not text.strip():
+        raise HTTPException(status_code=422, detail="text 不能为空")
+    file = _bot_replies_file(safe_id)
+    entries: list[dict[str, Any]] = []
+    if file.exists():
+        try:
+            entries = json.loads(file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            entries = []
+    entries.append(
+        {
+            "text": text[:4000],
+            "role": str(payload.get("role", "bot")),
+            "ts": datetime.now(UTC).isoformat(),
+        }
+    )
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text(
+        json.dumps(entries, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
+    return JSONResponse({"success": True, "count": len(entries)})
