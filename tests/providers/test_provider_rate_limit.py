@@ -253,6 +253,34 @@ class TestProviderRateLimiter:
         assert call_count == 2
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [429, 502, 503, 504])
+    async def test_execute_with_retry_retries_retryable_http_status(self, status):
+        """Transient HTTP status errors are retried before surfacing."""
+        import httpx
+
+        GlobalRateLimiter.reset_instance()
+        limiter = GlobalRateLimiter.get_instance(rate_limit=100, rate_window=60)
+        call_count = 0
+
+        async def fail_then_ok():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                request = httpx.Request("POST", "http://x")
+                response = httpx.Response(status, request=request)
+                raise httpx.HTTPStatusError(
+                    "transient", request=request, response=response
+                )
+            return "ok"
+
+        result = await limiter.execute_with_retry(
+            fail_then_ok, max_retries=1, base_delay=0.01, max_delay=0.1, jitter=0
+        )
+
+        assert result == "ok"
+        assert call_count == 2
+
+    @pytest.mark.asyncio
     async def test_max_concurrency_zero_raises(self):
         """max_concurrency <= 0 raises ValueError."""
         GlobalRateLimiter.reset_instance()

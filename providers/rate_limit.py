@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any, ClassVar, TypeVar
 
+import httpx
 import openai
 from loguru import logger
 
@@ -209,21 +210,41 @@ class GlobalRateLimiter:
 
             try:
                 return await fn(*args, **kwargs)
-            except openai.RateLimitError as e:
+            except Exception as e:
+                retryable = isinstance(
+                    e,
+                    (
+                        openai.RateLimitError,
+                        openai.APIConnectionError,
+                        httpx.TransportError,
+                    ),
+                )
+                status_code = None
+                if isinstance(e, httpx.HTTPStatusError):
+                    status_code = e.response.status_code
+                    retryable = status_code in (429, 502, 503, 504)
+                elif isinstance(e, openai.APIStatusError):
+                    status_code = e.status_code
+                    retryable = status_code in (429, 502, 503, 504)
+                if not retryable:
+                    raise
+
                 last_exc = e
                 if attempt >= max_retries:
                     logger.warning(
-                        f"Rate limit retry exhausted after {max_retries} retries"
+                        f"Transient provider retry exhausted after {max_retries} retries"
                     )
                     break
 
                 delay = min(base_delay * (2**attempt), max_delay)
                 delay += random.uniform(0, jitter)
                 logger.warning(
-                    f"Rate limited (429), attempt {attempt + 1}/{max_retries + 1}. "
+                    f"Transient provider error ({type(e).__name__}), "
+                    f"attempt {attempt + 1}/{max_retries + 1}. "
                     f"Retrying in {delay:.1f}s..."
                 )
-                self.set_blocked(delay)
+                if isinstance(e, openai.RateLimitError) or status_code == 429:
+                    self.set_blocked(delay)
                 await asyncio.sleep(delay)
 
         assert last_exc is not None

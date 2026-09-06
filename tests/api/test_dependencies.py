@@ -21,6 +21,7 @@ def _make_mock_settings(**overrides):
     settings.minimax_base_url = "https://api.minimaxi.com/anthropic"
     settings.minimax_proxy = ""
     settings.deepseek_api_key = "test_deepseek_key"
+    settings.deepseek_base_url = ""
     settings.provider_rate_limit = 40
     settings.provider_rate_window = 60
     settings.provider_max_concurrency = 5
@@ -71,13 +72,16 @@ def test_get_provider_for_type_constructs_supported_providers():
     assert minimax is not deepseek
 
 
-def test_deepseek_uses_fixed_base_url_and_thinking_setting():
+def test_deepseek_uses_configured_base_url_and_thinking_setting():
     with patch("api.dependencies.get_settings") as mock_settings:
-        mock_settings.return_value = _make_mock_settings(enable_thinking=False)
+        mock_settings.return_value = _make_mock_settings(
+            enable_thinking=False,
+            deepseek_base_url="http://127.0.0.1:9010/v1",
+        )
         provider = get_provider_for_type("deepseek")
 
     assert isinstance(provider, DeepSeekProvider)
-    assert provider._base_url == "https://api.deepseek.com"
+    assert provider._base_url == "http://127.0.0.1:9010/v1"
     assert provider._config.enable_thinking is False
 
 

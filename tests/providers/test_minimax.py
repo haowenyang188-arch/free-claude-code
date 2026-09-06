@@ -131,3 +131,20 @@ async def test_stream_response_closes_upstream_response():
     assert "message_stop" in "".join(events)
     assert response.is_closed
     await provider.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_send_stream_request_raises_for_transient_http_status():
+    provider = _make_provider()
+    response = httpx.Response(
+        503,
+        request=httpx.Request("POST", f"{MINIMAX_BASE_URL}/v1/messages"),
+    )
+    body = {"model": "MiniMax-M3", "messages": []}
+
+    with patch.object(provider._client, "send", new=AsyncMock(return_value=response)):
+        with pytest.raises(httpx.HTTPStatusError):
+            await provider._send_stream_request(body)
+
+    assert response.is_closed
+    await provider.cleanup()

@@ -87,7 +87,14 @@ class MiniMaxProvider(BaseProvider):
             json=body,
             headers=self._request_headers(),
         )
-        return await self._client.send(request_obj, stream=True)
+        response = await self._client.send(request_obj, stream=True)
+        if response.status_code != 200:
+            try:
+                await response.aread()
+                response.raise_for_status()
+            finally:
+                await response.aclose()
+        return response
 
     async def stream_response(
         self,
@@ -115,17 +122,6 @@ class MiniMaxProvider(BaseProvider):
                 response = await self._global_rate_limiter.execute_with_retry(
                     self._send_stream_request, body
                 )
-
-                if response.status_code != 200:
-                    text = await response.aread()
-                    logger.error(
-                        "{}_ERROR:{} HTTP {}: {}",
-                        tag,
-                        req_tag,
-                        response.status_code,
-                        text.decode("utf-8", errors="replace"),
-                    )
-                    response.raise_for_status()
 
                 async for line in response.aiter_lines():
                     if line:
