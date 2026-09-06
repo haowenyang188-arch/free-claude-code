@@ -692,6 +692,17 @@ class WorkflowEngine:
             return f"review artifact {review.artifact_id} is missing"
         if artifact.type is not ArtifactType.REVIEW_REPORT:
             return None
+        # v2 pipeline:PLAN 类评审(方案审核/复审/最终门)天然没有 DIFF/TEST
+        # 执行证据,评审报告自身的 blocking/non_blocking 就是记录 —— 豁免
+        # 证据门;执行类评审(final_decision 审 output)仍走完整证据门。
+        try:
+            reviewed_task = self._reviewed_task(review)
+            step_run = self._get_model("step_runs", reviewed_task.step_run_id, StepRun)
+            step = self.step_definition(step_run.sop_run_id, step_run.step_id)
+            if step.output_type is ArtifactType.PLAN:
+                return None
+        except (KeyError, TypeError, ValueError, WorkflowEngineError):
+            pass  # 结构未知 → 走严格证据门
         from .lineage import LineageError, validate_review_evidence
 
         try:

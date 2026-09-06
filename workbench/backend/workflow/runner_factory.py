@@ -123,6 +123,22 @@ class _ClaudeExecutionAdapter(_WrappingExecutionAdapter):
 
 
 class _CodexExecutionAdapter(_WrappingExecutionAdapter):
+    async def execute(self, *, task, assignment, context) -> RuntimeExecutionResult:
+        inner = await self._inner.execute(
+            task=task, assignment=assignment, context=context
+        )
+        # codex_executor 返回 (DIFF, TEST_REPORT) 元组——执行证据链需要
+        # 两件同 attempt 工件;审核者仍为单 REVIEW_REPORT。
+        artifacts = list(inner) if isinstance(inner, tuple) else [inner]
+        return RuntimeExecutionResult(
+            artifacts=artifacts,
+            session_id=self._session_id(),
+            runtime_metadata={
+                "runtime_id": self.runtime_id,
+                "adapter": type(self._inner).__name__,
+            },
+        )
+
     async def _run_inner(self, *, task, assignment, context) -> Artifact:
         return await self._inner.execute(
             task=task, assignment=assignment, context=context

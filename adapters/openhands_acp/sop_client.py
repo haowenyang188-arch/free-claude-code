@@ -36,8 +36,12 @@ class SopClient:
     def __init__(self, api_base: str | None = None) -> None:
         self._base = (api_base or API_BASE).rstrip("/")
         self._jar = http.cookiejar.CookieJar()
+        # 显式空 ProxyHandler:本客户端只访问本机 Workbench,绝不走
+        # 环境代理(WSL 的 http_proxy=127.0.0.1:7890 会把回环请求送进
+        # Clash 导致 502;urllib 的 no_proxy 通配写法不生效)。
         self._op = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self._jar)
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPCookieProcessor(self._jar),
         )
 
     # -- http helpers -------------------------------------------------------

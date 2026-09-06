@@ -124,16 +124,52 @@ class CodexSubagentRunner(SubagentRunner):
                 accepted=False,
             )
         else:
-            artifact = Artifact(
+            # Executor-grade codex role (codex_executor): the evidence gate
+            # requires DIFF + TEST_REPORT from the attempt, so the prompt
+            # demands the markers and parsing FAILS CLOSED on missing or
+            # empty sections — the same discipline the DSH executor
+            # contract enforced (never fabricate evidence).
+            diff_marker = "---DIFF---"
+            test_marker = "---TEST_REPORT---"
+            if diff_marker not in output_text or test_marker not in output_text:
+                raise RuntimeError(
+                    "codex executor output missing "
+                    f"{diff_marker}/{test_marker} markers; refusing to "
+                    f"fabricate evidence. raw head: {output_text[:400]!r}"
+                )
+            diff_part = output_text.split(diff_marker, 1)[1]
+            diff_content = diff_part.split(test_marker, 1)[0].strip()
+            test_content = (
+                diff_part.split(test_marker, 1)[1].strip()
+                if test_marker in diff_part
+                else ""
+            )
+            if not diff_content or not test_content:
+                raise RuntimeError(
+                    "codex executor produced empty DIFF/TEST_REPORT sections; "
+                    "refusing to fabricate evidence"
+                )
+            diff_artifact = Artifact(
                 id=str(uuid.uuid4()),
                 task_id=task.id,
-                type=ArtifactType.TEXT,
-                content=output_text[:10000],  # Limit content size
-                summary=self._extract_summary(output_text),
+                type=ArtifactType.DIFF,
+                content=diff_content,
+                summary="DIFF",
                 created_at=datetime.now(UTC),
                 accepted=False,
             )
-        return artifact
+            test_artifact = Artifact(
+                id=str(uuid.uuid4()),
+                task_id=task.id,
+                type=ArtifactType.TEST_REPORT,
+                content=test_content,
+                summary="TEST_REPORT",
+                created_at=datetime.now(UTC),
+                accepted=False,
+            )
+            # 执行证据链需要 DIFF + TEST_REPORT 两件;元组由
+            # _CodexExecutionAdapter 展开进同一 attempt。
+            return diff_artifact, test_artifact
 
     def _build_prompt(self, task: Task, context: ContextPackage) -> str:
         """Build Codex prompt from task and context.
@@ -163,6 +199,19 @@ class CodexSubagentRunner(SubagentRunner):
                 "",
                 "## Acceptance Criteria",
                 *[f"- {criterion.description}" for criterion in context.acceptance_criteria],
+            ])
+
+        if (task.role_id or "").lower() not in {"codex", "reviewer"}:
+            # Executor-grade output contract: the evidence gate needs
+            # machine-splittable DIFF + TEST_REPORT sections.
+            parts.extend([
+                "",
+                "## Required output format",
+                "Emit exactly two sections:",
+                "---DIFF---",
+                "<the diff / deliverable>",
+                "---TEST_REPORT---",
+                "<the test / verification report>",
             ])
 
         if context.artifact_ids:
