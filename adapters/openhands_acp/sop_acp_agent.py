@@ -339,6 +339,63 @@ class SopAcpAgent(Agent):
         """同步 HTTP 调用放线程池，避免阻塞 asyncio loop（否则推送/响应死锁）。"""
         return await asyncio.to_thread(fn, *args, **kwargs)
 
+    def _persist_best_effort(self, session_id: str, text: str) -> None:
+        """[实验已暂停]把回复落为 agent-server 会话事件。
+
+        失败仅记日志,绝不影响实时推送;EXPERIMENT_PERSIST=0 可关闭。
+        """
+        # 结论(2026-09-06 实验):ACP session_id(如 f67af77e)与
+        # conversation id(908e48c3)是两套 ID,子进程内无法直查,
+        # POST /api/conversations/<acp_id>/events 404。恢复需先解决
+        # ID 映射(agent-server 侧透传或 Workbench 反查端点)。
+        if os.environ.get("EXPERIMENT_PERSIST", "0").strip().lower() not in {
+            "1", "true", "on"
+        } or os.environ.get("PYTEST_CURRENT_TEST"):
+            return
+        try:
+            import json as _json
+            import threading
+            import urllib.request
+
+            key_path = os.path.expanduser(
+                "~/.openhands/agent-canvas/api-key.txt"
+            )
+            with open(key_path, encoding="utf-8") as f:
+                key = f.read().strip()
+            base = os.environ.get(
+                "OH_AGENT_SERVER_BASE", "http://127.0.0.1:18000"
+            ).rstrip("/")
+            body = _json.dumps(
+                {
+                    "role": "agent",
+                    "content": [{"type": "text", "text": text}],
+                    "run": False,
+                }
+            ).encode()
+
+            def _post():
+                try:
+                    opener = urllib.request.build_opener(
+                        urllib.request.ProxyHandler({})
+                    )
+                    req = urllib.request.Request(
+                        f"{base}/api/conversations/{session_id}/events",
+                        data=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Session-API-Key": key,
+                        },
+                        method="POST",
+                    )
+                    with opener.open(req, timeout=8) as resp:
+                        _log(f"persisted event status={resp.status}")
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"persist POST failed: {exc!r}")
+
+            threading.Thread(target=_post, daemon=True).start()
+        except Exception as exc:  # noqa: BLE001
+            _log(f"persist best-effort failed: {exc!r}")
+
     async def _push(self, session_id: str, text: str) -> None:
         """推送一条 agent_message（session/update 通知）。
 
@@ -358,6 +415,7 @@ class SopAcpAgent(Agent):
             chunk = update_agent_message_text(text)
             await self._conn.session_update(session_id, chunk)
             _log("pushed msg len=" + str(len(text)))
+            self._persist_best_effort(session_id, text)
         except Exception as exc:
             import traceback
 
