@@ -34,7 +34,7 @@ def main() -> int:
     run_id = started.get("sop_run_id") or started.get("id") or ""
     print(f"run started: {run_id}")
 
-    deadline = time.time() + 180
+    deadline = time.time() + 1800
     status = ""
     dispatched: list[str] = []
     while time.time() < deadline:

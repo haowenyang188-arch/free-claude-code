@@ -304,7 +304,19 @@ class ClaudeCodeAdapter(RuntimeAdapter):
             if process.returncode != 0:
                 # Stderr can include provider and credential diagnostics.  The
                 # detailed data stays local to the CLI process; the workflow
-                # boundary exposes only a stable failure class.
+                # boundary exposes only a stable failure class.  Diagnostics
+                # are logged server-side for operator debugging.
+                from loguru import logger
+
+                stderr_tail = (
+                    _stderr.decode("utf-8", errors="replace")[-500:] if _stderr else ""
+                )
+                logger.error(
+                    "claude_code adapter exit={} stdout_tail={} stderr_tail={}",
+                    process.returncode,
+                    stdout.decode("utf-8", errors="replace")[-300:],
+                    stderr_tail,
+                )
                 raise RunnerError(f"Claude Code exited with code {process.returncode}")
 
             response = stdout.decode("utf-8").strip()

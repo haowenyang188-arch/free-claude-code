@@ -391,6 +391,14 @@ class WorkflowEngine:
                 result = await adapter.execute(
                     task=task, assignment=assignment, context=context
                 )
+                if any(item is None for item in result.artifacts):
+                    from loguru import logger as _lg
+
+                    _lg.error(
+                        "runner {} returned None artifact: {}",
+                        type(adapter).__name__,
+                        result.artifacts,
+                    )
                 artifacts = [
                     item.model_copy(
                         update={

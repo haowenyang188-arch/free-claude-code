@@ -1002,6 +1002,15 @@ class WorkbenchService:
 
         except Exception as exc:
             # Persist execution failure to SopRun status
+            import traceback as _tb
+
+            from loguru import logger
+
+            logger.error(
+                "SOP background run {} failed: {}",
+                sop_run_id,
+                "".join(_tb.format_exception(exc)),
+            )
             try:
                 run = self.workflow_store.get_entity("sop_runs", sop_run_id)
                 run["status"] = SopRunStatus.FAILED.value
