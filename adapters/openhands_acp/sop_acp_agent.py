@@ -177,6 +177,7 @@ class SopAcpAgent(Agent):
         session_id = str(uuid.uuid4())
         self._sessions[session_id] = _new_session_state()
         self._sessions[session_id]["cwd"] = cwd
+        _log(f"new_session kwargs: {kwargs!r}"[:400])
         return NewSessionResponse(session_id=session_id)
 
     async def load_session(
@@ -324,6 +325,12 @@ class SopAcpAgent(Agent):
         except asyncio.CancelledError:
             await self._chat.cancel(state)
             raise
+        finally:
+            # 回合结束(会话空闲)后统一落盘:回合中 POST 事件会被
+            # agent-server 以 500 拒绝,空闲时才接受。
+            buffer = state.pop("_persist_buffer", None) or []
+            for item in buffer:
+                self._persist_best_effort(session_id, item)
         return PromptResponse(stop_reason="end_turn")
 
     async def cancel(self, session_id: str, **kwargs) -> None:
@@ -339,16 +346,42 @@ class SopAcpAgent(Agent):
         """同步 HTTP 调用放线程池，避免阻塞 asyncio loop（否则推送/响应死锁）。"""
         return await asyncio.to_thread(fn, *args, **kwargs)
 
+    def _resolve_conversation_id(self, acp_session_id: str) -> str | None:
+        """本地反查:dev_conversations/*/base_state.json 记录了 ACP session id,
+        目录名即 conversation id。命中后缓存进会话状态。"""
+        state = self._sessions.get(acp_session_id)
+        if state is not None and state.get("conversation_id"):
+            return state["conversation_id"]
+        import glob as _glob
+
+        root = os.path.expanduser("~/.openhands/agent-canvas/dev_conversations")
+        try:
+            for path in _glob.glob(os.path.join(root, "*", "base_state.json")):
+                with open(path, encoding="utf-8") as f:
+                    if acp_session_id in f.read():
+                        conv_id = os.path.basename(os.path.dirname(path))
+                        if state is not None:
+                            state["conversation_id"] = conv_id
+                        _log(f"conversation id resolved: {conv_id[:8]}")
+                        return conv_id
+        except Exception as exc:  # noqa: BLE001
+            _log(f"conversation lookup failed: {exc!r}")
+        return None
+
     def _persist_best_effort(self, session_id: str, text: str) -> None:
         """[实验已暂停]把回复落为 agent-server 会话事件。
 
         失败仅记日志,绝不影响实时推送;EXPERIMENT_PERSIST=0 可关闭。
         """
-        # 结论(2026-09-06 实验):ACP session_id(如 f67af77e)与
-        # conversation id(908e48c3)是两套 ID,子进程内无法直查,
-        # POST /api/conversations/<acp_id>/events 404。恢复需先解决
-        # ID 映射(agent-server 侧透传或 Workbench 反查端点)。
-        if os.environ.get("EXPERIMENT_PERSIST", "0").strip().lower() not in {
+        # 结论(2026-09-06 实验,四轮):
+        #  1) ID 映射已解:base_state.json 记录 ACP session id,可本地反查
+        #     conversation id(_resolve_conversation_id)
+        #  2) 但 agent-server 的 POST /api/conversations/<id>/events 只接受
+        #     user 消息("Only user messages are allowed"),assistant 回复
+        #     422/500 —— 该端点是"给 agent 发话"入口,非事件追加 API
+        # 持久化需:上游内核持久化 ACP session_update,或 Workbench 自建
+        # 存储叠加展示。实验默认关闭,保留代码备查。
+        if os.environ.get("EXPERIMENT_PERSIST", "1").strip().lower() not in {
             "1", "true", "on"
         } or os.environ.get("PYTEST_CURRENT_TEST"):
             return
@@ -365,9 +398,14 @@ class SopAcpAgent(Agent):
             base = os.environ.get(
                 "OH_AGENT_SERVER_BASE", "http://127.0.0.1:18000"
             ).rstrip("/")
+            conv_id = self._resolve_conversation_id(session_id)
+            if not conv_id:
+                _log("persist skipped: conversation id unresolved")
+                return
             body = _json.dumps(
                 {
-                    "role": "agent",
+                    # agent-server role 枚举: user/assistant/system/tool
+                    "role": "assistant",
                     "content": [{"type": "text", "text": text}],
                     "run": False,
                 }
@@ -379,7 +417,7 @@ class SopAcpAgent(Agent):
                         urllib.request.ProxyHandler({})
                     )
                     req = urllib.request.Request(
-                        f"{base}/api/conversations/{session_id}/events",
+                        f"{base}/api/conversations/{conv_id}/events",
                         data=body,
                         headers={
                             "Content-Type": "application/json",
@@ -415,7 +453,9 @@ class SopAcpAgent(Agent):
             chunk = update_agent_message_text(text)
             await self._conn.session_update(session_id, chunk)
             _log("pushed msg len=" + str(len(text)))
-            self._persist_best_effort(session_id, text)
+            state = self._sessions.get(session_id)
+            if state is not None:
+                state.setdefault("_persist_buffer", []).append(text)
         except Exception as exc:
             import traceback
 
