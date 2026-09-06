@@ -10,12 +10,12 @@ describe('UsageGuidePanel', () => {
 
     expect(screen.getByRole('heading', { name: '怎么协作' })).toBeInTheDocument()
     expect(screen.getByTestId('usage-guide-collaboration-order')).toHaveTextContent(
-      'Claude → DSH → Codex',
+      'Claude 方案 → Codex 审核 → Claude 修订 → Codex 复审 → Codex 输出 → 用户决策 → Codex 执行',
     )
     expect(screen.getByText('SOP Engine')).toBeInTheDocument()
     expect(screen.getByText('Artifact + Handoff')).toBeInTheDocument()
     expect(screen.getByText('Codex')).toBeInTheDocument()
-    expect(screen.getByText('独立审核')).toBeInTheDocument()
+    expect(screen.getByText(/审核 \/ 复审 \/ 最终门/)).toBeInTheDocument()
   })
 
   it('展示工具用途、审批前置条件和重复下发提醒', () => {

@@ -76,7 +76,7 @@ const STATE_TEXT: Record<BackendState, string> = {
 }
 
 /**
- * SOP 控制台主入口：Claude → DSH → Codex 固定流水线的可视化与人工操控。
+ * SOP 控制台主入口：Claude ⇄ Codex 七段流水线的可视化与人工操控。
  * 后端不可用时仍然完整渲染（各面板自行降级），不白屏。
  */
 export default function SopConsolePage() {
@@ -163,7 +163,7 @@ export default function SopConsolePage() {
                 SOP Workbench Console
               </p>
               <h1 className="mt-1 text-xl font-semibold tracking-tight sm:text-2xl">
-                Claude → DSH → Codex 固定流水线
+                Claude ⇄ Codex 七段流水线
               </h1>
               <p className="mt-1 text-xs text-slate-500">可视化与人工操控 · SOP Engine 统一调度</p>
             </div>

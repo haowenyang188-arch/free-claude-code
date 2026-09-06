@@ -9,16 +9,16 @@ const COLLABORATION_STEPS = [
     detail: '理解需求、分析代码并产出 PLAN；不直接改代码，也不做最终审核。',
   },
   {
-    role: 'DSH',
+    role: 'Codex',
     tone: 'active' as const,
-    title: '主执行',
-    detail: '按已确定的 PLAN 修改文件、运行命令和测试，并提交 diff / test_report。',
+    title: '审核 / 复审 / 最终门',
+    detail: '对方案与交付物做独立审核，只输出 PASS / REWORK / PLAN_INVALID；最终门等用户决策。',
   },
   {
-    role: 'Codex',
-    tone: 'warn' as const,
-    title: '独立审核',
-    detail: '检查 diff、测试、边界、回归和需求覆盖，只输出 PASS / REWORK / PLAN_INVALID。',
+    role: 'Codex 执行',
+    tone: 'active' as const,
+    title: '输出结果 / 执行',
+    detail: '按已批准的交付物落实文件修改、运行命令和测试，并提交 diff / test_report。',
   },
 ]
 
@@ -187,14 +187,15 @@ export function UsageGuidePanel() {
       </header>
 
       <div className="space-y-4 p-3">
-        <Panel title="怎么协作" subtitle="固定顺序：Claude → DSH → Codex；SOP Engine 负责推进与路由。">
+        <Panel title="怎么协作" subtitle="v2 流程：Claude 方案 → Codex 审核 → Claude 修订 → Codex 复审 → Codex 输出 → 用户决策 → Codex 执行；SOP Engine 负责推进与路由。">
           <p
             data-testid="usage-guide-collaboration-order"
             className="text-sm font-semibold tracking-wide text-slate-100"
             aria-label="协作顺序"
           >
-            Claude <span className="px-1 text-slate-600" aria-hidden="true">→</span> DSH{' '}
-            <span className="px-1 text-slate-600" aria-hidden="true">→</span> Codex
+            Claude 方案 <span className="px-1 text-slate-600" aria-hidden="true">→</span> Codex 审核 →
+            Claude 修订 <span className="px-1 text-slate-600" aria-hidden="true">→</span> Codex 复审 →
+            Codex 输出 → 用户决策 → Codex 执行
           </p>
           <div
             data-testid="usage-guide-collaboration-roles"
