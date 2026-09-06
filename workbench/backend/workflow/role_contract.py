@@ -640,7 +640,7 @@ KNOWN_VIOLATIONS: frozenset[ContractViolation] = frozenset(
         ContractViolation(
             rule_id="RC-6",
             path="workbench/backend/main.py",
-            line=1202,
+            line=1219,
             why_open=f"{_FROZEN}; RUN_FINISHED maps 1:1 to RunStatus/TaskStatus "
             "COMPLETED, bypassing both the Engine and the Reviewer",
             routed_to=SESSION_COMMIT_GATE,
