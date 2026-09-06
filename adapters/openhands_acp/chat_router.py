@@ -95,6 +95,11 @@ class ChatRouter:
         if not tasks:
             await push("[Chat] ⚠️ 没有启用的聊天 runtime")
             return
+        if not self._probe_gateway():
+            await push(
+                "[Chat] ⚠️ 网关预检失败:cc-switch(127.0.0.1:15721)不可用或上游异常,"
+                "Claude/Codex 本轮预计降级;请在 cc-switch 切换健康上游后重试"
+            )
         state["_chat_tasks"] = set(tasks)
         # 单一 runtime 的独立机器人不带标签（会话本身就是那个机器人）
         tag_prefix = len(self.runtime_names) > 1
@@ -134,6 +139,19 @@ class ChatRouter:
         tasks = list(state.get("_chat_tasks") or ())
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    @staticmethod
+    def _probe_gateway() -> bool:
+        """探测 cc-switch 网关(回环直连,不走环境代理)。"""
+        base = os.environ.get("WORKBENCH_CHAT_GATEWAY", "http://127.0.0.1:15721")
+        try:
+            import urllib.request
+
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(base + "/v1/models", timeout=3) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
 
     async def _one(
         self, name: str, thread: dict[str, Any], text: str, cwd: str | None

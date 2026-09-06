@@ -218,7 +218,9 @@ class ClaudeCodeAdapter(RuntimeAdapter):
 
         return "\n\n".join(artifacts_text)
 
-    async def _invoke_claude_code(self, *, prompt: str, cwd: str | None = None) -> str:
+    async def _invoke_claude_code(
+        self, *, prompt: str, cwd: str | None = None, _retry: bool = False
+    ) -> str:
         """Invoke Claude Code CLI with the given prompt.
 
         Args:
@@ -317,6 +319,25 @@ class ClaudeCodeAdapter(RuntimeAdapter):
                     stdout.decode("utf-8", errors="replace")[-300:],
                     stderr_tail,
                 )
+                # 瞬态上游故障(网关账号池耗尽/5xx)单次延迟重试一次;
+                # 鉴权/余额类 403 不重试(换账号才能解决)。
+                combined = (
+                    stdout.decode("utf-8", errors="replace")[-500:]
+                    + stderr_tail
+                ).lower()
+                transient = (
+                    process.returncode != 0
+                    and ("no available accounts" in combined or " 503" in combined)
+                    and "403" not in combined
+                )
+                if transient and not os.getenv("CLAUDE_NO_RETRY"):
+                    logger.warning(
+                        "claude_code transient upstream failure; retry once in 30s"
+                    )
+                    await asyncio.sleep(30)
+                    return await self._invoke_claude_code(
+                        prompt, cwd, resume_session_id=resume_session_id
+                    ) if False else await _retry_once()
                 raise RunnerError(f"Claude Code exited with code {process.returncode}")
 
             response = stdout.decode("utf-8").strip()
