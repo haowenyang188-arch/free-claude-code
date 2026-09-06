@@ -123,6 +123,7 @@ class CodexSubagentRunner(SubagentRunner):
                 created_at=datetime.now(UTC),
                 accepted=False,
             )
+            return artifact
         else:
             # Executor-grade codex role (codex_executor): the evidence gate
             # requires DIFF + TEST_REPORT from the attempt, so the prompt

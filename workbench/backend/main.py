@@ -970,6 +970,7 @@ class WorkbenchService:
             "claude": "claude",
             "dsh": "dsh",
             "codex": "codex",
+            "codex_executor": "codex",
             "planner": "claude",
             "executor": "dsh",
             "reviewer": "codex",
