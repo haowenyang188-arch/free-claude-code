@@ -493,9 +493,11 @@ SOURCE_RULES: tuple[SourceRule, ...] = (
     ),
     SourceRule(
         rule_id="RC-6",
-        description="The HTTP layer must not translate an agent terminal event into a task terminal state.",
+        description="The HTTP layer must not decide a task terminal state on its own "
+        "authority; terminal writes go through workflow.run_relay "
+        "(which applies them as the Engine).",
         roots=("workbench/backend/main.py",),
-        pattern=r"EventType\.RUN_FINISHED",
+        pattern=r"task\.status\s*=\s*TaskStatus\.(?:COMPLETED|FAILED|CANCELLED)",
         severity="blocker",
     ),
 )
@@ -636,15 +638,10 @@ KNOWN_VIOLATIONS: frozenset[ContractViolation] = frozenset(
             why_open=_SECOND_STATE_MACHINE,
             routed_to=SESSION_LEGACY_BRIDGE,
         ),
-        # ---- RC-6: HTTP layer maps an agent event to a task terminal state -
-        ContractViolation(
-            rule_id="RC-6",
-            path="workbench/backend/main.py",
-            line=1219,
-            why_open=f"{_FROZEN}; RUN_FINISHED maps 1:1 to RunStatus/TaskStatus "
-            "COMPLETED, bypassing both the Engine and the Reviewer",
-            routed_to=SESSION_COMMIT_GATE,
-        ),
+        # RC-6 retired 2026-09-07: the HTTP layer no longer decides a task
+        # terminal state; it relays through workflow.run_relay, which writes
+        # under Engine authority.  Re-register it if a terminal assignment
+        # ever reappears in main.py.
     }
 )
 

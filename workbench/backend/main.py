@@ -108,6 +108,7 @@ if __package__:
     )
     from .workflow.engine import WorkflowEngine, WorkflowEngineError
     from .workflow.orchestrator import AutoOrchestrator
+    from .workflow.run_relay import relay_run_status_to_task
     from .workflow.runner_factory import RuntimeUnavailableError, create_runners
 else:  # Support ``python workbench/backend/main.py`` as a local entry point.
     import sys
@@ -198,6 +199,7 @@ else:  # Support ``python workbench/backend/main.py`` as a local entry point.
     )
     from workbench.backend.workflow.engine import WorkflowEngine, WorkflowEngineError
     from workbench.backend.workflow.orchestrator import AutoOrchestrator
+    from workbench.backend.workflow.run_relay import relay_run_status_to_task
     from workbench.backend.workflow.runner_factory import (
         RuntimeUnavailableError,
         create_runners,
@@ -1231,21 +1233,13 @@ class WorkbenchService:
             elif event.type is EventType.USER_INPUT_REQUIRED:
                 run.status = RunStatus.WAITING_HUMAN
 
-            # 更新Task状态
+            # 更新Task状态 —— 终态裁决与写入归 workflow 受权通道，HTTP 层只上报
             task_id = run.task_id
             if task_id in self.tasks:
                 task = self.tasks[task_id]
-                if run.status == RunStatus.COMPLETED:
-                    task.status = TaskStatus.COMPLETED
+                relayed = relay_run_status_to_task(task, run.status)
+                if relayed == TaskStatus.COMPLETED:
                     task.completed_at = datetime.now()
-                elif run.status == RunStatus.FAILED:
-                    task.status = TaskStatus.FAILED
-                elif run.status == RunStatus.PAUSED:
-                    task.status = TaskStatus.PAUSED
-                elif run.status == RunStatus.CANCELLED:
-                    task.status = TaskStatus.CANCELLED
-                elif run.status == RunStatus.WAITING_HUMAN:
-                    task.status = TaskStatus.WAITING_HUMAN
                 task.updated_at = datetime.now()
 
         await self._persist_state()
@@ -1447,7 +1441,7 @@ class WorkbenchService:
 
         if not success:
             run.status = RunStatus.FAILED
-            task.status = TaskStatus.FAILED
+            relay_run_status_to_task(task, RunStatus.FAILED)
             await self._persist_state()
             raise HTTPException(status_code=500, detail="Failed to start agent task")
 

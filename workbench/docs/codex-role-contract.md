@@ -89,10 +89,18 @@
 | RC-3 | Agent adapter 不得 import workflow engine（`SubagentRunner` 是无状态 ABC，豁免） | blocker |
 | RC-4 | Agent adapter 不得自我验证完成声明 | major |
 | RC-5 | `workflow/` 之外不得把任务推进到终态 | blocker |
-| RC-6 | HTTP 层不得把 Agent 终态事件翻译成任务终态 | blocker |
+| RC-6 | HTTP 层不得自主任定任务终态（终态写入须经 `workflow/run_relay.py` → `apply_status`） | blocker（✅ 2026-09-07 已修） |
 
 **契约债务登记**：`role_contract.KNOWN_VIOLATIONS`（13 项，每条带 `routed_to`）。
 测试双向卡死 —— 新增违规会 fail，已修复却不摘登记也会 fail。
+
+**RC-6 修复说明（2026-09-07）**：`main.py` 原先在 `_handle_event` 里把 `RUN_FINISHED`
+直接翻译成 `task.status = TaskStatus.COMPLETED`（绕过 Engine 与 Reviewer）。现改为调用
+`workflow/run_relay.py::relay_run_status_to_task()`，映射表与写入都落在 `workflow/` 包内，
+并经 `role_contract.apply_status(kind="tasks")` 以 Engine 身份执行；`main.py` 内部不再出现
+任何任务终态赋值。规则 pattern 同步从 `EventType\.RUN_FINISHED` 精确化为
+`task\.status\s*=\s*TaskStatus\.(?:COMPLETED|FAILED|CANCELLED)`（比原规则更严），
+旧登记条目已摘除。legacy `/api/tasks` 的终态语义不变，SOP v2 引擎路径不受影响。
 
 ## 8. 禁止事项（违反即回滚）
 
