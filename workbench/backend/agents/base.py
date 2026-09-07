@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from providers.common.identity import RuntimeIdentity
@@ -171,32 +173,54 @@ class BaseAgentAdapter(ABC):
         values["run_id"] = run_id
         return RuntimeIdentity(**values)
 
-    async def verify_completion(self) -> dict[str, Any]:
-        """验证Agent完成声明"""
-        verification_script = (
-            "/home/gnen/.claude/skills/agent-verify-before-done/verify.sh"
+    #: Pre-flight script an adapter may run before it claims to be done.  The
+    #: outcome is **evidence**, never acceptance: only Codex may review the
+    #: work and only the Engine may close the task (role contract RC-4).
+    DEFAULT_SELF_CHECK_SCRIPT = (
+        "/home/gnen/.claude/skills/agent-verify-before-done/verify.sh"
+    )
+
+    async def run_self_check(self) -> dict[str, Any]:
+        """Run the adapter's own checks and report the outcome as evidence.
+
+        An adapter may inspect its own work, but it may never accept it, so the
+        result carries an explicit ``status`` (``passed`` / ``failed`` /
+        ``skipped``) and is meant to be surfaced to the reviewer, not to close
+        anything.  A missing script yields ``skipped`` instead of a fabricated
+        failure.
+
+        Returns:
+            ``{"status": ..., "passed": bool, "output": str, "error": str | None}``.
+        """
+        script = os.environ.get(
+            "WORKBENCH_AGENT_SELF_CHECK_SCRIPT", self.DEFAULT_SELF_CHECK_SCRIPT
         )
+        if not script or not Path(script).is_file():
+            return {"status": "skipped", "passed": False, "output": "", "error": None}
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                verification_script,
+                script,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.workspace_path,
             )
 
             stdout, stderr = await proc.communicate()
+            passed = proc.returncode == 0
 
             return {
-                "passed": proc.returncode == 0,
+                "status": "passed" if passed else "failed",
+                "passed": passed,
                 "output": stdout.decode(),
-                "error": stderr.decode() if proc.returncode != 0 else None,
+                "error": stderr.decode() if not passed else None,
             }
         except Exception as e:
             return {
+                "status": "failed",
                 "passed": False,
                 "output": "",
-                "error": f"验证脚本执行失败: {e!s}",
+                "error": f"自检脚本执行失败: {e!s}",
             }
 
     async def cleanup(self):

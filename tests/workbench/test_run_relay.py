@@ -22,6 +22,7 @@ from workbench.backend.workflow.role_contract import (
 from workbench.backend.workflow.run_relay import (
     RUN_STATUS_TO_TASK_STATUS,
     relay_run_status_to_task,
+    relay_task_record_terminal,
     task_status_for_run_status,
 )
 
@@ -78,6 +79,26 @@ def test_relay_rejects_an_agent_actor() -> None:
         relay_run_status_to_task(task, RunStatus.COMPLETED, actor=AgentRole.CLAUDE)
 
     assert task.status is TaskStatus.PENDING
+
+
+def test_task_record_relay_writes_under_engine_authority() -> None:
+    """RC-5: the bridge writes terminal states through the same relay."""
+    record: dict[str, object] = {"status": "running"}
+
+    written = relay_task_record_terminal(record, TaskStatus.COMPLETED)
+
+    assert written is TaskStatus.COMPLETED
+    assert record["status"] is TaskStatus.COMPLETED
+
+
+def test_task_record_relay_rejects_an_agent_actor() -> None:
+    """The mapping form is gated exactly like the object form."""
+    record: dict[str, object] = {"status": "running"}
+
+    with pytest.raises(RoleContractViolation):
+        relay_task_record_terminal(record, TaskStatus.FAILED, actor=AgentRole.CODEX)
+
+    assert record["status"] == "running"
 
 
 def test_http_layer_holds_no_terminal_task_assignment() -> None:

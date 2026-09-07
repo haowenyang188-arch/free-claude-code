@@ -202,7 +202,7 @@ class DeepSeekHarnessAdapter(BaseAgentAdapter):
                 )
                 await self.emit_event(
                     EventType.RUN_FINISHED,
-                    {"message": "DeepSeek Harness task completed"},
+                    {"message": "Run finished (exit code 0)"},
                     run_id=run_id,
                     identity=terminal_identity,
                 )

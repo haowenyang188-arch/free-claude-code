@@ -17,6 +17,7 @@ from workbench.backend.domain.models import (
     SubagentAssignment,
     Task,
 )
+from workbench.backend.workflow.run_relay import relay_task_record_terminal
 from workbench.backend.workflow.runners import RuntimeNeutralRunner
 
 
@@ -106,30 +107,28 @@ class BridgeService:
                 timeout=self._execution_timeout,
             )
 
-            # Update task status to COMPLETED
+            # 终态裁决归 workflow 受权通道(RC-5): bridge 只上报结果
+            relay_task_record_terminal(self._tasks[task_id], TaskStatus.COMPLETED)
             self._tasks[task_id].update(
                 {
-                    "status": TaskStatus.COMPLETED,
                     "updated_at": datetime.now(UTC),
                     "artifact": artifact,
                 }
             )
 
         except asyncio.TimeoutError:
-            # Update task status to FAILED due to timeout
+            relay_task_record_terminal(self._tasks[task_id], TaskStatus.FAILED)
             self._tasks[task_id].update(
                 {
-                    "status": TaskStatus.FAILED,
                     "updated_at": datetime.now(UTC),
                     "error": f"Execution timed out after {self._execution_timeout}s",
                 }
             )
 
         except Exception as e:
-            # Update task status to FAILED
+            relay_task_record_terminal(self._tasks[task_id], TaskStatus.FAILED)
             self._tasks[task_id].update(
                 {
-                    "status": TaskStatus.FAILED,
                     "updated_at": datetime.now(UTC),
                     "error": str(e),
                 }

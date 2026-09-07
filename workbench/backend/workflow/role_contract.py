@@ -526,124 +526,25 @@ class ContractViolation:
         return (self.rule_id, self.path, self.line)
 
 
-#: Sessions referenced by the register.
+#: Sessions that may own contract debt; a new entry must name one of them.
 SESSION_COMMIT_GATE = "会话: Commit Gate / 冻结解冻决策"
 SESSION_LEGACY_BRIDGE = "会话: legacy bridge 与 Agent 运行时收敛"
 SESSION_MAINLINE_E2E = "会话: 主链接线与 Final E2E"
 
-_FROZEN = "inside the Commit A frozen set (21 files)"
-_PLANNER_CLAIM = "Planner (Claude) declares the task complete; terminality belongs to the Engine"
-_EXECUTOR_CLAIM = "Executor (DSH) declares the task complete; DSH owns no review right"
-_SELF_VERIFY = "agent verifies its own completion claim instead of letting Codex review it"
-_SECOND_STATE_MACHINE = (
-    "bridge/ drives task status next to WorkflowEngine; collapsing it changes "
-    "the legacy /api/tasks path and needs its own regression pass"
-)
-
-KNOWN_VIOLATIONS: frozenset[ContractViolation] = frozenset(
-    {
-        # ---- RC-2: an agent declares the task complete --------------------
-        ContractViolation(
-            rule_id="RC-2",
-            path="workbench/backend/agents/claude_adapter.py",
-            line=282,
-            why_open=f"{_FROZEN}; {_PLANNER_CLAIM}",
-            routed_to=SESSION_COMMIT_GATE,
-        ),
-        ContractViolation(
-            rule_id="RC-2",
-            path="workbench/backend/agents/claude_adapter.py",
-            line=342,
-            why_open=f"{_FROZEN}; {_PLANNER_CLAIM} (second code path)",
-            routed_to=SESSION_COMMIT_GATE,
-        ),
-        ContractViolation(
-            rule_id="RC-2",
-            path="workbench/backend/agents/dsh_adapter.py",
-            line=205,
-            why_open=f"{_FROZEN}; {_EXECUTOR_CLAIM}",
-            routed_to=SESSION_COMMIT_GATE,
-        ),
-        # ---- RC-4: an agent self-verifies its own completion --------------
-        ContractViolation(
-            rule_id="RC-4",
-            path="workbench/backend/agents/base.py",
-            line=174,
-            why_open=f"{_FROZEN}; verify_completion() grants self-acceptance to "
-            "every role through the shared base class",
-            routed_to=SESSION_COMMIT_GATE,
-        ),
-        ContractViolation(
-            rule_id="RC-4",
-            path="workbench/backend/agents/claude_adapter.py",
-            line=325,
-            why_open=f"{_FROZEN}; {_SELF_VERIFY}",
-            routed_to=SESSION_COMMIT_GATE,
-        ),
-        ContractViolation(
-            rule_id="RC-4",
-            path="workbench/backend/agents/claude_adapter.py",
-            line=372,
-            why_open=f"{_FROZEN}; {_SELF_VERIFY}",
-            routed_to=SESSION_COMMIT_GATE,
-        ),
-        ContractViolation(
-            rule_id="RC-4",
-            path="workbench/backend/agents/claude_adapter.py",
-            line=379,
-            why_open=f"{_FROZEN}; {_SELF_VERIFY}",
-            routed_to=SESSION_COMMIT_GATE,
-        ),
-        ContractViolation(
-            rule_id="RC-4",
-            path="workbench/backend/agents/codex_adapter.py",
-            line=255,
-            why_open=f"{_SELF_VERIFY}; removing it changes the legacy run flow "
-            "and is not frozen, but needs a behaviour regression pass",
-            routed_to=SESSION_LEGACY_BRIDGE,
-        ),
-        ContractViolation(
-            rule_id="RC-4",
-            path="workbench/backend/agents/codex_adapter.py",
-            line=369,
-            why_open=f"{_SELF_VERIFY}; same as line 255",
-            routed_to=SESSION_LEGACY_BRIDGE,
-        ),
-        ContractViolation(
-            rule_id="RC-4",
-            path="workbench/backend/agents/codex_adapter.py",
-            line=376,
-            why_open=f"{_SELF_VERIFY}; same as line 255",
-            routed_to=SESSION_LEGACY_BRIDGE,
-        ),
-        # ---- RC-5: a second task state machine ----------------------------
-        ContractViolation(
-            rule_id="RC-5",
-            path="workbench/backend/bridge/service.py",
-            line=112,
-            why_open=_SECOND_STATE_MACHINE,
-            routed_to=SESSION_LEGACY_BRIDGE,
-        ),
-        ContractViolation(
-            rule_id="RC-5",
-            path="workbench/backend/bridge/service.py",
-            line=122,
-            why_open=_SECOND_STATE_MACHINE,
-            routed_to=SESSION_LEGACY_BRIDGE,
-        ),
-        ContractViolation(
-            rule_id="RC-5",
-            path="workbench/backend/bridge/service.py",
-            line=132,
-            why_open=_SECOND_STATE_MACHINE,
-            routed_to=SESSION_LEGACY_BRIDGE,
-        ),
-        # RC-6 retired 2026-09-07: the HTTP layer no longer decides a task
-        # terminal state; it relays through workflow.run_relay, which writes
-        # under Engine authority.  Re-register it if a terminal assignment
-        # ever reappears in main.py.
-    }
-)
+#: The register is empty -- every known breach has been retired (2026-09-07):
+#:
+#:   RC-2  adapters no longer emit a "task completed" claim; the terminal
+#:         event states that the *run* finished, completion is the Engine's.
+#:   RC-4  adapters run a self-check and surface it as *evidence*; acceptance
+#:         belongs to Codex (review) and the Engine (terminal state).
+#:   RC-5  the bridge reports its outcome; the terminal write goes through
+#:         workflow.run_relay under Engine authority.
+#:   RC-6  main.py relays the run status instead of deciding task terminal
+#:         states itself.
+#:
+#: An empty register is a maintained state, not an abandoned gate: the audit
+#: tests still fail the build the moment a new breach appears.
+KNOWN_VIOLATIONS: frozenset[ContractViolation] = frozenset()
 
 CONTRACT_DEBT_REGISTER: tuple[ContractViolation, ...] = tuple(
     sorted(KNOWN_VIOLATIONS, key=lambda item: (item.rule_id, item.path, item.line))

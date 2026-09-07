@@ -18,12 +18,16 @@ enter ``WorkbenchService.tasks``, and therefore never reach this relay.
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
+from typing import Any
+
 from ..models import RunStatus, TaskStatus
-from .role_contract import AgentRole, apply_status
+from .role_contract import STATUS_AUTHORITY, AgentRole, apply_status, assert_capability
 
 __all__ = [
     "RUN_STATUS_TO_TASK_STATUS",
     "relay_run_status_to_task",
+    "relay_task_record_terminal",
     "task_status_for_run_status",
 ]
 
@@ -82,3 +86,39 @@ def relay_run_status_to_task(
         return None
     apply_status(task, kind="tasks", value=value, actor=actor)
     return value
+
+
+def relay_task_record_terminal(
+    record: MutableMapping[str, Any],
+    status: Any,
+    *,
+    actor: AgentRole = AgentRole.SOP_ENGINE,
+) -> Any:
+    """Write a terminal status into a task record kept as a plain mapping.
+
+    The Dify bridge stores its task rows as ``dict`` (``bridge/service.py``),
+    so the object-based :func:`apply_status` cannot be used there.  This
+    helper applies the very same capability gate to the mapping form, which is
+    what retires RC-5: the bridge reports the outcome, the workflow package
+    decides the terminal state and writes it as the Engine.
+
+    Args:
+        record: the task record to mutate.
+        status: the terminal status value (any ``TaskStatus``-like enum; the
+            legacy and bridge models are both accepted).
+        actor: who performs the write; defaults to the Engine.
+
+    Returns:
+        The status that was written.
+
+    Raises:
+        RoleContractViolation: if ``actor`` does not hold
+            ``Capability.TRANSITION_TASK``.
+    """
+    assert_capability(
+        actor,
+        STATUS_AUTHORITY["tasks"],
+        context=f"write tasks[].status = {getattr(status, 'value', status)!r}",
+    )
+    record["status"] = status
+    return status

@@ -85,14 +85,15 @@
 | ID | 规则 | 级别 |
 |----|------|------|
 | RC-1 | Agent adapter 不得写 SOP 状态字段（`AgentStatus` 是进程存活态，豁免） | blocker |
-| RC-2 | Agent adapter 不得宣告任务完成 | blocker |
+| RC-2 | Agent adapter 不得宣告任务完成（终态事件只能陈述 run 结束） | blocker（✅ 2026-09-07 已修） |
 | RC-3 | Agent adapter 不得 import workflow engine（`SubagentRunner` 是无状态 ABC，豁免） | blocker |
-| RC-4 | Agent adapter 不得自我验证完成声明 | major |
-| RC-5 | `workflow/` 之外不得把任务推进到终态 | blocker |
+| RC-4 | Agent adapter 不得自我验证完成声明（只能跑自检并作为证据上报） | major（✅ 2026-09-07 已修） |
+| RC-5 | `workflow/` 之外不得把任务推进到终态（bridge 须走 `run_relay`） | blocker（✅ 2026-09-07 已修） |
 | RC-6 | HTTP 层不得自主任定任务终态（终态写入须经 `workflow/run_relay.py` → `apply_status`） | blocker（✅ 2026-09-07 已修） |
 
-**契约债务登记**：`role_contract.KNOWN_VIOLATIONS`（13 项，每条带 `routed_to`）。
-测试双向卡死 —— 新增违规会 fail，已修复却不摘登记也会 fail。
+**契约债务登记**：`role_contract.KNOWN_VIOLATIONS` —— **已清零（0 项）**。
+测试双向卡死 —— 新增违规会 fail，已修复却不摘登记也会 fail；空登记是被维护的状态，
+不是被放弃的闸门。
 
 **RC-6 修复说明（2026-09-07）**：`main.py` 原先在 `_handle_event` 里把 `RUN_FINISHED`
 直接翻译成 `task.status = TaskStatus.COMPLETED`（绕过 Engine 与 Reviewer）。现改为调用
@@ -101,6 +102,21 @@
 任何任务终态赋值。规则 pattern 同步从 `EventType\.RUN_FINISHED` 精确化为
 `task\.status\s*=\s*TaskStatus\.(?:COMPLETED|FAILED|CANCELLED)`（比原规则更严），
 旧登记条目已摘除。legacy `/api/tasks` 的终态语义不变，SOP v2 引擎路径不受影响。
+
+**RC-2 / RC-4 / RC-5 修复说明（2026-09-07）**：
+
+- **RC-2**：`claude_adapter` / `dsh_adapter` 的终态事件原本带 `Task completed successfully`
+  / `DeepSeek Harness task completed` 文案，等于 adapter 宣告任务完成。现统一改为
+  `Run finished (exit code 0)` —— 只陈述 run 结束，任务完成由 Engine 终裁。全仓无消费者依赖该文案。
+- **RC-4**：`base.verify_completion()` → `run_self_check()`，
+  `_verify_before_done()` → `_surface_completion_claim()`；输出从"✅ 验证通过 / ❌ 验证失败"
+  改为"自检通过/未通过（非验收结论，已作为证据上报）"。顺带修掉一处会撒谎的降级：
+  自检脚本 `/home/gnen/.claude/skills/agent-verify-before-done/verify.sh` 实际不存在，
+  原逻辑会把它报成"验证失败"并把 adapter 置为 `ERROR`；现在返回 `skipped` 并跳过，
+  只有自检真的失败才置 `ERROR`。脚本路径改为 `WORKBENCH_AGENT_SELF_CHECK_SCRIPT` 可配。
+- **RC-5**：`bridge/service.py` 三处 `update({"status": TaskStatus.COMPLETED|FAILED, ...})`
+  改为 `relay_task_record_terminal(record, status)`（dict 版，与 `apply_status` 同一
+  `TRANSITION_TASK` 能力校验），bridge 只上报结果，终态写入落在 `workflow/run_relay.py`。
 
 ## 8. 禁止事项（违反即回滚）
 

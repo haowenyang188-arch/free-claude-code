@@ -279,7 +279,7 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
                     elif code == 0:
                         await self.emit_event(
                             EventType.RUN_FINISHED,
-                            {"message": "Task completed successfully"},
+                            {"message": "Run finished (exit code 0)"},
                             run_id=run_id,
                         )
                     else:
@@ -322,7 +322,7 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
                 if text:
                     # 检测完成声明
                     if await self._check_completion_claim(text):
-                        await self._verify_before_done(text)
+                        await self._surface_completion_claim(text)
 
                     await self.emit_event(EventType.AGENT_MESSAGE, {"message": text})
 
@@ -339,7 +339,7 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
                 elif returncode == 0:
                     await self.emit_event(
                         EventType.RUN_FINISHED,
-                        {"message": "Task completed successfully"},
+                        {"message": "Run finished (exit code 0)"},
                         run_id=run_id,
                     )
                 else:
@@ -369,28 +369,45 @@ class ClaudeCodeAdapter(BaseAgentAdapter):
         completion_keywords = ["完成", "done", "finished", "成功", "已实现", "已完成"]
         return any(keyword in text.lower() for keyword in completion_keywords)
 
-    async def _verify_before_done(self, claim_text: str):
-        """完成前强制验证"""
+    async def _surface_completion_claim(self, claim_text: str):
+        """把完成声明转成交给审核方的自检证据.
+
+        自检只回答"我自己的检查跑没跑过", 不回答"这件事能不能算完":
+        验收权在 Codex(审核) 与 Engine(终裁), adapter 无权自行结案(RC-4)。
+        """
         await self.emit_event(
-            EventType.AGENT_MESSAGE, {"message": "🔍 检测到完成声明, 触发自动验证..."}
+            EventType.AGENT_MESSAGE,
+            {
+                "message": "🔍 检测到完成声明, 执行自检"
+                "(结果仅作为证据上报, 不构成验收结论)..."
+            },
         )
 
-        # 运行验证
-        result = await self.verify_completion()
+        result = await self.run_self_check()
+
+        if result["status"] == "skipped":
+            await self.emit_event(
+                EventType.AGENT_MESSAGE,
+                {
+                    "message": "⚠️ 自检脚本不可用, 已跳过自检;"
+                    "该完成声明将由审核方独立核验。"
+                },
+            )
+            return
 
         if result["passed"]:
             await self.emit_event(
                 EventType.AGENT_MESSAGE,
-                {"message": f"✅ 验证通过!\n\n{result['output']}"},
+                {"message": f"自检通过(非验收结论):\n\n{result['output']}"},
             )
         else:
             await self.emit_event(
                 EventType.AGENT_MESSAGE,
                 {
-                    "message": f"❌ 验证失败!\n\n{result['error']}\n\n请修复后再声称完成。"
+                    "message": f"自检未通过(非验收结论, 已作为证据上报):\n\n{result['error']}"
                 },
             )
-            # 标记为需要修复
+            # 自检确实失败 -> 标记本适配器需要修复(进程存活态, 非 SOP 终态)
             self.status = AgentStatus.ERROR
 
     async def send_message(self, message: str) -> bool:
